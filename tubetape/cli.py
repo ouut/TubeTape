@@ -50,9 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--segment-duration",
         type=durations.parse_duration,
-        default="20m",
-        help="max duration per uploaded video; supports 20m / 1200s / 0:20:00 "
-        "(default: 20m)",
+        default="1h",
+        help="max duration per uploaded video; supports 1h / 3600s / 1:00:00 "
+        "(default: 1h)",
     )
     parser.add_argument(
         "--timezone",

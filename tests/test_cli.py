@@ -19,7 +19,7 @@ class TestDefaults:
         assert args.image_duration == 3.0
         assert args.input == os.path.abspath(".")
         assert args.db == os.path.join(os.path.abspath("."), "tubetape.json")
-        assert args.segment_duration == 1200.0
+        assert args.segment_duration == 3600.0
         assert args.crf == 18
         assert args.max_resolution == (3840, 2160)
         assert args.ken_burns is False

@@ -13,11 +13,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: tubetape-linux
+            name: linux
           - os: windows-latest
-            artifact: tubetape-windows
+            name: windows
           - os: macos-latest
-            artifact: tubetape-macos
+            name: macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -32,11 +32,32 @@ jobs:
           pip install pyinstaller tzdata Pillow exifread google-api-python-client google-auth-oauthlib watchdog rich
 
       - name: Build executable
-        run: python scripts/build.py --name ${{ matrix.artifact }}
+        run: python scripts/build.py --name tubetape-${{ matrix.name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: tubetape-${{ matrix.name }}
           path: |
             dist/tubetape*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release and upload binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/tubetape-linux/*
+            artifacts/tubetape-windows/*
+            artifacts/tubetape-macos/*

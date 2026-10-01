@@ -142,7 +142,7 @@ python -m tubetape --input /path/to/photos --watch
 | `--image-duration` | `3` | 图片转视频时单张图片的播放秒数 |
 | `--input` | 当前目录 | 图片/视频根目录 |
 | `--db` | `<input>/tubetape.json` | JSON 数据库路径 |
-| `--segment-duration` | `20m` | 每片时长上限；支持 `20m` / `1200s` / `0:20:00` |
+| `--segment-duration` | `1h` | 每片时长上限；支持 `1h` / `3600s` / `1:00:00` |
 | `--timezone` | 系统本地 | 无时区 EXIF 时间的解释基准（如 `Asia/Shanghai`） |
 | `--crf` | `18` | 视频重编码质量，越小越清晰 |
 | `--max-resolution` | `3840x2160` | 目标分辨率上限，不放大 |
@@ -281,12 +281,11 @@ TUBETAPE_TOKEN="$(cat token.json)" nohup python3 -m tubetape \
     --privacy private \
     --only-camera-photos \
     --only-phone-videos \
-    --segment-duration 15m \
     --watch \
     > /tmp/tubetape.log 2>&1 &
 ```
 
-- `--segment-duration 15m`：**未验证**的 YouTube 账号单视频上限 15 分钟（默认 20m 会传失败）；已验证账号可调大（如 `1h`）减少总片数。
+- 默认每片 `1h`。⚠️ **未验证**的 YouTube 账号单视频上限 15 分钟，需加 `--segment-duration 15m`；已验证账号可用默认 `1h`（或更大）减少总片数。
 - `--watch`：持续运行；配额耗尽后自动暂停，每天（UTC 零点）自动续传。
 - 日志：`tail -f /tmp/tubetape.log`。
 
@@ -325,7 +324,7 @@ TUBETAPE_TOKEN="$(cat token.json)" python3 -m tubetape \
 
 ```bash
 python3 -m tubetape --dry-run --no-watch --input /path/to/photos \
-    --timezone Asia/Shanghai --only-camera-photos --only-phone-videos --segment-duration 15m
+    --timezone Asia/Shanghai --only-camera-photos --only-phone-videos
 ```
 
 输出会告诉你：保留/丢弃多少文件、总共多少分片、总时长多少——据此估算要跑多少天。
