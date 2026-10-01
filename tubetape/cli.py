@@ -9,10 +9,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 from . import auth, durations
 from .chapters import chapters_text
 from .db import Database
+from .log import get_logger, setup_logging
 from .planner import plan
 from .rebuild import Rebuilder
 from .scanner import scan
@@ -20,6 +22,8 @@ from .transcoder import TranscodeConfig, transcode_segment
 from .ui import Reporter
 
 _DEFAULT_DB_NAME = "tubetape.json"
+
+_log = get_logger("cli")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -138,6 +142,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="30s",
         help="in watch mode, poll for new files every this many seconds (default: 30s)",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="more console detail: -v shows INFO, -vv shows DEBUG (default: WARNING+)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help=f"detailed log file path (default: <db>.log, i.e. {_DEFAULT_DB_NAME}.log)",
+    )
     return parser
 
 
@@ -168,11 +184,57 @@ def _segment_params(args: argparse.Namespace) -> tuple:
     return (args.image_duration, args.crf, args.max_resolution, args.ken_burns)
 
 
+def _file_persister(db: Database):
+    """Return a scan callback that upserts files and periodically saves the db.
+
+    Saving every N files (or every few seconds) means a long scan can be
+    interrupted without losing all of its progress: already-scanned files are
+    already persisted with their size+mtime, so the next run reuses the cache.
+    """
+    state = {"count": 0, "last_save": time.monotonic()}
+
+    def persist(item) -> None:
+        db.upsert_file(item.file_id, item.to_record())
+        state["count"] += 1
+        now = time.monotonic()
+        if state["count"] >= 1000 or now - state["last_save"] >= 30.0:
+            db.save()
+            _log.debug("incremental save: %d file(s) indexed so far", len(db.files))
+            state["count"] = 0
+            state["last_save"] = now
+
+    return persist
+
+
 def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> int:
     reporter = reporter or Reporter()
     db = Database.load(args.db)
 
+    _log.info(
+        "pipeline start: input=%s db=%s timezone=%s segment_duration=%.1fs "
+        "crf=%d max_resolution=%s ken_burns=%s privacy=%s watch=%s dry_run=%s "
+        "only_camera_photos=%s only_phone_videos=%s flush=%s",
+        args.input,
+        args.db,
+        args.timezone,
+        args.segment_duration,
+        args.crf,
+        f"{args.max_resolution[0]}x{args.max_resolution[1]}",
+        args.ken_burns,
+        args.privacy,
+        args.watch,
+        args.dry_run,
+        args.only_camera_photos,
+        args.only_phone_videos,
+        args.flush,
+    )
+    _log.info("database loaded: %d file(s), %d segment(s)", len(db.files), len(db.segments))
+
     reporter.status(f"scanning {args.input} ...")
+    # During a real run, persist files as they are scanned (throttled) so a
+    # long scan survives interruption and the hash cache is useful next time.
+    # Dry-run stays read-only and passes no callback.
+    on_file = None if args.dry_run else _file_persister(db)
     result = scan(
         args.input,
         db,
@@ -180,11 +242,24 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         args.image_duration,
         only_camera_photos=args.only_camera_photos,
         only_phone_videos=args.only_phone_videos,
+        on_file=on_file,
+    )
+    _log.info(
+        "scan complete: %d media file(s) (%d new, %d already processed, %d deleted), "
+        "%d error(s), %d skipped",
+        len(result.files),
+        len(result.new_file_ids),
+        len(result.processed_file_ids),
+        len(result.deleted_file_ids),
+        len(result.errors),
+        len(result.skipped),
     )
     for error in result.errors:
         reporter.status(f"  error: {error['path']}: {error['reason']}")
+        _log.warning("scan error: %s: %s", error["path"], error["reason"])
     for item in result.skipped:
         reporter.status(f"  skipped: {item['path']} ({item['reason']})")
+        _log.info("skipped: %s (%s)", item["path"], item["reason"])
 
     reporter.status(
         f"planning: {len(result.files)} files "
@@ -197,6 +272,12 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         args.segment_duration,
         params=_segment_params(args),
         flush=args.flush,
+    )
+    _log.info(
+        "plan complete: %d segment(s) to process, %d skipped (unchanged), %d pending (held for flush)",
+        len(plan_result.segments),
+        len(plan_result.skipped_segment_ids),
+        len(plan_result.pending_files),
     )
 
     files_by_id = {item.file_id: item for item in result.files}
@@ -214,21 +295,35 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                 f"  segment {segment.segment_id[:12]} {segment.title} "
                 f"[{len(segment.file_ids)} files, {segment.duration_seconds:.1f}s] ({kind})"
             )
+            _log.info(
+                "dry-run segment %s: title=%s files=%d duration=%.1fs kind=%s",
+                segment.segment_id,
+                segment.title,
+                len(segment.file_ids),
+                segment.duration_seconds,
+                kind,
+            )
         for item in plan_result.pending_files:
             reporter.status(f"  pending file {item.file_id[:12]} {item.rel_path}")
+            _log.info("pending file %s: %s", item.file_id, item.rel_path)
+        _log.info("dry-run complete (no database writes, no transcode, no upload)")
         return 0
 
     # Real run: persist scanned files, then transcode and upload.
     for item in result.files:
         db.upsert_file(item.file_id, item.to_record())
+        _log.debug("indexed file %s: %s (%.1fs)", item.file_id[:12], item.rel_path, item.duration_seconds or 0.0)
     for file_id in result.deleted_file_ids:
         db.remove_file(file_id)
+        _log.debug("removed deleted file %s from index", file_id[:12])
 
     # Real run: transcode each new/rebuild segment, then upload.
     uploader = _build_uploader(args, db)
     if uploader is None:
         reporter.status("no YouTube credentials; set TUBETAPE_TOKEN or token.json")
+        _log.error("no YouTube credentials found (TUBETAPE_TOKEN env or token.json next to db)")
         db.save()
+        _log.info("database saved to %s", db.path)
         return 1
 
     config = TranscodeConfig(
@@ -238,23 +333,47 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         image_duration=args.image_duration,
     )
 
-    for segment in plan_result.segments:
+    total_segments = len(plan_result.segments)
+    for index, segment in enumerate(plan_result.segments, start=1):
         if not uploader.quota.can_upload():
             reporter.status(
                 f"quota exhausted ({uploader.quota.used}/{uploader.quota.daily_limit}); "
                 f"{len(plan_result.segments)} segment(s) deferred to next run"
             )
+            _log.warning(
+                "quota exhausted (%d/%d units used); %d segment(s) deferred",
+                uploader.quota.used,
+                uploader.quota.daily_limit,
+                len(plan_result.segments) - index + 1,
+            )
             break
         segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
         out_path = os.path.join(os.path.dirname(args.db), f".{segment.segment_id[:12]}.mp4")
+        _log.info(
+            "segment %d/%d: %s (%d files, %.1fs) -> %s",
+            index,
+            total_segments,
+            segment.title,
+            len(segment_files),
+            segment.duration_seconds,
+            out_path,
+        )
 
         def transcode_fn(files, _out_path=out_path):
-            return transcode_segment(files, _out_path, config)
+            def progress(done: int, total: int, item) -> None:
+                reporter.status(f"    transcode {done}/{total}: {item.rel_path} ({item.type})")
+
+            return transcode_segment(files, _out_path, config, progress=progress)
 
         reporter.status(f"transcoding {segment.title} ...")
         if segment.is_rebuild:
             reporter.status(
                 f"rebuilding {segment.title} (replaces {segment.replaces_segment_id[:12]} ...) ..."
+            )
+            _log.info(
+                "rebuild: replacing segment %s with %s",
+                segment.replaces_segment_id,
+                segment.segment_id,
             )
             rebuilder = Rebuilder(
                 db,
@@ -272,6 +391,7 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                 segment_files,
                 title=segment.title,
             )
+            _log.info("rebuild committed: new video id %s", video_id)
         else:
             _, chapters = transcode_fn(segment_files)
             reporter.status(f"uploading {segment.title} ...")
@@ -297,18 +417,28 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                     "error": None,
                 },
             )
+            _log.info("sealed segment %s -> video id %s", segment.segment_id, video_id)
 
         # Clean up the local transcode output now that it's uploaded.
         try:
             os.remove(out_path)
-        except OSError:
-            pass
+            _log.debug("removed local transcode output %s", out_path)
+        except OSError as exc:
+            _log.debug("could not remove %s: %s", out_path, exc)
 
         db.settings["quota"] = uploader.quota.to_dict()
         db.save()
+        _log.debug("database saved to %s", db.path)
         reporter.quota(uploader.quota.used, uploader.quota.daily_limit)
 
     db.save()
+    _log.info(
+        "pipeline done: %d segment(s) processed, %d pending, quota used %d/%d",
+        len(plan_result.segments),
+        len(plan_result.pending_files),
+        uploader.quota.used,
+        uploader.quota.daily_limit,
+    )
     reporter.status("done")
     return 0
 
@@ -347,7 +477,9 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
         f"watching for new files (poll {args.poll_interval:g}s, "
         f"quiet {args.quiet_period:g}s, Ctrl+C to stop) ..."
     )
+    _log.info("watch mode active: poll=%.1fs quiet=%.1fs", args.poll_interval, args.quiet_period)
     known = _media_paths(args.input)
+    _log.debug("baseline media set: %d path(s)", len(known))
     last_change = time.time()
     has_changes = False
 
@@ -365,6 +497,7 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
             if today != last_day:
                 last_day = today
                 reporter.status("new day (quota reset); re-processing ...")
+                _log.info("new UTC day %s: re-running pipeline (quota rollover)", today)
                 run_pipeline(args, reporter)
                 known = _media_paths(args.input)
                 has_changes = False
@@ -375,16 +508,19 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
             new = current - known
             if new:
                 reporter.status(f"detected {len(new)} new file(s)")
+                _log.info("detected %d new file(s): %s", len(new), sorted(new))
                 known = current
                 last_change = time.time()
                 has_changes = True
             if has_changes and time.time() - last_change >= args.quiet_period:
                 reporter.status("quiet period elapsed; re-processing ...")
+                _log.info("quiet period (%.1fs) elapsed; re-running pipeline", args.quiet_period)
                 run_pipeline(args, reporter)
                 known = _media_paths(args.input)
                 has_changes = False
     except KeyboardInterrupt:
         reporter.status("exit signal: flushing pending segments ...")
+        _log.info("received exit signal; flushing pending segments")
         args.flush = True
         run_pipeline(args, reporter)
     return 0
@@ -415,6 +551,13 @@ def _build_uploader(args: argparse.Namespace, db: Database):
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # Detailed audit log goes next to the database by default; the console
+    # (stderr) shows WARNING+ unless -v / -vv is given.
+    log_file = args.log_file if args.log_file is not None else (args.db + ".log")
+    setup_logging(verbose=args.verbose, log_file=log_file)
+    _log.info("tubetape starting (log file: %s)", log_file)
+
     if args.watch and not args.dry_run:
         return run_watch(args)
     return run_pipeline(args)

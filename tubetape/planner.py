@@ -16,7 +16,10 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from .log import get_logger
 from .scanner import ScannedFile, format_iso_utc, parse_iso_utc
+
+_logger = get_logger("planner")
 
 _DISPLAY_TS_FORMAT = "%Y%m%d-%H%M%S"
 
@@ -149,6 +152,11 @@ def plan(
     """
     files_by_id = {f.file_id: f for f in files}
     known_ids = set(existing_segments.keys())
+    _logger.info(
+        "planning %d file(s) against %d existing segment(s)",
+        len(files),
+        len(existing_segments),
+    )
 
     # Parse existing ranges into epoch bounds, sorted and stable.
     ranges: list[tuple[float, float, str, dict]] = []
@@ -162,6 +170,7 @@ def plan(
             continue
         ranges.append((start_dt.timestamp(), end_dt.timestamp(), sid, record))
     ranges.sort(key=lambda r: (r[0], r[1], r[2]))
+    _logger.debug("parsed %d existing segment time range(s)", len(ranges))
 
     # Assign each file to the first matching existing range (inclusive bounds).
     assigned: dict[str, list[str]] = {sid: [] for _, _, sid, _ in ranges}
@@ -193,27 +202,50 @@ def plan(
 
         if not combined:
             # Every file in this segment was deleted; nothing to rebuild now.
+            _logger.debug("segment %s has no remaining files; skipping rebuild", sid)
             continue
 
         segment = _make_segment(combined, params, replaces_segment_id=sid)
         if segment.segment_id == sid:
             result.skipped_segment_ids.append(sid)
+            _logger.debug("segment %s unchanged; skipping", sid)
         elif segment.segment_id in known_ids:
             result.skipped_segment_ids.append(sid)
+            _logger.debug("segment %s already known as %s; skipping", sid, segment.segment_id)
         else:
             known_ids.add(segment.segment_id)
             result.segments.append(segment)
+            _logger.info(
+                "rebuild planned: %s (%s) replaces %s",
+                segment.segment_id[:12],
+                segment.title,
+                sid[:12],
+            )
 
     # Pack free files into new segments.
     groups = greedy_pack(free_files, segment_duration)
+    _logger.debug("packed %d free file(s) into %d new group(s)", len(free_files), len(groups))
     if groups and not flush and _is_partial(groups[-1], segment_duration):
         result.pending_files = groups.pop()
+        _logger.info(
+            "holding %d file(s) as pending (last group shorter than %.1fs and not flushing)",
+            len(result.pending_files),
+            segment_duration,
+        )
 
     for group in groups:
         segment = _make_segment(group, params)
         if segment.segment_id in known_ids:
+            _logger.debug("new segment %s already known; skipping", segment.segment_id)
             continue
         known_ids.add(segment.segment_id)
         result.segments.append(segment)
+        _logger.info(
+            "new segment planned: %s (%s) with %d file(s), %.1fs",
+            segment.segment_id[:12],
+            segment.title,
+            len(segment.file_ids),
+            segment.duration_seconds,
+        )
 
     return result

@@ -12,6 +12,10 @@ import os
 
 from google.oauth2.credentials import Credentials
 
+from .log import get_logger
+
+_logger = get_logger("auth")
+
 # Google may return more scopes than requested when re-authorizing with a
 # superset (e.g. adding youtube.force-ssl on top of previously-granted
 # scopes). oauthlib rejects that mismatch by default; relax it.
@@ -31,16 +35,21 @@ def credentials_from_token_string(token_str: str) -> Credentials:
     try:
         info = json.loads(token_str)
     except json.JSONDecodeError as exc:
+        _logger.error("token string is not valid JSON")
         raise ValueError("token string is not valid JSON") from exc
+    _logger.debug("built credentials from TUBETAPE_TOKEN env var")
     return Credentials.from_authorized_user_info(info, SCOPES)
 
 
 def load_token_file(path: str) -> Credentials:
     """Load credentials from a token.json file."""
     try:
-        return Credentials.from_authorized_user_file(path, SCOPES)
+        creds = Credentials.from_authorized_user_file(path, SCOPES)
     except (OSError, ValueError) as exc:
+        _logger.error("cannot load token file %s: %s", path, exc)
         raise ValueError(f"cannot load token file {path}: {exc}") from exc
+    _logger.info("loaded YouTube credentials from %s", path)
+    return creds
 
 
 def check_token_permissions(path: str) -> bool:
@@ -60,6 +69,7 @@ def run_oauth_flow(client_secret_path: str, token_path: str | None = None) -> Cr
     from google_auth_oauthlib.flow import InstalledAppFlow
 
     flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
+    _logger.info("starting local OAuth flow (client secret %s)", client_secret_path)
     credentials = flow.run_local_server(port=0)
 
     if token_path is not None:
@@ -67,6 +77,7 @@ def run_oauth_flow(client_secret_path: str, token_path: str | None = None) -> Cr
         with open(target, "w", encoding="utf-8") as handle:
             handle.write(credentials.to_json())
         os.chmod(target, 0o600)
+        _logger.info("saved OAuth token to %s (mode 0600)", target)
 
     return credentials
 
@@ -90,6 +101,7 @@ def headless_oauth_flow(
 
     flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
     flow.redirect_uri = redirect_uri
+    _logger.info("starting headless OAuth flow (redirect %s)", redirect_uri)
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         prompt="consent",
@@ -104,6 +116,7 @@ def headless_oauth_flow(
 
     query = parse_qs(urlparse(redirect_url).query)
     if "code" not in query:
+        _logger.error("no 'code' parameter in the redirect URL")
         raise ValueError("no 'code' parameter in the redirect URL")
     code = query["code"][0]
 
@@ -111,6 +124,7 @@ def headless_oauth_flow(
     # redirect_uri (no trailing slash) and the PKCE code_verifier matching the
     # authorization request. Retrying with a different redirect_uri can
     # consume the one-time code, so don't.
+    _logger.debug("exchanging authorization code for token")
     flow.fetch_token(code=code)
     credentials = flow.credentials
 
@@ -119,5 +133,6 @@ def headless_oauth_flow(
         with open(target, "w", encoding="utf-8") as handle:
             handle.write(credentials.to_json())
         os.chmod(target, 0o600)
+        _logger.info("saved OAuth token to %s (mode 0600)", target)
 
     return credentials

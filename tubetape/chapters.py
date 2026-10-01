@@ -8,6 +8,10 @@ one chapter.
 
 from __future__ import annotations
 
+from .log import get_logger
+
+_logger = get_logger("chapters")
+
 DEFAULT_MIN_GAP = 10.0
 
 
@@ -42,6 +46,7 @@ def build_chapters(items, min_gap: float = DEFAULT_MIN_GAP) -> list[list[str]]:
         # else: merge into the current chapter (no new entry)
         elapsed += float(duration)
 
+    _logger.debug("built %d chapter(s) from %d item(s)", len(chapters), len(items))
     return chapters
 
 

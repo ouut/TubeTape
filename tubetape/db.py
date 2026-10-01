@@ -46,6 +46,10 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
+from .log import get_logger
+
+_logger = get_logger("db")
+
 SCHEMA_VERSION = 1
 
 SEGMENT_STATUS_PENDING = "pending"
@@ -116,16 +120,20 @@ class Database:
     def load(cls, path: str) -> "Database":
         """Load a database file, or return an empty database if it is missing."""
         if not os.path.exists(path):
+            _logger.info("database %s does not exist; starting with an empty one", path)
             return cls(path=os.path.abspath(path))
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 raw = json.load(handle)
         except json.JSONDecodeError as exc:
+            _logger.error("corrupt database %s: %s", path, exc)
             raise DatabaseError(f"corrupt database {path}: {exc}") from exc
         except OSError as exc:
+            _logger.error("cannot read database %s: %s", path, exc)
             raise DatabaseError(f"cannot read database {path}: {exc}") from exc
 
         if not isinstance(raw, dict):
+            _logger.error("database %s must contain a JSON object", path)
             raise DatabaseError(f"database {path} must contain a JSON object")
 
         queue = raw.get("queue", {})
@@ -133,6 +141,13 @@ class Database:
             queue = {}
         queue.setdefault("pending_file_ids", [])
         queue.setdefault("rebuild_segment_ids", [])
+
+        _logger.info(
+            "database loaded: %s (%d file(s), %d segment(s))",
+            path,
+            len(raw.get("files", {})),
+            len(raw.get("segments", {})),
+        )
 
         return cls(
             version=raw.get("version", SCHEMA_VERSION),
@@ -179,6 +194,12 @@ class Database:
                 pass
             raise
         self.path = target
+        _logger.debug(
+            "database saved to %s (%d file(s), %d segment(s))",
+            target,
+            len(self.files),
+            len(self.segments),
+        )
 
     # ------------------------------------------------------------ file access
 
@@ -186,9 +207,12 @@ class Database:
         return self.files.get(file_id)
 
     def upsert_file(self, file_id: str, record: dict) -> None:
+        _logger.debug("upsert file %s (%s)", file_id[:12], record.get("path"))
         self.files[file_id] = record
 
     def remove_file(self, file_id: str) -> None:
+        if file_id in self.files:
+            _logger.debug("remove file %s", file_id[:12])
         self.files.pop(file_id, None)
 
     # --------------------------------------------------------- segment access
@@ -197,6 +221,12 @@ class Database:
         return self.segments.get(segment_id)
 
     def upsert_segment(self, segment_id: str, record: dict) -> None:
+        _logger.debug(
+            "upsert segment %s (status=%s, video=%s)",
+            segment_id[:12],
+            record.get("status"),
+            record.get("youtube_video_id"),
+        )
         self.segments[segment_id] = record
 
     def set_segment_status(self, segment_id: str, status: str) -> None:

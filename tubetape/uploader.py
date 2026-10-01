@@ -8,11 +8,16 @@ retried (they queue to the next day).
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from googleapiclient.http import MediaFileUpload
+
+from .log import get_logger
+
+_logger = get_logger("uploader")
 
 UPLOAD_QUOTA_UNITS = 1600
 DAILY_QUOTA_DEFAULT = 10000
@@ -130,10 +135,24 @@ class Uploader:
     ) -> str:
         """Upload a media file and return the new video ID."""
         if not self.quota.can_upload():
+            _logger.warning(
+                "upload refused: daily quota exhausted (%d/%d units used)",
+                self.quota.used,
+                self.quota.daily_limit,
+            )
             raise QuotaExceededError(
                 f"daily quota exhausted ({self.quota.used}/{self.quota.daily_limit} units used)"
             )
 
+        size = os.path.getsize(media_path)
+        _logger.info(
+            "uploading %s (%.1f MB) as %r (privacy=%s, category=%s)",
+            media_path,
+            size / (1024 * 1024),
+            title,
+            privacy,
+            category_id,
+        )
         body = build_upload_body(title, description, privacy, category_id, made_for_kids=False)
         media = MediaFileUpload(media_path, chunksize=-1, resumable=True)
         request = self.service.videos().insert(part="snippet,status", body=body, media_body=media)
@@ -144,6 +163,12 @@ class Uploader:
         self.quota.consume()
 
         video_id = response.get("id")
+        _logger.info(
+            "upload complete: video id %s (quota used %d/%d)",
+            video_id,
+            self.quota.used,
+            self.quota.daily_limit,
+        )
         if self.playlist_id:
             self.add_to_playlist(video_id)
         return video_id
@@ -154,10 +179,20 @@ class Uploader:
                 return request.execute()
             except Exception as exc:  # noqa: BLE001 - retry transient errors
                 if is_quota_error(exc):
+                    _logger.warning("upload hit quota error: %s", exc)
                     raise QuotaExceededError(f"upload quota exceeded: {exc}") from exc
                 if attempt == max_retries:
+                    _logger.error("upload failed after %d attempt(s): %s", attempt + 1, exc)
                     raise
-                sleep(base_delay * (2 ** attempt))
+                delay = base_delay * (2 ** attempt)
+                _logger.warning(
+                    "upload attempt %d/%d failed (%s); retrying in %.1fs",
+                    attempt + 1,
+                    max_retries + 1,
+                    exc,
+                    delay,
+                )
+                sleep(delay)
         raise RuntimeError("retries exhausted")
 
     def add_to_playlist(self, video_id: str, playlist_id: str | None = None) -> dict:
@@ -165,6 +200,7 @@ class Uploader:
         pid = playlist_id or self.playlist_id
         if not pid:
             return {}
+        _logger.info("adding video %s to playlist %s", video_id, pid)
         request = self.service.playlistItems().insert(
             part="snippet",
             body={
@@ -178,10 +214,15 @@ class Uploader:
 
     def verify(self, video_id: str) -> None:
         """Verify an uploaded video exists; raise if it does not."""
+        _logger.info("verifying uploaded video %s exists", video_id)
         response = self.service.videos().list(part="status", id=video_id).execute()
         if not response.get("items"):
+            _logger.error("uploaded video %s not found during verification", video_id)
             raise RuntimeError(f"uploaded video {video_id} not found")
+        _logger.debug("verified video %s", video_id)
 
     def delete_video(self, video_id: str) -> None:
         """Delete a video (used by rebuild). Requires the youtube.force-ssl scope."""
+        _logger.info("deleting old video %s", video_id)
         self.service.videos().delete(id=video_id).execute()
+        _logger.debug("deleted video %s", video_id)

@@ -10,11 +10,16 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
+from typing import Callable
 
 from .chapters import build_chapters
+from .log import get_logger
 from .planner import display_ts
 from .scanner import ScannedFile, FILE_TYPE_IMAGE, FILE_TYPE_VIDEO
+
+_logger = get_logger("transcoder")
 
 
 @dataclass
@@ -120,12 +125,22 @@ def build_concat_command(list_path: str, dst: str) -> list[str]:
 
 
 def run_ffmpeg(cmd: list[str]) -> None:
+    _logger.debug("ffmpeg command: %s", " ".join(cmd))
+    start = time.monotonic()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        _logger.error("ffmpeg command failed after %.1fs: %s", time.monotonic() - start, exc)
         raise RuntimeError(f"ffmpeg failed: {exc}") from exc
     if proc.returncode != 0:
+        _logger.error(
+            "ffmpeg exited with code %d after %.1fs: %s",
+            proc.returncode,
+            time.monotonic() - start,
+            proc.stderr[-2000:],
+        )
         raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {proc.stderr[-2000:]}")
+    _logger.debug("ffmpeg finished successfully in %.1fs", time.monotonic() - start)
 
 
 def check_disk_space(path: str, required_bytes: int) -> None:
@@ -140,13 +155,24 @@ def transcode_segment(
     out_path: str,
     config: TranscodeConfig | None = None,
     work_dir: str | None = None,
+    progress: Callable[[int, int, ScannedFile], None] | None = None,
 ) -> tuple[str, list[list[str]]]:
     """Transcode a segment's files into a single MP4.
 
     Returns ``(out_path, chapters)`` where chapters are ``[[start, title], ...]``.
+
+    ``progress``, when given, is called before each clip as
+    ``progress(done, total, item)`` (``done`` is 1-based).
     """
     config = config or TranscodeConfig()
     canvas_w, canvas_h = segment_canvas(files, config)
+    _logger.info(
+        "transcoding segment: %d file(s) -> %s (canvas %dx%d)",
+        len(files),
+        out_path,
+        canvas_w,
+        canvas_h,
+    )
 
     chapters = build_chapters(
         [
@@ -154,10 +180,13 @@ def transcode_segment(
             for item in files
         ]
     )
+    _logger.info("built %d chapter(s) from %d file(s)", len(chapters), len(files))
 
     with tempfile.TemporaryDirectory(dir=work_dir) as tmp:
         clips: list[str] = []
         for index, item in enumerate(files):
+            if progress is not None:
+                progress(index + 1, len(files), item)
             clip_path = os.path.join(tmp, f"clip_{index:04d}.mp4")
             if item.type == FILE_TYPE_IMAGE:
                 cmd = build_image_clip_command(
@@ -168,6 +197,7 @@ def transcode_segment(
                 cmd = build_video_clip_command(item.abs_path, clip_path, canvas_w, canvas_h, config)
             else:
                 raise ValueError(f"unknown file type: {item.type!r}")
+            _logger.info("clip %d/%d: %s (%s)", index + 1, len(files), item.rel_path, item.type)
             run_ffmpeg(cmd)
             clips.append(clip_path)
 
@@ -175,7 +205,9 @@ def transcode_segment(
         with open(list_path, "w", encoding="utf-8") as handle:
             for clip in clips:
                 handle.write(f"file '{clip}'\n")
+        _logger.debug("concatenating %d clip(s)", len(clips))
 
         run_ffmpeg(build_concat_command(list_path, out_path))
 
+    _logger.info("transcode complete: %s", out_path)
     return out_path, chapters

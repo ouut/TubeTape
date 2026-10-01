@@ -10,7 +10,10 @@ from __future__ import annotations
 import os
 from typing import Callable
 
+from .log import get_logger
 from .scanner import MEDIA_EXTENSIONS
+
+_logger = get_logger("watcher")
 
 
 def is_media_path(path: str) -> bool:
@@ -59,6 +62,7 @@ class Watcher:
 
     def start(self) -> None:
         if not self.use_watchdog:
+            _logger.debug("watchdog disabled; using polling only")
             return
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
@@ -67,12 +71,14 @@ class Watcher:
         self._observer = Observer()
         self._observer.schedule(handler, self.input_dir, recursive=True)
         self._observer.start()
+        _logger.info("watchdog observer started on %s", self.input_dir)
 
     def stop(self) -> None:
         if self._observer is not None:
             self._observer.stop()
             self._observer.join(timeout=5)
             self._observer = None
+            _logger.debug("watchdog observer stopped")
 
     def poll_once(self, known_paths: set[str]) -> set[str]:
         """Polling fallback: return media paths not present in ``known_paths``."""
@@ -82,4 +88,7 @@ class Watcher:
                 path = os.path.join(root, name)
                 if is_media_path(path):
                     found.add(path)
-        return found - known_paths
+        new = found - known_paths
+        if new:
+            _logger.debug("poll_once found %d new media path(s)", len(new))
+        return new

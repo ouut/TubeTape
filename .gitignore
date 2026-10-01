@@ -3,6 +3,10 @@ client_secret.json
 token.json
 tubetape.json
 
+# 运行日志
+tubetape.json.log
+*.log
+
 # Python
 __pycache__/
 *.pyc

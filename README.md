@@ -43,6 +43,8 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 扫描（scan）
   → 递归找图片/视频，提取拍摄时间、分辨率、内容哈希(file_id)
   → 与数据库对比：新增 / 已处理 / 已删除
+  → 哈希缓存：文件「大小 + mtime」没变时直接复用上次的哈希和元数据，不重新读文件
+  → 视频元数据优先用 ffprobe 结构化读取，缺失时才回退到 ffmpeg -i
 
 分片规划（plan）
   → 按拍摄时间升序，紧凑拼接（去掉时间空洞）
@@ -159,10 +161,31 @@ python -m tubetape --input /path/to/photos --watch
 | `--only-camera-photos` | 关 | 只保留相机拍摄的照片（EXIF 有 Make+Model） |
 | `--only-phone-videos` | 关 | 只保留手机拍摄的视频（元数据有 make） |
 | `--dry-run` | — | 只扫描、计算分片和 ID，不转码不上传 |
+| `-v` / `--verbose` | 关 | 更详细的终端输出；`-v` 显示 INFO，`-vv` 显示 DEBUG（默认仅 WARNING+） |
+| `--log-file` | `<db>.log` | 详细运行日志文件路径（始终记录 DEBUG 级别） |
 
 ---
 
 ## 命令例子
+
+### 运行日志
+
+程序运行时会：
+
+1. **在终端（stdout）打印友好进度**：扫描了多少文件、规划出几个分片、正在转码第几个片段、上传结果、配额用量等。
+2. **把带时间戳的详细 DEBUG 日志写入 `<db>.log`**（例如 `tubetape.json.log`），记录每一步细节：文件哈希、元数据解析、ffmpeg 命令行、上传重试、重建步骤、数据库读写等。
+3. **在终端（stderr）打印 WARNING 及以上**（错误、配额耗尽、上传失败重试等）。用 `-v` 可在 stderr 同时看 INFO，`-vv` 看全部 DEBUG。
+
+```bash
+# 默认：stdout 友好进度 + <db>.log 详细日志
+python -m tubetape --input ~/Photos --no-watch
+
+# 终端也要看全部细节（DEBUG）
+python -m tubetape --input ~/Photos --no-watch -vv
+
+# 日志写到指定文件
+python -m tubetape --input ~/Photos --no-watch --log-file /var/log/tubetape.log
+```
 
 ### 基础用法
 

@@ -13,16 +13,23 @@ first/middle/last 4 MB plus size.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Callable
 
 import exifread
 from PIL import Image
 
 from .db import FILE_TYPE_IMAGE, FILE_TYPE_VIDEO, Database
+from .log import get_logger
+
+_logger = get_logger("scanner")
 
 IMAGE_EXTENSIONS = frozenset(
     [".jpg", ".jpeg", ".png", ".heic", ".tif", ".tiff", ".webp", ".bmp"]
@@ -162,8 +169,10 @@ def file_sha256(path: str, threshold: int = FAST_HASH_THRESHOLD) -> str:
         with open(path, "rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 hasher.update(chunk)
+        _logger.debug("hashed %s (%d bytes, full hash)", path, size)
         return hasher.hexdigest()
 
+    _logger.debug("hashed %s (%d bytes, fast hash: first/middle/last 4MB + size)", path, size)
     with open(path, "rb") as handle:
         hasher.update(handle.read(FAST_HASH_CHUNK))  # first 4 MB
         handle.seek(max(0, size // 2 - FAST_HASH_CHUNK // 2))
@@ -204,25 +213,115 @@ def _parse_ffmpeg_make(stderr: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _parse_ffprobe_json(text: str) -> dict:
+    """Parse ``ffprobe -print_format json`` output into the probe dict."""
+    data = json.loads(text)
+
+    fmt = data.get("format") or {}
+    tags = fmt.get("tags") or {}
+    duration = None
+    if fmt.get("duration"):
+        try:
+            duration = float(fmt["duration"])
+        except (TypeError, ValueError):
+            duration = None
+
+    creation_time = tags.get("creation_time")
+    make = _make_from_tags(tags)
+
+    resolution = None
+    for stream in data.get("streams") or []:
+        if stream.get("codec_type") != "video":
+            continue
+        width, height = stream.get("width"), stream.get("height")
+        if width and height:
+            resolution = f"{width}x{height}"
+        # creation_time / make may also live on the video stream's tags.
+        stags = stream.get("tags") or {}
+        if not creation_time:
+            creation_time = stags.get("creation_time")
+        if not make:
+            make = _make_from_tags(stags)
+        break
+
+    return {
+        "duration_seconds": duration,
+        "resolution": resolution,
+        "creation_time": creation_time,
+        "make": make,
+    }
+
+
+def _make_from_tags(tags: dict) -> str | None:
+    """Pick a camera manufacturer out of common ffprobe tag names."""
+    return (
+        tags.get("make")
+        or tags.get("com.apple.quicktime.make")
+        or tags.get("com.android.manufacturer")
+    )
+
+
 def probe_video(path: str) -> dict:
-    """Probe a video with ``ffmpeg -i``, returning duration/resolution/creation_time/make."""
+    """Probe a video, preferring ``ffprobe`` (structured, faster).
+
+    Falls back to ``ffmpeg -i`` stderr parsing when ffprobe is missing or
+    returns nothing usable (e.g. no duration).
+    """
+    _logger.debug("probing video metadata: %s", path)
+
+    if shutil.which("ffprobe"):
+        try:
+            proc = subprocess.run(
+                ["ffprobe", "-v", "error", "-print_format", "json",
+                 "-show_format", "-show_streams", path],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                result = _parse_ffprobe_json(proc.stdout)
+                if result["duration_seconds"] is not None:
+                    _logger.debug(
+                        "probed %s via ffprobe: duration=%s resolution=%s "
+                        "creation_time=%s make=%s",
+                        path,
+                        result["duration_seconds"],
+                        result["resolution"],
+                        result["creation_time"],
+                        result["make"],
+                    )
+                    return result
+        except (json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+            _logger.debug("ffprobe failed for %s (%s); falling back to ffmpeg", path, exc)
+
+    # Fallback: ffmpeg -i and regex parsing of stderr.
     try:
         proc = subprocess.run(
-            ["ffmpeg", "-i", path],
+            ["ffmpeg", "-hide_banner", "-i", path],
             capture_output=True,
             text=True,
             timeout=120,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        _logger.warning("ffmpeg probe failed for %s: %s", path, exc)
         raise ValueError(f"ffmpeg probe failed: {exc}") from exc
 
     stderr = proc.stderr or ""
-    return {
+    result = {
         "duration_seconds": _parse_ffmpeg_duration(stderr),
         "resolution": _parse_ffmpeg_resolution(stderr),
         "creation_time": _parse_ffmpeg_creation_time(stderr),
         "make": _parse_ffmpeg_make(stderr),
     }
+    _logger.debug(
+        "probed %s via ffmpeg: duration=%s resolution=%s creation_time=%s make=%s",
+        path,
+        result["duration_seconds"],
+        result["resolution"],
+        result["creation_time"],
+        result["make"],
+    )
+    return result
 
 
 # ---------------------------------------------------------------- GPS helpers
@@ -382,6 +481,7 @@ class ScannedFile:
     missing_meta: bool = False
     time_source: str = "metadata"  # metadata | filename | mtime
     source: str = "unknown"  # camera | other (camera photo / phone video vs the rest)
+    mtime_ns: int | None = None  # st_mtime_ns, used for the scan cache
 
     def to_record(self) -> dict:
         return {
@@ -397,6 +497,7 @@ class ScannedFile:
             "missing_meta": self.missing_meta,
             "time_source": self.time_source,
             "source": self.source,
+            "mtime_ns": self.mtime_ns,
         }
 
 
@@ -420,17 +521,32 @@ def scan_files(
     hash_threshold: int = FAST_HASH_THRESHOLD,
     only_camera_photos: bool = False,
     only_phone_videos: bool = False,
+    cache: dict[str, dict] | None = None,
+    on_file: Callable[[ScannedFile], None] | None = None,
 ) -> tuple[list[ScannedFile], list[dict], list[dict]]:
     """Recursively scan ``input_dir``, returning (scanned files, errors, skipped).
 
     Unparseable/corrupt files go into ``errors``; files excluded by the
     camera/phone filters go into ``skipped``.
+
+    ``cache`` maps ``rel_path`` to a previous database record. When a file's
+    size and mtime both match its cached record, the expensive content hash and
+    metadata probing (ffprobe/EXIF) are skipped and the cached values reused.
+
+    ``on_file``, when given, is called with each successfully-scanned file
+    (including cache hits) so the caller can persist progress incrementally.
     """
     input_dir = os.path.abspath(input_dir)
     scanned: list[ScannedFile] = []
     errors: list[dict] = []
     skipped: list[dict] = []
 
+    _logger.info("scanning directory: %s", input_dir)
+
+    # Phase 1: collect candidate media files. This is fast (only walks names),
+    # so we can report the total count up front and show per-file progress
+    # during the slow hashing/metadata phase below.
+    candidates: list[tuple[str, str, str, str]] = []
     for root, dirs, names in os.walk(input_dir):
         # Skip hidden files/dirs: the transcode output is a dotfile written
         # next to the db, and must not be re-scanned as media.
@@ -439,18 +555,79 @@ def scan_files(
             if name.startswith("."):
                 continue
             abs_path = os.path.join(root, name)
-            rel_path = os.path.relpath(abs_path, input_dir)
             ext = os.path.splitext(name)[1].lower()
-
             if ext in IMAGE_EXTENSIONS:
                 ftype = FILE_TYPE_IMAGE
             elif ext in VIDEO_EXTENSIONS:
                 ftype = FILE_TYPE_VIDEO
             else:
                 continue
+            rel_path = os.path.relpath(abs_path, input_dir)
+            candidates.append((abs_path, rel_path, name, ftype))
 
+    total = len(candidates)
+    _logger.info("found %d media file(s) to scan", total)
+
+    # Phase 2: hash + extract metadata for each candidate, one at a time, with
+    # a progress line *before* each file so a slow/large file is always named.
+    # Unchanged files (same size + mtime as a previous record) skip the hash
+    # and ffprobe/EXIF steps entirely via the record cache.
+    for index, (abs_path, rel_path, name, ftype) in enumerate(candidates, start=1):
+        try:
+            st = os.stat(abs_path)
+            size = st.st_size
+            mtime_ns = st.st_mtime_ns
+        except OSError as exc:
+            errors.append({"path": rel_path, "reason": str(exc), "ts": utc_now_iso()})
+            _logger.warning("failed to stat %s: %s", rel_path, exc)
+            continue
+
+        cached = (cache or {}).get(rel_path)
+        cache_hit = bool(
+            cached
+            and cached.get("sha256")
+            and cached.get("type") == ftype
+            and cached.get("size_bytes") == size
+            and cached.get("mtime_ns") == mtime_ns
+        )
+
+        _logger.info(
+            "scan [%d/%d] %s (%s, %.1f MB)%s",
+            index,
+            total,
+            rel_path,
+            ftype,
+            size / (1024 * 1024),
+            " [cache]" if cache_hit else "",
+        )
+
+        if cache_hit:
+            captured_at_utc = cached.get("captured_at_utc")
+            captured_epoch = None
+            if captured_at_utc:
+                dt = parse_iso_utc(captured_at_utc)
+                if dt is not None:
+                    captured_epoch = dt.timestamp()
+            item = ScannedFile(
+                file_id=cached["sha256"],
+                abs_path=abs_path,
+                rel_path=rel_path,
+                name=name,
+                type=ftype,
+                size_bytes=size,
+                captured_at_utc=captured_at_utc,
+                captured_epoch=captured_epoch,
+                resolution=cached.get("resolution"),
+                duration_seconds=cached.get("duration_seconds"),
+                location=cached.get("location"),
+                missing_meta=bool(cached.get("missing_meta", True)),
+                time_source=cached.get("time_source", "metadata"),
+                source=cached.get("source", "unknown"),
+                mtime_ns=mtime_ns,
+            )
+        else:
+            started = time.monotonic()
             try:
-                size = os.path.getsize(abs_path)
                 file_id = file_sha256(abs_path, hash_threshold)
                 if ftype == FILE_TYPE_IMAGE:
                     meta = _image_meta(abs_path, timezone)
@@ -475,34 +652,57 @@ def scan_files(
                     missing_meta = True
 
                 source = "camera" if meta["is_camera"] else "other"
-                if ftype == FILE_TYPE_IMAGE and only_camera_photos and source != "camera":
-                    skipped.append({"path": rel_path, "reason": "not a camera photo"})
-                    continue
-                if ftype == FILE_TYPE_VIDEO and only_phone_videos and source != "camera":
-                    skipped.append({"path": rel_path, "reason": "not a phone video"})
-                    continue
-
-                scanned.append(
-                    ScannedFile(
-                        file_id=file_id,
-                        abs_path=abs_path,
-                        rel_path=rel_path,
-                        name=name,
-                        type=ftype,
-                        size_bytes=size,
-                        captured_at_utc=captured_at_utc,
-                        captured_epoch=captured_epoch,
-                        resolution=meta["resolution"],
-                        duration_seconds=duration,
-                        location=meta["location"],
-                        missing_meta=missing_meta,
-                        time_source=time_source,
-                        source=source,
-                    )
+                item = ScannedFile(
+                    file_id=file_id,
+                    abs_path=abs_path,
+                    rel_path=rel_path,
+                    name=name,
+                    type=ftype,
+                    size_bytes=size,
+                    captured_at_utc=captured_at_utc,
+                    captured_epoch=captured_epoch,
+                    resolution=meta["resolution"],
+                    duration_seconds=duration,
+                    location=meta["location"],
+                    missing_meta=missing_meta,
+                    time_source=time_source,
+                    source=source,
+                    mtime_ns=mtime_ns,
+                )
+                _logger.debug(
+                    "scanned %s in %.1fs: id=%s captured=%s source=%s time_source=%s",
+                    rel_path,
+                    time.monotonic() - started,
+                    file_id[:12],
+                    captured_at_utc,
+                    source,
+                    time_source,
                 )
             except Exception as exc:  # noqa: BLE001 - skip unparseable files
                 errors.append({"path": rel_path, "reason": str(exc), "ts": utc_now_iso()})
+                _logger.warning("failed to scan %s: %s", rel_path, exc)
+                continue
 
+        # Source filters apply to both cached and freshly-scanned files.
+        if ftype == FILE_TYPE_IMAGE and only_camera_photos and item.source != "camera":
+            skipped.append({"path": rel_path, "reason": "not a camera photo"})
+            _logger.info("skipped %s (not a camera photo)", rel_path)
+            continue
+        if ftype == FILE_TYPE_VIDEO and only_phone_videos and item.source != "camera":
+            skipped.append({"path": rel_path, "reason": "not a phone video"})
+            _logger.info("skipped %s (not a phone video)", rel_path)
+            continue
+
+        scanned.append(item)
+        if on_file is not None:
+            on_file(item)
+
+    _logger.info(
+        "directory scan finished: %d scanned, %d error(s), %d skipped",
+        len(scanned),
+        len(errors),
+        len(skipped),
+    )
     return scanned, errors, skipped
 
 
@@ -513,21 +713,38 @@ def scan(
     image_duration: float = 3.0,
     only_camera_photos: bool = False,
     only_phone_videos: bool = False,
+    on_file: Callable[[ScannedFile], None] | None = None,
 ) -> ScanResult:
     """Scan and reconcile against the database (new / processed / deleted)."""
+    cache: dict[str, dict] = {}
+    existing_ids = set(db.files.keys())  # snapshot before any incremental upserts
+    for record in db.files.values():
+        path = record.get("path")
+        if path:
+            cache[path] = record
+    _logger.debug("built scan cache with %d cached path(s)", len(cache))
+
     scanned, errors, skipped = scan_files(
         input_dir,
         timezone,
         image_duration,
         only_camera_photos=only_camera_photos,
         only_phone_videos=only_phone_videos,
+        cache=cache,
+        on_file=on_file,
     )
-    existing_ids = set(db.files.keys())
     scanned_ids = {f.file_id for f in scanned}
 
     new_file_ids = [f.file_id for f in scanned if f.file_id not in existing_ids]
     processed_file_ids = [f.file_id for f in scanned if f.file_id in existing_ids]
     deleted_file_ids = sorted(existing_ids - scanned_ids)
+
+    _logger.info(
+        "reconciled against db: %d new, %d processed, %d deleted",
+        len(new_file_ids),
+        len(processed_file_ids),
+        len(deleted_file_ids),
+    )
 
     return ScanResult(
         files=scanned,
