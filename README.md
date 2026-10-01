@@ -15,6 +15,7 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 - [快速开始](#快速开始)
 - [命令行参数](#命令行参数)
 - [命令例子](#命令例子)
+- [长期挂机（持续运行）](#长期挂机持续运行)
 - [过滤：只要相机照片和手机视频](#过滤只要相机照片和手机视频)
 - [数据库](#数据库)
 - [配额](#配额)
@@ -263,6 +264,71 @@ python -m tubetape --input ~/Photos --flush --no-watch
 # Windows
 tubetape.exe --input D:\Photos --dry-run
 ```
+
+---
+
+## 长期挂机（持续运行）
+
+数据量大时（几万张照片/视频），受配额限制（约 6 片/天）需要连续跑很多天。`--watch` 模式就是为「启动后挂着不管」设计的：自动检测新文件、自动归入分片、自动上传，配额耗尽自动暂停、每日自动续传。
+
+### 完整启动命令
+
+```bash
+cd TubeTape
+TUBETAPE_TOKEN="$(cat token.json)" nohup python3 -m tubetape \
+    --input /path/to/photos \
+    --timezone Asia/Shanghai \
+    --privacy private \
+    --only-camera-photos \
+    --only-phone-videos \
+    --segment-duration 15m \
+    --watch \
+    > /tmp/tubetape.log 2>&1 &
+```
+
+- `--segment-duration 15m`：**未验证**的 YouTube 账号单视频上限 15 分钟（默认 20m 会传失败）；已验证账号可调大（如 `1h`）减少总片数。
+- `--watch`：持续运行；配额耗尽后自动暂停，每天（UTC 零点）自动续传。
+- 日志：`tail -f /tmp/tubetape.log`。
+
+### 运行中增加照片/视频会怎样？
+
+挂着的时候往目录里扔新文件，`--watch` 会自动检测（默认每 30s 轮询 + 10 分钟静默期去抖，防拷贝一半）并重新处理。新文件按拍摄时间落入三种情况：
+
+| 新文件拍摄时间 | 行为 | 消耗配额 |
+|---|---|---|
+| 落在**已封口分片**的区间内 | **重建该分片**：转码（并入新文件）→ 上传新片 → 删除旧片 → 更新库（旧 video_id 进 `previous_video_ids`） | 1600 units（一次重传） |
+| 落在所有区间**之外** | 进入待处理队列，攒够 `--segment-duration` 才成片上传 | 成片时 1600 units |
+| 与现有文件**内容重复**（相同哈希） | 自动去重，忽略 | 0 |
+
+> ⚠️ 给已封口分片「加一张照片」会触发该分片重建，消耗一次配额并改变该片 URL。可用 `--no-rebuild` 改为单独补录分片（不动旧片、不删旧视频）。
+> 默认有 24h 冷却（`--rebuild-cooldown`），同一分片多次变更会合并成一次重建。
+
+### 配额与每日续传
+
+- 每天约 10000 units ≈ 6 次上传（含重建）。
+- 用完当天配额后**优雅暂停**（不崩溃、不丢进度）：已传的分片记录在库，未传的留在队列。
+- watch 每天自动重新处理，继续传剩余分片，直到全部传完。
+- 期间随时 Ctrl+C 退出：会先 flush 封片再退出，进度全部落库。
+
+### 停止与重启
+
+```bash
+# 停止（发送退出信号，自动 flush 封片）
+kill -INT <pid>          # 或前台运行时按 Ctrl+C
+
+# 重启后从数据库断点续传，已封口未变更的分片不重复处理
+TUBETAPE_TOKEN="$(cat token.json)" python3 -m tubetape \
+    --input /path/to/photos --timezone Asia/Shanghai --watch
+```
+
+### 正式挂机前先 dry-run 看规模
+
+```bash
+python3 -m tubetape --dry-run --no-watch --input /path/to/photos \
+    --timezone Asia/Shanghai --only-camera-photos --only-phone-videos --segment-duration 15m
+```
+
+输出会告诉你：保留/丢弃多少文件、总共多少分片、总时长多少——据此估算要跑多少天。
 
 ---
 
