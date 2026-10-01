@@ -405,6 +405,8 @@ python scripts/build.py --name tube    # 自定义名字
 
 > 可执行文件**不捆绑 ffmpeg**，目标机器仍需安装 ffmpeg。
 
+> ⚠️ **glibc 兼容性**：Linux 可执行文件是在 Ubuntu 22.04（glibc 2.35）上构建的，只能在 glibc ≥ 2.35 的系统运行。若在更旧的系统（如 Debian 11）报 `GLIBC_2.xx not found`，请改用源码运行（`python3 -m tubetape`），或自行在目标系统上 `python scripts/build.py` 构建。
+
 ---
 
 ## 常见问题

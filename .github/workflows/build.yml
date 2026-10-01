@@ -12,7 +12,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Build Linux on an older glibc (Ubuntu 22.04) so the binary runs on
+          # older distros too (glibc is backward- but not forward-compatible).
+          - os: ubuntu-22.04
             name: linux
           - os: windows-latest
             name: windows
