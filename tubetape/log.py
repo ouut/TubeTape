@@ -78,10 +78,20 @@ def setup_logging(verbose: int = 0, log_file: str | None = None) -> None:
     root.addHandler(console)
 
     if log_file:
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter(_FILE_FORMAT, _DATE_FORMAT))
-        root.addHandler(file_handler)
+        try:
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        except OSError as exc:
+            # Read-only mount or missing directory (e.g. Docker dry-run with a
+            # read-only /data): keep console logging only, don't crash.
+            root.warning(
+                "cannot open log file %s: %s; continuing with console logging only",
+                log_file,
+                exc,
+            )
+        else:
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(logging.Formatter(_FILE_FORMAT, _DATE_FORMAT))
+            root.addHandler(file_handler)
 
     for noisy in _NOISY_LOGGERS:
         logging.getLogger(noisy).setLevel(logging.WARNING)

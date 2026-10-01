@@ -18,6 +18,7 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 - [长期挂机（持续运行）](#长期挂机持续运行)
 - [过滤：只要相机照片和手机视频](#过滤只要相机照片和手机视频)
 - [数据库](#数据库)
+- [哈希缓存（扫描加速）](#哈希缓存扫描加速)
 - [配额](#配额)
 - [构建可执行文件](#构建可执行文件)
 - [Docker](#docker)
@@ -34,6 +35,8 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 - **来源过滤**：可选择只保留相机拍摄的照片和手机拍摄的视频，丢弃截图和网络传输的压缩副本。
 - **配额感知**：每日配额用量持久化，超出自动排队到次日。
 - **断点续传**：进度存 JSON 库，崩溃/重启后从断点继续，已封口且未变更的分片不重复处理。
+- **扫描缓存**：文件「大小 + mtime」未变时直接复用上次的内容哈希和元数据，重复扫描极快。
+- **详细日志**：终端友好进度 + `<db>.log` 带时间戳的 DEBUG 审计日志，随时可查「程序正在做什么」。
 
 ---
 
@@ -43,8 +46,9 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 扫描（scan）
   → 递归找图片/视频，提取拍摄时间、分辨率、内容哈希(file_id)
   → 与数据库对比：新增 / 已处理 / 已删除
-  → 哈希缓存：文件「大小 + mtime」没变时直接复用上次的哈希和元数据，不重新读文件
+  → 哈希缓存：文件「大小 + mtime(ns)」没变时复用上次的哈希和元数据，不重新读文件
   → 视频元数据优先用 ffprobe 结构化读取，缺失时才回退到 ffmpeg -i
+  → 扫描中每 1000 个文件（或每 30s）增量落盘，中断不丢已扫进度
 
 分片规划（plan）
   → 按拍摄时间升序，紧凑拼接（去掉时间空洞）
@@ -170,11 +174,11 @@ python -m tubetape --input /path/to/photos --watch
 
 ### 运行日志
 
-程序运行时会：
+程序运行时会输出三层日志：
 
-1. **在终端（stdout）打印友好进度**：扫描了多少文件、规划出几个分片、正在转码第几个片段、上传结果、配额用量等。
-2. **把带时间戳的详细 DEBUG 日志写入 `<db>.log`**（例如 `tubetape.json.log`），记录每一步细节：文件哈希、元数据解析、ffmpeg 命令行、上传重试、重建步骤、数据库读写等。
-3. **在终端（stderr）打印 WARNING 及以上**（错误、配额耗尽、上传失败重试等）。用 `-v` 可在 stderr 同时看 INFO，`-vv` 看全部 DEBUG。
+1. **终端 stdout —— 友好进度**：扫描进度 `scan [i/N] ... [cache]`、分片规划、正在转码第几片、上传结果、配额用量等。
+2. **`<db>.log` —— 完整审计日志**：默认写到数据库旁（如 `tubetape.json.log`），始终记录带时间戳的 DEBUG 细节（每个文件的哈希、ffprobe/ffmpeg 命令、上传重试、重建步骤、数据库读写等）。
+3. **终端 stderr —— 错误/警告**：默认只显示 WARNING+；加 `-v` 显示 INFO，`-vv` 显示全部 DEBUG。
 
 ```bash
 # 默认：stdout 友好进度 + <db>.log 详细日志
@@ -185,7 +189,12 @@ python -m tubetape --input ~/Photos --no-watch -vv
 
 # 日志写到指定文件
 python -m tubetape --input ~/Photos --no-watch --log-file /var/log/tubetape.log
+
+# 另开终端实时看详细日志（含缓存命中 [cache]）
+tail -f ~/Photos/tubetape.json.log
 ```
+
+> Docker 里：stdout/stderr 用 `docker logs -f tubetape` 看；文件日志在数据库卷里（如 `/db/tubetape.json.log`），可用 `docker exec tubetape tail -f /db/tubetape.json.log` 看。
 
 ### 基础用法
 
@@ -395,6 +404,42 @@ python -m tubetape --input ~/Photos --only-camera-photos --only-phone-videos
 - `segment_id` = sha256(排序后的 file_id 列表 + 分片参数)，内容或参数变了才重建。
 - `previous_video_ids` = 重建替换掉的旧视频 id。
 - `settings.quota` = 当日配额用量，跨运行持久化，每日自动归零。
+- `files.*.size_bytes` / `mtime_ns` = 哈希缓存判断依据，扫描时与磁盘 `stat` 比对。
+
+---
+
+## 哈希缓存（扫描加速）
+
+第一次扫描要为每个文件读内容算 SHA-256、并为每个视频跑 ffprobe，数据量大时最慢（几十 GB 视频可能要读很久）。之后每次扫描走缓存，未变文件基本秒过。
+
+### 判断依据（全部满足才命中）
+
+| 维度 | 比较内容 |
+|---|---|
+| 相对路径 `rel_path` | 作为缓存键，定位「上次这个文件」 |
+| 大小 `size_bytes` | 当前 `stat` 大小 == 上次记录 |
+| 修改时间 `mtime_ns` | 当前纳秒级 mtime == 上次记录 |
+| 类型 `type` | image / video 没变 |
+
+命中后直接复用上次的 `file_id`（内容哈希）、拍摄时间、分辨率、时长、GPS、来源等，**跳过读文件哈希和 ffprobe/EXIF**。日志中命中文件会带 `[cache]`：
+
+```
+scan [2/26962] a.jpg (image, 2.3 MB) [cache]
+```
+
+### 缓存存在哪里
+
+就存在 `tubetape.json` 的 `files` 记录里（`sha256` + `size_bytes` + `mtime_ns` + 元数据），**没有单独的缓存文件**。
+
+### 中断安全
+
+扫描过程中每 1000 个文件（或每 30 秒）增量保存一次。中途 Ctrl+C / 断电，已扫过的文件已落库，下次扫描直接命中缓存，不用从头再来。
+
+### 注意
+
+- `--dry-run` 不写库，因此**不产生也不更新缓存**；要先生成缓存需真实运行一次。
+- 缓存按「路径 + 大小 + mtime」判断，若内容变了但大小和 mtime 被工具刻意保持原样，会误判为未变（标准取舍，家用场景基本不会遇到）。
+- 文件移动/改名：路径变了会重新哈希，但算出的 `file_id` 不变，仍会被识别为「已处理」。
 
 ---
 
@@ -463,8 +508,11 @@ docker run --rm \
     chet2026/tubetape \
     --dry-run --no-watch \
     --input /data --timezone Asia/Shanghai \
-    --only-camera-photos --only-phone-videos
+    --only-camera-photos --only-phone-videos \
+    -v --log-file /tmp/tubetape.log
 ```
+
+> dry-run 不写库；`/data` 是只读挂载，所以把 `--log-file` 指到容器内的 `/tmp`（或省略 `--log-file` 只看 `-v` 的终端输出）。
 
 #### 2. 长期挂机（推荐：多天自动上传）
 
@@ -479,8 +527,10 @@ docker run -d --name tubetape \
     --input /data --db /db/tubetape.json \
     --timezone Asia/Shanghai --privacy private \
     --only-camera-photos --only-phone-videos \
-    --watch
+    --watch -v
 ```
+
+> 数据库 `tubetape.json`、哈希缓存、详细日志 `tubetape.json.log` 都在命名卷 `tubetape-db` 里，删容器不丢，重启自动走缓存续传。
 
 #### 3. 一次性处理（处理完退出，不监控）
 
@@ -492,7 +542,7 @@ docker run --rm \
     -e TZ=Asia/Shanghai \
     chet2026/tubetape \
     --input /data --db /db/tubetape.json \
-    --timezone Asia/Shanghai --privacy private --no-watch
+    --timezone Asia/Shanghai --privacy private --no-watch -v
 ```
 
 ### 挂载与环境变量
@@ -500,22 +550,25 @@ docker run --rm \
 | 项 | 说明 |
 |---|---|
 | `-v <照片目录>:/data:ro` | 照片/视频目录**只读**挂载到容器内 `/data` |
-| `-v tubetape-db:/db` | 数据库存到 Docker 命名卷（持久化，删容器不丢） |
+| `-v tubetape-db:/db` | 数据库 + 哈希缓存 + 详细日志存到命名卷（持久化，删容器不丢） |
 | `-e TUBETAPE_TOKEN` | token 环境变量（或挂 `token.json` 到 `/db/token.json`） |
 | `-e TZ=Asia/Shanghai` | 容器时区（与 `--timezone` 保持一致） |
 | `--restart unless-stopped` | 崩溃/宿主机重启自动拉起，长期挂机必备 |
+| `-v` / `-vv` | 终端显示 INFO / DEBUG（透传参数） |
+| `--log-file <path>` | 详细日志路径；默认 `<db>.log`（即 `/db/tubetape.json.log`） |
 
 > 注意：容器内 `--input` 写挂载路径 `/data`，不是宿主机路径。其它 CLI 参数原样透传。
 
 ### 日志 / 停止 / 更新
 
 ```bash
-docker logs -f tubetape     # 实时日志
-docker logs --tail 200 tubetape   # 最近 200 行
+docker logs -f tubetape                 # 实时终端日志（stdout/stderr）
+docker logs --tail 200 tubetape         # 最近 200 行
+docker exec tubetape tail -f /db/tubetape.json.log   # 实时详细 DEBUG 日志（含 [cache]）
 
-docker stop tubetape        # 停止（SIGTERM，会自动 flush 封片再退出）
-docker start tubetape       # 再次启动（续传）
-docker rm tubetape          # 删除容器（数据卷 tubetape-db 保留）
+docker stop tubetape                    # 停止（SIGTERM，会自动 flush 封片再退出）
+docker start tubetape                   # 再次启动（续传，走哈希缓存）
+docker rm tubetape                      # 删除容器（数据卷 tubetape-db 保留）
 
 # 更新到新版本
 docker pull chet2026/tubetape
@@ -523,12 +576,16 @@ docker stop tubetape && docker rm tubetape
 # 然后重新 docker run（同上命令）
 ```
 
-### 自己构建镜像
+### 自己构建并推送到 Docker Hub
+
+脚本默认在构建完成后直接推送到 `chet2026/tubetape`（可用 `TUBETAPE_IMAGE` 环境变量覆盖）。推送前先 `docker login`。
 
 ```bash
-./scripts/docker_build.sh               # 构建 tubetape:latest（当前架构）
-./scripts/docker_build.sh v0.1.1        # 指定 tag
-./scripts/docker_build.sh latest --multi  # 多架构 amd64 + arm64（需 buildx）
+./scripts/docker_build.sh                     # 构建并推送 chet2026/tubetape:latest（当前架构）
+./scripts/docker_build.sh v0.1.1              # 构建并推送指定 tag
+./scripts/docker_build.sh v0.1.1 --no-push    # 只构建不推送（本地测试）
+./scripts/docker_build.sh latest --multi      # 多架构 amd64+arm64 构建并推送（需 buildx）
+TUBETAPE_IMAGE=myhub/tubetape ./scripts/docker_build.sh v0.1.1  # 推送到自定义仓库
 ```
 
 ---
