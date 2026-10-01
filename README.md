@@ -412,17 +412,38 @@ python scripts/build.py --name tube    # 自定义名字
 
 ## Docker
 
-Docker 是**最稳**的运行方式：容器自带 glibc + ffmpeg + 全部 Python 依赖，彻底避开可执行文件的 glibc 兼容问题，也不需要在宿主机装任何东西（除了 docker）。
+Docker 是**最稳**的运行方式：容器自带 glibc + ffmpeg + 全部 Python 依赖，宿主机只需装 docker，彻底避开可执行文件的 glibc 兼容问题。
 
-### 构建镜像
+**Docker Hub 镜像**：`chet2026/tubetape`
+
+### 拉取镜像
 
 ```bash
-./scripts/docker_build.sh               # 构建 tubetape:latest（当前架构）
-./scripts/docker_build.sh v0.1.1        # 指定 tag
-./scripts/docker_build.sh latest --multi  # 多架构 amd64 + arm64（需 buildx）
+docker pull chet2026/tubetape
 ```
 
-### 运行（长期挂机）
+### 准备 token
+
+OAuth 拿到的 `token.json` 有两种传入方式，二选一：
+
+- **环境变量**（推荐）：`-e TUBETAPE_TOKEN="$(cat token.json)"`
+- **挂载文件**：`-v /path/token.json:/db/token.json`（容器会到 db 同目录找 `token.json`）
+
+### 运行场景
+
+#### 1. 预览（dry-run，只读不传）
+
+```bash
+docker run --rm \
+    -v ~/projects/u/bone-ash:/data:ro \
+    -e TZ=Asia/Shanghai \
+    chet2026/tubetape \
+    --dry-run --no-watch \
+    --input /data --timezone Asia/Shanghai \
+    --only-camera-photos --only-phone-videos
+```
+
+#### 2. 长期挂机（推荐：多天自动上传）
 
 ```bash
 docker run -d --name tubetape \
@@ -431,26 +452,60 @@ docker run -d --name tubetape \
     -v tubetape-db:/db \
     -e TUBETAPE_TOKEN="$(cat token.json)" \
     -e TZ=Asia/Shanghai \
-    tubetape:latest \
+    chet2026/tubetape \
     --input /data --db /db/tubetape.json \
     --timezone Asia/Shanghai --privacy private \
     --only-camera-photos --only-phone-videos \
     --watch
 ```
 
-参数说明：
-- `-v <照片目录>:/data:ro`：照片/视频目录**只读**挂载到容器内 `/data`。
-- `-v tubetape-db:/db`：数据库存到 Docker 命名卷（持久化，重建容器也不丢）。
-- `-e TUBETAPE_TOKEN`：token 通过环境变量传入；也可改成 `-v /path/token.json:/db/token.json` 挂载文件。
-- `--restart unless-stopped`：崩溃/宿主机重启自动拉起，适合长期挂机。
-- 所有 CLI 参数照旧透传（`--input` 写容器内路径 `/data`）。
-
-### 查看日志 / 停止
+#### 3. 一次性处理（处理完退出，不监控）
 
 ```bash
-docker logs -f tubetape    # 实时日志
-docker stop tubetape       # 停止（发 SIGTERM，容器会自动 flush 封片再退出）
-docker rm tubetape         # 删除容器（数据卷 tubetape-db 保留）
+docker run --rm \
+    -v ~/projects/u/bone-ash:/data:ro \
+    -v tubetape-db:/db \
+    -e TUBETAPE_TOKEN="$(cat token.json)" \
+    -e TZ=Asia/Shanghai \
+    chet2026/tubetape \
+    --input /data --db /db/tubetape.json \
+    --timezone Asia/Shanghai --privacy private --no-watch
+```
+
+### 挂载与环境变量
+
+| 项 | 说明 |
+|---|---|
+| `-v <照片目录>:/data:ro` | 照片/视频目录**只读**挂载到容器内 `/data` |
+| `-v tubetape-db:/db` | 数据库存到 Docker 命名卷（持久化，删容器不丢） |
+| `-e TUBETAPE_TOKEN` | token 环境变量（或挂 `token.json` 到 `/db/token.json`） |
+| `-e TZ=Asia/Shanghai` | 容器时区（与 `--timezone` 保持一致） |
+| `--restart unless-stopped` | 崩溃/宿主机重启自动拉起，长期挂机必备 |
+
+> 注意：容器内 `--input` 写挂载路径 `/data`，不是宿主机路径。其它 CLI 参数原样透传。
+
+### 日志 / 停止 / 更新
+
+```bash
+docker logs -f tubetape     # 实时日志
+docker logs --tail 200 tubetape   # 最近 200 行
+
+docker stop tubetape        # 停止（SIGTERM，会自动 flush 封片再退出）
+docker start tubetape       # 再次启动（续传）
+docker rm tubetape          # 删除容器（数据卷 tubetape-db 保留）
+
+# 更新到新版本
+docker pull chet2026/tubetape
+docker stop tubetape && docker rm tubetape
+# 然后重新 docker run（同上命令）
+```
+
+### 自己构建镜像
+
+```bash
+./scripts/docker_build.sh               # 构建 tubetape:latest（当前架构）
+./scripts/docker_build.sh v0.1.1        # 指定 tag
+./scripts/docker_build.sh latest --multi  # 多架构 amd64 + arm64（需 buildx）
 ```
 
 ---
