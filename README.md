@@ -20,6 +20,7 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 - [数据库](#数据库)
 - [配额](#配额)
 - [构建可执行文件](#构建可执行文件)
+- [Docker](#docker)
 - [常见问题](#常见问题)
 
 ---
@@ -406,6 +407,51 @@ python scripts/build.py --name tube    # 自定义名字
 > 可执行文件**不捆绑 ffmpeg**，目标机器仍需安装 ffmpeg。
 
 > ⚠️ **glibc 兼容性**：Linux 可执行文件是在 Ubuntu 22.04（glibc 2.35）上构建的，只能在 glibc ≥ 2.35 的系统运行。若在更旧的系统（如 Debian 11）报 `GLIBC_2.xx not found`，请改用源码运行（`python3 -m tubetape`），或自行在目标系统上 `python scripts/build.py` 构建。
+
+---
+
+## Docker
+
+Docker 是**最稳**的运行方式：容器自带 glibc + ffmpeg + 全部 Python 依赖，彻底避开可执行文件的 glibc 兼容问题，也不需要在宿主机装任何东西（除了 docker）。
+
+### 构建镜像
+
+```bash
+./scripts/docker_build.sh               # 构建 tubetape:latest（当前架构）
+./scripts/docker_build.sh v0.1.1        # 指定 tag
+./scripts/docker_build.sh latest --multi  # 多架构 amd64 + arm64（需 buildx）
+```
+
+### 运行（长期挂机）
+
+```bash
+docker run -d --name tubetape \
+    --restart unless-stopped \
+    -v ~/projects/u/bone-ash:/data:ro \
+    -v tubetape-db:/db \
+    -e TUBETAPE_TOKEN="$(cat token.json)" \
+    -e TZ=Asia/Shanghai \
+    tubetape:latest \
+    --input /data --db /db/tubetape.json \
+    --timezone Asia/Shanghai --privacy private \
+    --only-camera-photos --only-phone-videos \
+    --watch
+```
+
+参数说明：
+- `-v <照片目录>:/data:ro`：照片/视频目录**只读**挂载到容器内 `/data`。
+- `-v tubetape-db:/db`：数据库存到 Docker 命名卷（持久化，重建容器也不丢）。
+- `-e TUBETAPE_TOKEN`：token 通过环境变量传入；也可改成 `-v /path/token.json:/db/token.json` 挂载文件。
+- `--restart unless-stopped`：崩溃/宿主机重启自动拉起，适合长期挂机。
+- 所有 CLI 参数照旧透传（`--input` 写容器内路径 `/data`）。
+
+### 查看日志 / 停止
+
+```bash
+docker logs -f tubetape    # 实时日志
+docker stop tubetape       # 停止（发 SIGTERM，容器会自动 flush 封片再退出）
+docker rm tubetape         # 删除容器（数据卷 tubetape-db 保留）
+```
 
 ---
 

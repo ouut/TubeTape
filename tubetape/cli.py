@@ -331,7 +331,11 @@ def _media_paths(input_dir: str) -> set[str]:
 
 def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int:
     """Process once, then keep re-processing as new media files appear."""
+    import signal
     import time
+
+    # docker stop 发 SIGTERM，转成 KeyboardInterrupt 走同样的 flush 退出逻辑
+    signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     reporter = reporter or Reporter()
 

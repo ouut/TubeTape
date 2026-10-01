@@ -1,0 +1,22 @@
+# 机密 —— 绝不打进镜像
+client_secret.json
+token.json
+tubetape.json
+
+# 不需要的目录
+.git
+.github
+tests
+scripts
+dist
+build
+__pycache__
+*.pyc
+.pytest_cache
+*.spec
+*.egg-info
+
+# 文档
+README.md
+development.md
+prompt.md
