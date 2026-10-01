@@ -239,6 +239,12 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
     )
 
     for segment in plan_result.segments:
+        if not uploader.quota.can_upload():
+            reporter.status(
+                f"quota exhausted ({uploader.quota.used}/{uploader.quota.daily_limit}); "
+                f"{len(plan_result.segments)} segment(s) deferred to next run"
+            )
+            break
         segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
         out_path = os.path.join(os.path.dirname(args.db), f".{segment.segment_id[:12]}.mp4")
 
@@ -292,6 +298,12 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                 },
             )
 
+        # Clean up the local transcode output now that it's uploaded.
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+
         db.settings["quota"] = uploader.quota.to_dict()
         db.save()
         reporter.quota(uploader.quota.used, uploader.quota.daily_limit)
@@ -335,9 +347,26 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
     last_change = time.time()
     has_changes = False
 
+    from datetime import datetime, timezone
+
+    last_day = datetime.now(timezone.utc).date()
+
     try:
         while True:
             time.sleep(max(1.0, args.poll_interval))
+
+            # Daily re-process: quota rolls over each day, so re-run once a day
+            # to upload segments deferred by quota exhaustion.
+            today = datetime.now(timezone.utc).date()
+            if today != last_day:
+                last_day = today
+                reporter.status("new day (quota reset); re-processing ...")
+                run_pipeline(args, reporter)
+                known = _media_paths(args.input)
+                has_changes = False
+                last_change = time.time()
+                continue
+
             current = _media_paths(args.input)
             new = current - known
             if new:
