@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tubetape"
+version = "0.1.0"
+description = "Organize home photos and videos into segmented YouTube uploads"
+requires-python = ">=3.11"
+dependencies = [
+  "tzdata",
+  "Pillow",
+  "exifread",
+  "google-api-python-client",
+  "google-auth-oauthlib",
+  "watchdog",
+  "rich",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+tubetape = "tubetape.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tubetape*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

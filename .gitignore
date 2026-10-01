@@ -1,0 +1,15 @@
+# 机密文件 —— 切勿提交
+client_secret.json
+token.json
+tubetape.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
