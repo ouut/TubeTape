@@ -545,12 +545,35 @@ docker run --rm \
     --timezone Asia/Shanghai --privacy private --no-watch -v
 ```
 
+### Docker Compose（推荐：长期挂机）
+
+仓库已带 `docker-compose.yml` 和 `.env.example`，参数与上面的「长期挂机」一致。数据库 `tubetape.json` 和日志 `tubetape.json.log` 会直接生成在 `docker-compose.yml` 同目录下（不用命名卷）。
+
+```bash
+cd TubeTape
+cp .env.example .env
+
+# 一键生成 .env（含 token；然后手动把 MEDIA_DIR 改成你的照片目录）
+{ echo "MEDIA_DIR=/home/user/projects/u/bone-ash"; echo -n "TUBETAPE_TOKEN="; cat token.json; echo; } > .env
+
+# 或直接编辑 .env，填两项：MEDIA_DIR（宿主机绝对路径）、TUBETAPE_TOKEN（token.json 单行内容）
+```
+
+```bash
+docker compose up -d        # 启动（后台，restart=unless-stopped）
+docker compose logs -f      # 实时终端日志
+docker compose ps           # 查看运行状态
+docker compose down         # 停止并删除容器（tubetape.json / 日志保留在本地，重启走缓存续传）
+```
+
+> `.env`、生成的 `tubetape.json`、`tubetape.json.log` 都已加入 `.gitignore`，切勿提交。参数含义见下方「挂载与环境变量」。
+
 ### 挂载与环境变量
 
 | 项 | 说明 |
 |---|---|
 | `-v <照片目录>:/data:ro` | 照片/视频目录**只读**挂载到容器内 `/data` |
-| `-v tubetape-db:/db` | 数据库 + 哈希缓存 + 详细日志存到命名卷（持久化，删容器不丢） |
+| `-v tubetape-db:/db` | （docker run）数据库 + 哈希缓存 + 详细日志存到命名卷；Docker Compose 改用 `./:/db`，json 生成在 compose 同目录 |
 | `-e TUBETAPE_TOKEN` | token 环境变量（或挂 `token.json` 到 `/db/token.json`） |
 | `-e TZ=Asia/Shanghai` | 容器时区（与 `--timezone` 保持一致） |
 | `--restart unless-stopped` | 崩溃/宿主机重启自动拉起，长期挂机必备 |

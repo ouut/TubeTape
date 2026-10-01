@@ -1,0 +1,42 @@
+# TubeTape 长期挂机（参数与 README「长期挂机（持续运行）」的 Docker 示例一致）
+#
+# 数据库 tubetape.json 和日志 tubetape.json.log 直接生成在本文件同目录下
+# （当前目录 ./ 以读写方式挂载为容器内 /db）。
+#
+# 准备：
+#   1. cp .env.example .env
+#   2. 编辑 .env：填 MEDIA_DIR（宿主机照片目录绝对路径）和 TUBETAPE_TOKEN（token.json 内容）
+#   3. docker compose up -d
+#
+# 常用命令：
+#   docker compose logs -f                                        # 实时终端日志
+#   docker compose exec tubetape tail -f /db/tubetape.json.log    # 详细 DEBUG 日志（含 [cache]）
+#   docker compose down                                           # 停止并删除容器（tubetape.json / 日志保留在本目录）
+
+services:
+  tubetape:
+    image: chet2026/tubetape
+    container_name: tubetape
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      # 照片/视频目录：只读挂载进容器 /data
+      - "${MEDIA_DIR:?请在 .env 中设置 MEDIA_DIR}:/data:ro"
+      # 数据库 + 哈希缓存 + 详细日志：落在 docker-compose.yml 同目录
+      - ./:/db
+    command:
+      - --input
+      - /data
+      - --db
+      - /db/tubetape.json
+      - --timezone
+      - Asia/Shanghai
+      - --privacy
+      - private
+      # 下面两行按需保留：只处理相机照片 + 手机视频，丢弃截图/网络传输副本
+      #- --only-camera-photos
+      #- --only-phone-videos
+      - --watch
+      - -v
