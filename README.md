@@ -8,6 +8,7 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 
 ## 目录
 
+- [Docker 快速开始](#docker-快速开始)
 - [核心特性](#核心特性)
 - [工作原理](#工作原理)
 - [运行流程](#运行流程)
@@ -25,6 +26,108 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 - [构建可执行文件](#构建可执行文件)
 - [Docker](#docker)
 - [常见问题](#常见问题)
+
+---
+
+## Docker 快速开始
+
+> 本程序主要以 Docker 运行。下面从零到跑起来，按顺序做即可。
+
+### 0. 前置条件
+
+- 装好 **Docker** 与 **Docker Compose**（`docker compose version` 能输出即可）；
+- 一个 Google 账号，并在 [youtube.com](https://youtube.com) 建好频道；
+- 按 [OAuth 配置（一次性）](#oauth-配置一次性) 拿到 `client_secret.json`。
+
+### 1. 拿到镜像
+
+```bash
+# 方式 A：拉取官方镜像
+docker pull chet2026/tubetape
+
+# 方式 B：本地构建（改过代码 / 想自己构建时）
+cd TubeTape
+docker build -t chet2026/tubetape:latest .
+```
+
+### 2. 准备配置（在 `docker-compose.yml` 同目录）
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`：
+
+```bash
+MEDIA_DIR=/home/cc/projects/u/bone-ash   # 你的照片/视频目录（宿主机绝对路径）
+TUBETAPE_TOKEN=                          # 留空，改用 token.json
+```
+
+把 OAuth 客户端文件也放到**同一目录**：
+
+```bash
+cp /path/to/client_secret.json .
+```
+
+### 3. 首次登录（生成 `token.json`）
+
+必须**交互式**运行（不能用 `up -d`），且需要 `client_secret.json` 已在同目录：
+
+```bash
+docker compose run --rm tubetape --db /db/tubetape.json --login
+```
+
+1. 终端会打印一个授权 URL → 浏览器打开、同意；
+2. 浏览器最后会跳到 `http://localhost:8080/?code=...`（页面打不开没关系），把**地址栏那整条 URL** 复制粘贴回终端；
+3. 成功后 `token.json` 生成在项目目录（容器内 `/db/token.json`）。
+
+### 4. 先预览（dry-run，只读，不转码不上传）
+
+```bash
+docker compose run --rm tubetape --input /data --timezone Asia/Shanghai \
+  --db /db/tubetape.json --dry-run --no-watch
+```
+
+看输出：多少文件、几个分片、多少 pending。
+
+### 5. 启动（后台持续运行）
+
+```bash
+docker compose up -d
+docker compose logs -f        # 看进度；Ctrl+C 只退出日志，不影响运行
+```
+
+### 6. 停止 / 重启 / 更新
+
+```bash
+docker compose down                          # 停止并删容器（数据/日志/凭据保留在项目目录）
+docker compose up -d                         # 再启动（断点续传，走缓存）
+
+# 更新到新版本
+./scripts/docker_build.sh                    # 构建并推送新镜像（或 docker pull chet2026/tubetape）
+docker compose down && docker compose up -d
+```
+
+### 7. 常用排查
+
+```bash
+docker compose ps                                                # 运行状态
+docker compose logs --tail 200 tubetape                          # 最近的终端日志
+docker compose exec tubetape tail -f /db/tubetape.json.log       # 详细 DEBUG 日志（含 [cache]）
+```
+
+### 文件都在哪
+
+| 宿主机（项目目录） | 容器内 | 说明 |
+|---|---|---|
+| `MEDIA_DIR` | `/data`（只读） | 原始照片/视频 |
+| `./tubetape.json` | `/db/tubetape.json` | 数据库（含哈希缓存） |
+| `./tubetape.json.log` | `/db/tubetape.json.log` | 详细日志 |
+| `./client_secret.json` | `/db/client_secret.json` | 登录用（平时不用） |
+| `./token.json` | `/db/token.json` | 授权（每人一份） |
+| `.env` | 环境变量 | `MEDIA_DIR` / `TUBETAPE_TOKEN` |
+
+> 参数、场景、常见问题见下方 [Docker](#docker) 与 [常见问题](#常见问题) 章节。
 
 ---
 
