@@ -169,8 +169,6 @@ python -m tubetape --input /path/to/photos --watch
 | `--ken-burns` | 关 | 图片缩放平移效果 |
 | `--privacy` | `private` | `private` 或 `unlisted` |
 | `--playlist` | 无 | 追加到的 YouTube 播放列表 ID |
-| `--no-rebuild` | 关 | 新文件落入已封口分片时不重建，改为单独补录分片 |
-| `--rebuild-cooldown` | `24h` | 同一分片两次重建的最短间隔 |
 | `--flush` | — | 立即把不足时长的待处理队列强制封片上传 |
 | `--watch` / `--no-watch` | 开 | 是否持续监控新文件 |
 | `--quiet-period` | `10m` | watch 模式下，最后一次变更后等待多久再处理（防拷贝一半） |
@@ -277,7 +275,7 @@ python -m tubetape --max-resolution 1920x1080 --dry-run
 python -m tubetape --ken-burns
 ```
 
-### 隐私 / 播放列表 / 重建
+### 隐私 / 播放列表
 
 ```bash
 # 上传为 unlisted（知道链接的人可看）
@@ -285,12 +283,6 @@ python -m tubetape --privacy unlisted
 
 # 追加到指定播放列表
 python -m tubetape --playlist PLxxxxxxxxxxxx
-
-# 不重建已封口分片（新文件单独成片）
-python -m tubetape --no-rebuild
-
-# 重建冷却调到 12 小时
-python -m tubetape --rebuild-cooldown 12h
 ```
 
 ### 数据库与配额
@@ -347,8 +339,7 @@ TUBETAPE_TOKEN="$(cat token.json)" nohup python3 -m tubetape \
 | 落在所有区间**之外** | 进入待处理队列，攒够 `--segment-duration` 才成片上传 | 成片时 1600 units |
 | 与现有文件**内容重复**（相同哈希） | 自动去重，忽略 | 0 |
 
-> ⚠️ 给已封口分片「加一张照片」会触发该分片重建，消耗一次配额并改变该片 URL。可用 `--no-rebuild` 改为单独补录分片（不动旧片、不删旧视频）。
-> 默认有 24h 冷却（`--rebuild-cooldown`），同一分片多次变更会合并成一次重建。
+> ⚠️ 给已封口分片「加一张照片」会触发该分片重建：转码上传新片、校验通过后删除旧片，消耗一次配额并改变该片 URL。
 
 ### 配额与退避重试
 
@@ -408,10 +399,7 @@ python -m tubetape --input ~/Photos --only-camera-photos --only-phone-videos
 {
   "version": 1,
   "files": { "<file_id>": { "path": "...", "captured_at_utc": "...", "source": "camera", ... } },
-  "segments": { "<segment_id>": { "file_ids": [...], "youtube_video_id": "...", "previous_video_ids": [...], "status": "sealed", ... } },
-  "queue": { "pending_file_ids": [], "rebuild_segment_ids": [] },
-  "errors": [],
-  "settings": {}
+  "segments": { "<segment_id>": { "file_ids": [...], "youtube_video_id": "...", "previous_video_ids": [...], "status": "sealed", ... } }
 }
 ```
 

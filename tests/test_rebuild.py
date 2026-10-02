@@ -4,7 +4,7 @@ import pytest
 
 from tubetape.db import SEGMENT_STATUS_FAILED, SEGMENT_STATUS_SEALED, Database
 from tubetape.planner import Segment
-from tubetape.rebuild import RebuildConfig, Rebuilder, should_rebuild
+from tubetape.rebuild import Rebuilder
 
 
 def make_old_segment(db, segment_id="old-id", video_id="old-vid"):
@@ -50,20 +50,6 @@ class CallRecorder:
                 raise exc
             return result
         return _fn
-
-
-class TestShouldRebuild:
-    def test_inside_cooldown(self):
-        assert should_rebuild(100, None, 200, 86400, 600) is False
-
-    def test_after_cooldown(self):
-        assert should_rebuild(100, None, 100 + 86400, 86400, 600) is True
-
-    def test_inside_quiet_period(self):
-        assert should_rebuild(None, 100, 200, 86400, 600) is False
-
-    def test_no_history(self):
-        assert should_rebuild(None, None, 0, 86400, 600) is True
 
 
 class TestRebuilder:

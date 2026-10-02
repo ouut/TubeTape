@@ -59,9 +59,6 @@ class Reporter:
         pct = current / total * 100
         self.status(f"{label} {current}/{total} ({pct:.0f}%)")
 
-    def quota(self, used: int, limit: int) -> None:
-        self.status(f"quota: {used}/{limit} units ({limit - used} remaining)")
-
 
 class _NullContext:
     def __enter__(self):

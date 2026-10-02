@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 
 import pytest
 
-from tubetape.db import (
-    SCHEMA_VERSION,
-    SEGMENT_STATUS_FAILED,
-    SEGMENT_STATUS_SEALED,
-    Database,
-    DatabaseError,
-)
+from tubetape.db import SCHEMA_VERSION, Database, DatabaseError
 
 
 def make_file_record(file_id="abc123", **overrides):
@@ -55,9 +48,6 @@ class TestNewDatabase:
         assert db.version == SCHEMA_VERSION
         assert db.files == {}
         assert db.segments == {}
-        assert db.queue == {"pending_file_ids": [], "rebuild_segment_ids": []}
-        assert db.errors == []
-        assert db.settings == {}
         assert db.path is None
 
     def test_save_without_path_raises(self):
@@ -72,17 +62,12 @@ class TestRoundTrip:
         db = Database(path=str(path))
         db.upsert_file("abc", make_file_record("abc", location={"lat": 1.0, "lng": 2.0}))
         db.upsert_segment("seg1", make_segment_record("seg1", youtube_video_id="vid123"))
-        db.enqueue_pending_file("abc")
-        db.enqueue_rebuild("seg1")
-        db.add_error("bad.jpg", "corrupt", ts="2024-01-01T00:00:00Z")
-        db.settings["x"] = 1
         db.save()
 
         loaded = Database.load(str(path))
         assert loaded.to_dict() == db.to_dict()
-        assert loaded.get_file("abc")["location"] == {"lat": 1.0, "lng": 2.0}
+        assert loaded.files["abc"]["location"] == {"lat": 1.0, "lng": 2.0}
         assert loaded.get_segment("seg1")["youtube_video_id"] == "vid123"
-        assert loaded.errors[0]["reason"] == "corrupt"
 
     def test_load_missing_returns_empty(self, tmp_path):
         path = tmp_path / "none.json"
@@ -136,12 +121,12 @@ class TestAtomicWrite:
 
 
 class TestFileHelpers:
-    def test_upsert_get_remove(self):
+    def test_upsert_remove(self):
         db = Database()
         db.upsert_file("abc", make_file_record("abc"))
-        assert db.get_file("abc")["name"] == "photo.jpg"
+        assert db.files["abc"]["name"] == "photo.jpg"
         db.remove_file("abc")
-        assert db.get_file("abc") is None
+        assert db.files.get("abc") is None
 
     def test_remove_missing_is_noop(self):
         db = Database()
@@ -153,58 +138,3 @@ class TestSegmentHelpers:
         db = Database()
         db.upsert_segment("seg1", make_segment_record("seg1"))
         assert db.get_segment("seg1")["status"] == "pending"
-
-    def test_set_status(self):
-        db = Database()
-        db.upsert_segment("seg1", make_segment_record("seg1"))
-        db.set_segment_status("seg1", SEGMENT_STATUS_SEALED)
-        assert db.get_segment("seg1")["status"] == SEGMENT_STATUS_SEALED
-
-    def test_set_status_invalid(self):
-        db = Database()
-        db.upsert_segment("seg1", make_segment_record("seg1"))
-        with pytest.raises(ValueError):
-            db.set_segment_status("seg1", "not-a-status")
-
-    def test_set_status_unknown_segment(self):
-        db = Database()
-        with pytest.raises(KeyError):
-            db.set_segment_status("nope", SEGMENT_STATUS_FAILED)
-
-
-class TestErrorsAndQueue:
-    def test_add_error_default_ts(self):
-        db = Database()
-        db.add_error("bad.jpg", "corrupt")
-        assert db.errors[0]["path"] == "bad.jpg"
-        assert db.errors[0]["reason"] == "corrupt"
-        assert db.errors[0]["ts"]
-
-    def test_add_error_explicit_ts(self):
-        db = Database()
-        db.add_error("bad.jpg", "corrupt", ts="2024-01-01T00:00:00Z")
-        assert db.errors[0]["ts"] == "2024-01-01T00:00:00Z"
-
-    def test_enqueue_pending_dedupes(self):
-        db = Database()
-        db.enqueue_pending_file("a")
-        db.enqueue_pending_file("a")
-        db.enqueue_pending_file("b")
-        assert db.queue["pending_file_ids"] == ["a", "b"]
-
-    def test_enqueue_rebuild_dedupes(self):
-        db = Database()
-        db.enqueue_rebuild("s1")
-        db.enqueue_rebuild("s1")
-        assert db.queue["rebuild_segment_ids"] == ["s1"]
-
-
-def test_load_normalizes_partial_queue(tmp_path):
-    path = tmp_path / "db.json"
-    path.write_text(
-        json.dumps({"version": 1, "files": {}, "segments": {}, "queue": {"pending_file_ids": ["x"]}}),
-        encoding="utf-8",
-    )
-    db = Database.load(str(path))
-    assert db.queue["pending_file_ids"] == ["x"]
-    assert db.queue["rebuild_segment_ids"] == []

@@ -24,8 +24,6 @@ class TestDefaults:
         assert args.max_resolution == (3840, 2160)
         assert args.ken_burns is False
         assert args.privacy == "private"
-        assert args.no_rebuild is False
-        assert args.rebuild_cooldown == 86400.0
         assert args.flush is False
         assert args.watch is True
         assert args.dry_run is False
@@ -50,8 +48,6 @@ class TestExplicitValues:
             "--max-resolution", "1920x1080",
             "--ken-burns",
             "--privacy", "unlisted",
-            "--no-rebuild",
-            "--rebuild-cooldown", "1h",
             "--flush",
             "--no-watch",
             "--dry-run",
@@ -65,8 +61,6 @@ class TestExplicitValues:
         assert args.max_resolution == (1920, 1080)
         assert args.ken_burns is True
         assert args.privacy == "unlisted"
-        assert args.no_rebuild is True
-        assert args.rebuild_cooldown == 3600.0
         assert args.flush is True
         assert args.watch is False
         assert args.dry_run is True

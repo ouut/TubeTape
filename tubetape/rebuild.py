@@ -12,7 +12,6 @@ record's ``previous_video_ids``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable
 
 from .chapters import chapters_text
@@ -24,27 +23,6 @@ from .scanner import utc_now_iso
 from .uploader import QuotaExceededError
 
 _logger = get_logger("rebuild")
-
-
-@dataclass
-class RebuildConfig:
-    cooldown: float = 86400.0  # 24h: min interval between rebuilds of one segment
-    quiet_period: float = 600.0  # 10min: wait after last change before rebuilding
-
-
-def should_rebuild(
-    last_rebuilt_ts: float | None,
-    last_change_ts: float | None,
-    now: float,
-    cooldown: float,
-    quiet_period: float,
-) -> bool:
-    """Debounce: reject rebuilds inside the cooldown or quiet period."""
-    if last_rebuilt_ts is not None and now - last_rebuilt_ts < cooldown:
-        return False
-    if last_change_ts is not None and now - last_change_ts < quiet_period:
-        return False
-    return True
 
 
 class Rebuilder:
@@ -64,14 +42,12 @@ class Rebuilder:
         upload_fn: Callable,
         verify_fn: Callable,
         delete_fn: Callable,
-        config: RebuildConfig | None = None,
     ):
         self.db = db
         self.transcode_fn = transcode_fn
         self.upload_fn = upload_fn
         self.verify_fn = verify_fn
         self.delete_fn = delete_fn
-        self.config = config or RebuildConfig()
 
     def rebuild(
         self,

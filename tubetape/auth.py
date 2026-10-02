@@ -58,30 +58,6 @@ def check_token_permissions(path: str) -> bool:
     return (mode & 0o077) == 0
 
 
-def run_oauth_flow(client_secret_path: str, token_path: str | None = None) -> Credentials:
-    """Run the interactive OAuth flow and persist a refresh token.
-
-    Requires a browser on the local machine (same host as this process). For
-    headless servers use ``authorization_url`` + ``exchange_redirect_url``
-    instead. In production the OAuth client must be "In production" so the
-    refresh token does not expire after ~7 days.
-    """
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
-    _logger.info("starting local OAuth flow (client secret %s)", client_secret_path)
-    credentials = flow.run_local_server(port=0)
-
-    if token_path is not None:
-        target = os.path.abspath(token_path)
-        with open(target, "w", encoding="utf-8") as handle:
-            handle.write(credentials.to_json())
-        os.chmod(target, 0o600)
-        _logger.info("saved OAuth token to %s (mode 0600)", target)
-
-    return credentials
-
-
 def headless_oauth_flow(
     client_secret_path: str,
     token_path: str | None = None,

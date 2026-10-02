@@ -101,17 +101,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="YouTube playlist ID to append segments to (in capture-time order)",
     )
     parser.add_argument(
-        "--no-rebuild",
-        action="store_true",
-        help="do not rebuild sealed segments; make supplemental segments instead",
-    )
-    parser.add_argument(
-        "--rebuild-cooldown",
-        type=durations.parse_duration,
-        default="24h",
-        help="min interval between two rebuilds of the same segment (default: 24h)",
-    )
-    parser.add_argument(
         "--flush",
         action="store_true",
         help="force-seal and upload the pending queue immediately",
@@ -516,7 +505,6 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
     """
     import signal
     import threading
-    import time
 
     from .watcher import MtimeScanner, Watcher
 
