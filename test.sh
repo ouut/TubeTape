@@ -1,1 +1,0 @@
-python3 -m tubetape --dry-run --no-watch -v --input /workspace/u/bone-ash --timezone Asia/Shanghai --db /workspace/u/bone-ash/tubetape.json
