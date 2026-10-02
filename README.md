@@ -746,6 +746,30 @@ EXIF 被剥（微信/QQ 传输）时会优先用文件名里的时间（如 `202
 **Q：配额不够怎么办？**
 默认约 6 片/天。减少分片数（增大 `--segment-duration`），或等次日自动恢复。
 
+**Q：`client_secret.json` 是干什么的？每次运行都要吗？**
+它是你**应用的身份凭据**（GCP 项目里那个 OAuth 客户端的 `client_id`/`client_secret`），**只在登录时**用来向 Google 证明“是哪个应用在请求授权”。
+
+| 阶段 | 需要 `client_secret.json` | 需要 `token.json` |
+|---|---|---|
+| 首次登录（`--login`） | ✅ | ❌（由它生成） |
+| 平时运行 / watch | ❌ 不需要 | ✅（或 `TUBETAPE_TOKEN`） |
+
+`token.json` 里已包含 `client_id`/`client_secret`/`refresh_token`，登录之后自给自足——**平时运行只读 `token.json`，不碰 `client_secret.json`**。
+
+**Q：没有 token，Docker 里怎么登录？**
+用内置登录命令（需**交互式**，不能用 `up -d`）：
+
+```bash
+docker compose run --rm tubetape \
+  --db /db/tubetape.json --client-secret /db/client_secret.json --login
+```
+
+它打印授权 URL → 浏览器同意 → 把跳回 `http://localhost:8080/?code=...` 的整条 URL 粘回终端 → 生成 `/db/token.json`。之后 `docker compose up -d` 即可。
+（`.env` 里的 `TUBETAPE_TOKEN` 要留空，否则环境变量会盖过 `token.json`。）
+
+**Q：提示 `no YouTube credentials` / 找不到 token？**
+说明既没有 `TUBETAPE_TOKEN` 环境变量，也没有 `<db 目录>/token.json`。先跑一次 `--login` 生成 token（见上一问）。
+
 ---
 
 ## 更新记录

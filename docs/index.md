@@ -99,6 +99,31 @@ python3 -m tubetape --watch -v \
 
 ---
 
+## 常见问题 / FAQ
+
+**Q：`client_secret.json` 是什么？每次运行都要吗？ / What is `client_secret.json`? Is it needed every run?**
+
+它是你**应用的身份凭据**，**只在登录时**用来向 Google 证明“是哪个应用在请求授权”。登录之后，`token.json` 已包含 `client_id`/`client_secret`/`refresh_token`，**平时运行只读 `token.json`，不需要 `client_secret.json`**。
+
+It is your **app's OAuth client credential**, used **only when logging in**. After that, `token.json` already contains the client id/secret and refresh token, so **normal runs only need `token.json`.**
+
+**Q：没有 token，Docker 里怎么登录？ / How do I log in inside Docker without a token?**
+
+```bash
+docker compose run --rm tubetape \
+  --db /db/tubetape.json --client-secret /db/client_secret.json --login
+```
+
+打印授权 URL → 浏览器同意 → 把跳转回 `http://localhost:8080/?code=...` 的整条 URL 粘回终端 → 生成 `/db/token.json`。必须**交互式**运行（不能用 `up -d`）。
+
+**Q：会操作别人的 YouTube 频道吗？ / Does it operate on someone else's channel?**
+
+不会。上传、删除、加播放列表操作的都是 **token 所属的那个频道**；每个人用**自己的** token，操作**自己的**频道。你的 `token.json` 不会被分发给别人。
+
+No. It operates **the channel the token belongs to**; everyone uses **their own** token, so **their own** channel. Your `token.json` is never distributed.
+
+---
+
 ## 联系方式 / Contact
 
 - **开发者 / Developer:** sxxwff 团队 / sxxwff team
