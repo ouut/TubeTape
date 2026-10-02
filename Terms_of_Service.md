@@ -84,3 +84,92 @@
 - **开发者 / 团队：** sxxwff 团队
 - **联系邮箱：** sxxwff@gmail.com
 - **官方网站：** <https://ouut.github.io/TubeTape/>
+
+---
+---
+
+# Terms of Service (English)
+
+**Effective date:** October 1, 2026  
+**Last updated:** October 3, 2026  
+
+Please read these Terms of Service (the “Terms”) carefully before accessing or using **TubeTape** (the “Service”) provided by the **sxxwff team** (“we”, “us”). By accessing or using the Service, you agree to be bound by these Terms. If you do not agree, please do not use the Service.
+
+- **Website:** <https://ouut.github.io/TubeTape/>
+- **Contact email:** sxxwff@gmail.com
+
+---
+
+## 1. The Service
+
+The Service is a **local automation tool**: it scans a directory of photos/videos you specify, organizes, concatenates and transcodes them into segmented videos by capture time, and uploads them, through the YouTube Data API, to **your own** YouTube channel (default: private), for personal backup and viewing.
+
+The Service uses **YouTube API Services**. By using the Service, you agree to be bound by the [YouTube Terms of Service](https://www.youtube.com/t/terms).
+
+We reserve the right to modify, suspend or terminate the Service at any time.
+
+---
+
+## 2. Account and Authorization
+
+1. **Account security:** you are responsible for safeguarding your Google authorization and local `token.json`, and for all activity carried out under your account.
+2. **Permissions:** the Service requests the `https://www.googleapis.com/auth/youtube.force-ssl` scope to upload videos to **your own** channel, manage videos and playlists, and delete the old video that is replaced when a segment is rebuilt.
+3. **Revoking access:** you may revoke the Service's access at any time via [Google Account – Third-party access](https://myaccount.google.com/permissions).
+
+---
+
+## 3. Acceptable Use
+
+You agree not to:
+
+1. use the Service for any activity that violates applicable laws or infringes third-party rights;
+2. upload content you do **not** have the right to upload;
+3. circumvent Google / YouTube usage quotas or violate their developer terms and policies;
+4. decompile, reverse-engineer or otherwise disrupt the Service's core systems and security mechanisms.
+
+---
+
+## 4. Intellectual Property
+
+- The intellectual property in the Service's code, documentation and technical architecture belongs to us or our licensors (subject to the open-source license included in this repository);
+- You retain full rights to the content you process and upload, and are responsible for its legality.
+
+---
+
+## 5. Disclaimer of Warranties
+
+1. **“AS IS”:** The Service is provided on an “AS IS” and “AS AVAILABLE” basis. To the maximum extent permitted by law, we make no warranties, express or implied, including but not limited to merchantability, fitness for a particular purpose and non-infringement.
+2. **Important:** the Service calls the YouTube API to upload and may **delete or replace** videos on your channel. Please **always keep your original files.** To the extent permitted by law, we are not liable for consequences arising from:
+   - upload or transcode failures, or videos being processed/rejected by YouTube;
+   - deletion of old videos due to segment rebuilds;
+   - changes to YouTube policies, quotas or APIs;
+   - your Google / YouTube account being restricted or suspended.
+
+---
+
+## 6. Limitation of Liability
+
+To the maximum extent permitted by applicable law, we are not liable for any indirect, incidental, special, consequential or punitive damages (including lost profits, data loss or business interruption) arising from the use of or inability to use the Service.
+
+---
+
+## 7. Changes and Termination
+
+- We may update or modify these Terms at any time; the revised Terms take effect once posted on this page. Your continued use after a change constitutes acceptance of the revised Terms;
+- If you violate any provision of these Terms, we may suspend or terminate the Service to you at any time.
+
+---
+
+## 8. Governing Law and Dispute Resolution
+
+These Terms are governed by and construed in accordance with the laws of the **People's Republic of China**. Any dispute arising out of or in connection with these Terms shall first be resolved through friendly negotiation; if negotiation fails, either party may submit it to the competent people's court at the developer's location.
+
+---
+
+## 9. Contact Us
+
+If you have any questions about these Terms, please contact us:
+
+- **Developer / Team:** sxxwff team
+- **Contact email:** sxxwff@gmail.com
+- **Website:** <https://ouut.github.io/TubeTape/>

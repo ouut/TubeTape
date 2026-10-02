@@ -113,3 +113,121 @@ OAuth 令牌（含 refresh token）保存在**您本地的** `token.json` 文件
 - **开发者 / 团队：** sxxwff 团队
 - **联系邮箱：** sxxwff@gmail.com
 - **官方网站：** <https://ouut.github.io/TubeTape/>
+
+---
+---
+
+# Privacy Policy (English)
+
+**Effective date:** October 1, 2026  
+**Last updated:** October 3, 2026  
+
+This Privacy Policy applies to **TubeTape** (the “App”), developed by the **sxxwff team** (“we”, “us”).
+
+**The App is a local tool that runs on your own computer.** It organizes your local photos and videos into segmented videos and uploads them, through the Google / YouTube API, to **your own YouTube channel** (default privacy status: private), for personal backup and viewing.
+
+- **Website:** <https://ouut.github.io/TubeTape/>
+- **Contact email:** sxxwff@gmail.com
+
+---
+
+## 1. Information We Access and Process
+
+The App **does not operate any server** and does not send your data to us (the developer). All scanning, metadata parsing and video transcoding happen locally on your machine.
+
+### 1.1 Local files (processed only on your device)
+
+- Photos/videos in the directory you specify: we read their content hash, capture time, resolution and duration for organizing and segmenting;
+- Processing progress and the index are stored in **your local** `tubetape.json` database, and run logs in **your local** `tubetape.json.log`;
+- The transcoded segment videos are temporary and are deleted locally after a successful upload.
+
+This data **always stays on your device**; we cannot access it.
+
+### 1.2 Data obtained through Google / YouTube authorization
+
+The App requests the following Google OAuth scope:
+
+| Scope | Purpose |
+|---|---|
+| `https://www.googleapis.com/auth/youtube.force-ssl` | Upload videos to **your own** YouTube channel, add videos to a playlist, and delete the old video that is replaced when a segment is rebuilt |
+
+Through this scope, the App accesses:
+
+- your channel's **uploads list** (used for “reconciliation” to avoid duplicate uploads);
+- the **titles, descriptions (including an internal marker) and video IDs** of videos uploaded by the App.
+
+The App does **not** read your Google name, email address, profile photo or other profile data, and does **not** access any Google data beyond your own YouTube channel content.
+
+### 1.3 Credential storage
+
+The OAuth token (including the refresh token) is stored in **your local** `token.json` file, with permissions set to **owner-only readable (0600)**. The file is stored in **plain text**; please keep it safe and do not share it or commit it to a repository. We (the developer) **cannot access** it.
+
+---
+
+## 2. How We Use Information
+
+- Organize and generate segmented videos and upload them to your own YouTube channel;
+- Record processing progress to support resumable and incremental processing;
+- Run logs for troubleshooting.
+
+**Special notice:** We do not use data obtained through the Google API for advertising or user profiling, or for any purpose beyond the App's core functionality, and we do not sell or transfer it to third parties.
+
+---
+
+## 3. Google API Limited Use Disclosure
+
+The App's use and transfer of information received from Google APIs adheres to the [Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy), including the **Limited Use** requirements:
+
+- **No transfer to third parties:** we do not sell, rent or transfer your Google data (except as required by law or with your explicit consent);
+- **No advertising:** not used for personalized advertising;
+- **No model training:** not used to train general machine learning or AI models.
+
+---
+
+## 4. Sharing and Disclosure
+
+We do not share your information with any third party except:
+
+1. **as required by law** (subpoena, court order or applicable law);
+2. **with your explicit authorization**.
+
+Videos you upload are stored on YouTube and are subject to Google / YouTube policies.
+
+---
+
+## 5. Data Storage and Security
+
+- **Primarily local:** except for videos uploaded to your own YouTube channel, all data (database, logs, token, temporary transcode files) exists only on your device;
+- **Transit security:** communication with Google APIs uses HTTPS/TLS;
+- **Token protection:** `token.json` is stored with owner-only permissions (0600) in plain text (please keep it safe);
+- **Retention:** local data is fully under your control; you may delete `tubetape.json`, `tubetape.json.log`, `token.json` and your uploaded videos at any time.
+
+---
+
+## 6. Your Rights and Revoking Access
+
+- **Revoke access:** go to [Google Account – Third-party access](https://myaccount.google.com/permissions) to revoke the App. After revocation, the App will immediately stop accessing your Google data;
+- **Delete data:** delete your local `tubetape.json` / `token.json` / logs to remove local data; uploaded videos can be deleted by you in YouTube Studio.
+
+---
+
+## 7. The App and YouTube API Services
+
+The App uses **YouTube API Services**.
+
+- By using the App, you agree to be bound by the [YouTube Terms of Service](https://www.youtube.com/t/terms);
+- To learn how Google collects and processes data, see the [Google Privacy Policy](http://www.google.com/policies/privacy).
+
+---
+
+## 8. Changes to This Policy
+
+We may update this Privacy Policy from time to time. Any material changes will be posted on this page and the “Last updated” date will be revised.
+
+---
+
+## 9. Contact Us
+
+- **Developer / Team:** sxxwff team
+- **Contact email:** sxxwff@gmail.com
+- **Website:** <https://ouut.github.io/TubeTape/>
