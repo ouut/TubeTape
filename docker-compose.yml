@@ -35,6 +35,10 @@ services:
       - Asia/Shanghai
       - --privacy
       - private
+      - --max-resolution
+      - 3840x2160
+      - --fps
+      - 30
       # 下面两行按需保留：只处理相机照片 + 手机视频，丢弃截图/网络传输副本
       #- --only-camera-photos
       #- --only-phone-videos
