@@ -224,5 +224,40 @@ class TestRunPipelineReconcile:
         assert cli.run_pipeline(args) == cli._EXIT_QUOTA
 
 
+class TestLogin:
+    def test_login_flag_parses(self, tmp_path):
+        from tubetape.cli import parse_args
+
+        args = parse_args(["--login", "--db", str(tmp_path / "db.json")])
+        assert args.login is True
+
+    def test_login_missing_client_secret(self, tmp_path):
+        from tubetape import cli
+
+        args = cli.parse_args(["--login", "--db", str(tmp_path / "db.json")])
+        assert cli._run_login(args) == cli._EXIT_ERROR
+
+    def test_login_saves_token(self, tmp_path, monkeypatch):
+        from tubetape import auth, cli
+
+        (tmp_path / "client_secret.json").write_text("{}")
+        args = cli.parse_args(["--login", "--db", str(tmp_path / "db.json")])
+        called = {}
+
+        def fake_flow(client_secret_path, token_path=None, **kwargs):
+            called["client"] = client_secret_path
+            called["token"] = token_path
+            with open(token_path, "w") as handle:
+                handle.write("{}")
+            return object()
+
+        monkeypatch.setattr(auth, "headless_oauth_flow", fake_flow)
+        rc = cli._run_login(args)
+        assert rc == cli._EXIT_OK
+        assert called["client"] == str(tmp_path / "client_secret.json")
+        assert called["token"] == str(tmp_path / "token.json")
+        assert (tmp_path / "token.json").exists()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

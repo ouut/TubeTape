@@ -190,6 +190,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"detailed log file path (default: <db>.log, i.e. {_DEFAULT_DB_NAME}.log)",
     )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="run the Google OAuth login flow, save token.json next to --db, and exit",
+    )
+    parser.add_argument(
+        "--client-secret",
+        default=None,
+        help="path to client_secret.json for --login (default: <db dir>/client_secret.json)",
+    )
     return parser
 
 
@@ -659,6 +669,27 @@ def _build_uploader(args: argparse.Namespace, db: Database):
     return Uploader(service, playlist_id=getattr(args, "playlist", None))
 
 
+def _run_login(args: argparse.Namespace) -> int:
+    """Run the OAuth login flow and save token.json next to the database."""
+    db_dir = os.path.dirname(args.db)
+    token_path = os.path.join(db_dir, "token.json")
+    client_secret = args.client_secret or os.path.join(db_dir, "client_secret.json")
+    _log.info("OAuth login: client secret %s -> token %s", client_secret, token_path)
+    if not os.path.exists(client_secret):
+        _log.error("client secret not found: %s", client_secret)
+        print(f"client secret not found: {client_secret}", file=sys.stderr)
+        return _EXIT_ERROR
+    try:
+        auth.headless_oauth_flow(client_secret, token_path=token_path)
+    except Exception as exc:  # noqa: BLE001
+        _log.error("OAuth login failed: %s", exc)
+        print(f"OAuth login failed: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    _log.info("token saved to %s", token_path)
+    print(f"token saved to {token_path}")
+    return _EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -667,6 +698,9 @@ def main(argv: list[str] | None = None) -> int:
     log_file = args.log_file if args.log_file is not None else (args.db + ".log")
     setup_logging(verbose=args.verbose, log_file=log_file)
     _log.info("tubetape starting (log file: %s)", log_file)
+
+    if args.login:
+        return _run_login(args)
 
     if args.watch and not args.dry_run:
         return run_watch(args)

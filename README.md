@@ -186,10 +186,15 @@ YouTube 上传必须 OAuth 2.0，OAuth 客户端只能来自 Google Cloud Consol
 2. 凭据 → 创建 **OAuth 客户端 ID → 桌面应用** → 下载 `client_secret.json`（放到项目根目录）。
 3. OAuth 同意屏幕 → External → 添加自己的邮箱为测试用户 → 加 scope：
    `https://www.googleapis.com/auth/youtube.force-ssl`（覆盖上传/删除/播放列表/读取）。
-4. 获取 token（一条命令，打印 URL → 浏览器授权 → 粘贴跳转 URL）：
+4. 获取 token（打印 URL → 浏览器授权 → 把跳转回来的 URL 粘回去）。两种等价方式：
 
 ```bash
+# 方式一：独立脚本（源码环境）
 python scripts/oauth_login.py --client-secret client_secret.json --output token.json
+
+# 方式二：内置命令（推荐，Docker 里也能用）
+python -m tubetape --login --db tubetape.json --client-secret client_secret.json
+# token 存到 <db 同目录>/token.json
 ```
 
 生成的 `token.json` 权限为 0600，含 refresh token。**两个档位：**
@@ -244,6 +249,8 @@ python -m tubetape --input /path/to/photos --watch
 | `--dry-run` | — | 只扫描、计算分片和 ID，不转码不上传 |
 | `-v` / `--verbose` | 关 | 更详细的终端输出；`-v` 显示 INFO，`-vv` 显示 DEBUG（默认仅 WARNING+） |
 | `--log-file` | `<db>.log` | 详细运行日志文件路径（始终记录 DEBUG 级别） |
+| `--login` | — | 运行 Google OAuth 登录流程，把 `token.json` 存到 `--db` 同目录后退出 |
+| `--client-secret` | `<db目录>/client_secret.json` | `--login` 使用的 `client_secret.json` 路径 |
 
 ---
 
@@ -587,6 +594,19 @@ OAuth 拿到的 `token.json` 有两种传入方式，二选一：
 - **环境变量**（推荐）：`-e TUBETAPE_TOKEN="$(cat token.json)"`
 - **挂载文件**：`-v /path/token.json:/db/token.json`（容器会到 db 同目录找 `token.json`）
 
+#### 在容器里直接登录（交互式）
+
+如果还没有 `token.json`，可以直接在容器内跑登录流程（需要交互式 TTY 来粘贴跳转 URL）：
+
+```bash
+# 先把 client_secret.json 放到 TubeTape 目录（会以 ./:/db 挂进容器）
+docker compose run --rm tubetape \
+  --db /db/tubetape.json --client-secret /db/client_secret.json --login
+```
+
+> 必须**交互式**运行（`docker compose run` 默认分配 TTY；`docker run` 要加 `-it`），不能用 `docker compose up -d`（无 stdin）。
+> 生成的 `token.json` 会写到 `/db`（已持久化）。
+
 ### 运行场景
 
 #### 1. 预览（dry-run，只读不传）
@@ -730,6 +750,7 @@ EXIF 被剥（微信/QQ 传输）时会优先用文件名里的时间（如 `202
 
 ## 更新记录
 
+- **内置登录命令**：新增 `tubetape --login`（配 `--client-secret`），可直接在容器内完成 OAuth 登录并把 `token.json` 写到 `--db` 同目录（Docker 用户不再需要宿主机装 Python）。
 - **保真优先默认值**：`--canvas-mode max`（画布取分片包围盒，不降采样）、`--max-resolution 7680x4320`（上限 8K，≤4K 内容仍 4K）、`--crf 16`、`--x264-preset slow`、`--fps 60`。
 - **上传对账**：上传前用 `channels.list` + `playlistItems.list` 列出频道已有视频，按简介里的 `segment_id` 标记匹配；已上传的直接跳过并补写本地记录（本地库丢失也不会重复上传）。不做自动删除。
 - **配额改为 API 驱动**：去掉本地额度计数与持久化，YouTube 返回 `quotaExceeded` 就暂停本轮，等 `--quota-backoff`（默认 1h）自动重试。
