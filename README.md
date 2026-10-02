@@ -10,6 +10,7 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 
 - [核心特性](#核心特性)
 - [工作原理](#工作原理)
+- [运行流程](#运行流程)
 - [安装](#安装)
 - [OAuth 配置（一次性）](#oauth-配置一次性)
 - [快速开始](#快速开始)
@@ -78,6 +79,65 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
   → watchdog 事件即时发现新文件 + 目录 mtime 兜底扫描（网络盘也能用）
   → 静默期去抖 → 自动重处理；配额用尽则退避重试；退出时 flush 封片
 ```
+
+---
+
+## 运行流程
+
+程序从启动到结束的实际执行顺序。
+
+### 一次性运行（`--no-watch`）
+
+**1. 载入数据库**：读 `tubetape.json`（不存在则空库）。
+
+**2. 扫描**：
+- 递归遍历目录，按扩展名收集图片/视频（跳过隐藏文件/目录），打印总数；
+- 逐个文件：`stat` 拿「大小 + mtime」→ 命中哈希缓存（两者未变）就复用旧哈希和元数据（日志带 `[cache]`），否则算内容哈希 + 读 EXIF/ffprobe 元数据 + 定拍摄时间（元数据 → 文件名 → mtime）；
+- 边扫边增量落盘（每 1000 文件或每 30s），中断不丢进度；
+- 与库对比得出 新增 / 已处理 / 已删除。
+
+**3. 规划**：
+- 按拍摄时间排序；已有分片的时间区间为固定边界（区间内的新文件归入该片 → 重建，区间外的打包成新片）；
+- 贪心打包，每片累计时长 ≤ `--segment-duration`；最后一片不足时长则留为 pending（除非 `--flush`）；
+- `segment_id = sha256(排序后的 file_ids + 转码参数)`，已存在则跳过。
+
+**4. `--dry-run`** 到此为止：只打印计划，不写库、不转码、不上传。
+
+**5. 上传前对账**：列出频道已有视频，按简介里的 `segment_id` 标记匹配 → 已在 YouTube 上的分片直接跳过并补写本地记录。
+
+**6. 逐分片处理**：
+- 定画布（`--canvas-mode`）→ 转码（每个文件一个 clip：缩放+黑边到画布，HEIC 先转 PNG；再 `-c copy` 拼接）→ 生成章节；
+- 上传（标题 = 起止时间，简介 = 章节 + `segment_id` 标记）→ 写库（`youtube_video_id`、`status=sealed`）；
+- 每片后保存数据库；配额用尽则本轮停止（退出码 2）。
+
+**7. 重建**（新文件落入已封口分片）：转码新片 → 上传 → 校验 → 删除旧片 → 提交新记录（旧 id 进 `previous_video_ids`）；任何一步失败都保留旧片。
+
+### 持续监控（`--watch`）
+
+1. 先跑一次完整流程；
+2. **watchdog**（inotify 等）即时发现新文件；
+3. 每 `--mtime-interval`（默认 1h）跑一次**目录 mtime 兜底扫描**（补漏事件 / 网络盘）；
+4. 检测到变更 → **静默期 `--quiet-period`（默认 10m）去抖** → 重跑；
+5. 配额用尽 → 等 `--quota-backoff`（默认 1h）自动重试；
+6. `Ctrl+C` / `SIGTERM` → 先 flush 封片再退出。
+
+### 第一次运行的推荐顺序
+
+```bash
+# ① 预览（只读）
+python3 -m tubetape --dry-run --no-watch -v \
+  --input /path/to/photos --db /path/to/photos/tubetape.json --timezone Asia/Shanghai
+
+# ② 真实跑一次（处理完退出）
+python3 -m tubetape --no-watch -v \
+  --input /path/to/photos --db /path/to/photos/tubetape.json --timezone Asia/Shanghai
+
+# ③ 确认无误后挂机
+python3 -m tubetape --watch -v \
+  --input /path/to/photos --db /path/to/photos/tubetape.json --timezone Asia/Shanghai
+```
+
+> 想看每一步细节：`tail -f /path/to/photos/tubetape.json.log`（加 `-vv` 让终端也显示全部 DEBUG）。
 
 ---
 
@@ -166,7 +226,7 @@ python -m tubetape --input /path/to/photos --watch
 | `--segment-duration` | `1h` | 每片时长上限；支持 `1h` / `3600s` / `1:00:00` |
 | `--timezone` | 系统本地 | 无时区 EXIF 时间的解释基准（如 `Asia/Shanghai`） |
 | `--crf` | `16` | 视频重编码质量，越小越清晰 |
-| `--max-resolution` | `3840x2160` | 分辨率上限，不放大 |
+| `--max-resolution` | `7680x4320` | 分辨率上限，不放大（画布是包围盒，≤4K 内容仍 4K，只有真 8K 才用 8K） |
 | `--canvas-mode` | `max` | 分片画布尺寸：`max`=所有文件尺寸的包围盒（不降采样，默认），`first`=第一个文件 |
 | `--fps` | `60` | 输出帧率（默认 60，保留最高 60fps 源的运动） |
 | `--x264-preset` | `slow` | x264 速度/压缩效率档；越慢同码率越清晰 |
@@ -457,14 +517,14 @@ scan [2/26962] a.jpg (image, 2.3 MB) [cache]
 - **`--canvas-mode max`（默认）**：画布 = 分片内所有文件尺寸的**包围盒**（每个先按 `--max-resolution` 封顶）→ **任何文件都不会被降采样**。
 - `--canvas-mode first`：画布 = 第一个文件（旧行为，可能把后面的高分辨率内容降下来）。
 - 每个文件等比缩放到画布并居中：大的缩小、小的放大、比例不同加黑边（`pad`，不裁切）。
-- 输出分辨率**永远不超过 `--max-resolution`**（默认 4K）。
+- 输出分辨率**永远不超过 `--max-resolution`**（默认 8K）。
 
 保真优先默认值：
 
 | 参数 | 默认 | 作用 |
 |---|---|---|
 | `--canvas-mode` | `max` | 不丢高分辨率细节 |
-| `--max-resolution` | `3840x2160` | 上限 4K（YouTube 对 4K 启用 VP9/AV1） |
+| `--max-resolution` | `7680x4320` | 上限 8K：≤4K 内容仍 4K，只有真 8K 内容才用 8K；YouTube 对 4K 启用 VP9/AV1 |
 | `--crf` | `16` | 高画质（越小越清晰、文件越大） |
 | `--x264-preset` | `slow` | 同码率伪影更少，二次编码损失更小 |
 | `--fps` | `60` | 不丢 60fps 源的运动细节 |
@@ -670,7 +730,7 @@ EXIF 被剥（微信/QQ 传输）时会优先用文件名里的时间（如 `202
 
 ## 更新记录
 
-- **保真优先默认值**：`--canvas-mode max`（画布取分片包围盒，不降采样）、`--crf 16`、`--x264-preset slow`、`--fps 60`；新增 `--canvas-mode` / `--x264-preset` / `--fps` 三个开关。
+- **保真优先默认值**：`--canvas-mode max`（画布取分片包围盒，不降采样）、`--max-resolution 7680x4320`（上限 8K，≤4K 内容仍 4K）、`--crf 16`、`--x264-preset slow`、`--fps 60`。
 - **上传对账**：上传前用 `channels.list` + `playlistItems.list` 列出频道已有视频，按简介里的 `segment_id` 标记匹配；已上传的直接跳过并补写本地记录（本地库丢失也不会重复上传）。不做自动删除。
 - **配额改为 API 驱动**：去掉本地额度计数与持久化，YouTube 返回 `quotaExceeded` 就暂停本轮，等 `--quota-backoff`（默认 1h）自动重试。
 - **watch 改为事件驱动**：watchdog（inotify/FSEvents）即时发现新文件 + 目录 mtime 兜底扫描（`--mtime-interval` 默认 1h），替代原来每 30s 全量遍历文件。

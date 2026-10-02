@@ -32,7 +32,7 @@ _logger = get_logger("transcoder")
 @dataclass
 class TranscodeConfig:
     crf: int = 16
-    max_resolution: tuple[int, int] = (3840, 2160)
+    max_resolution: tuple[int, int] = (7680, 4320)
     canvas_mode: str = "max"  # "max" (bounding box) | "first"
     ken_burns: bool = False
     image_duration: float = 3.0

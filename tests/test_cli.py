@@ -21,7 +21,7 @@ class TestDefaults:
         assert args.db == os.path.join(os.path.abspath("."), "tubetape.json")
         assert args.segment_duration == 3600.0
         assert args.crf == 16
-        assert args.max_resolution == (3840, 2160)
+        assert args.max_resolution == (7680, 4320)
         assert args.canvas_mode == "max"
         assert args.fps == 60
         assert args.x264_preset == "slow"

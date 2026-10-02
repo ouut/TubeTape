@@ -81,8 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-resolution",
         type=durations.parse_resolution,
-        default="3840x2160",
-        help="max target resolution WxH, never upscaling (default: 3840x2160)",
+        default="7680x4320",
+        help="resolution ceiling WxH, never upscaling (default: 7680x4320). "
+        "The actual output is the segment's bounding box, so <=4K content "
+        "stays <=4K and only true 8K content uses 8K",
     )
     parser.add_argument(
         "--canvas-mode",

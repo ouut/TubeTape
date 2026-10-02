@@ -82,7 +82,7 @@ class TestSegmentCanvas:
             name="a.png", type=FILE_TYPE_IMAGE, size_bytes=1,
             captured_epoch=0.0, duration_seconds=3.0, resolution=None,
         )
-        assert segment_canvas([f], TranscodeConfig()) == (3840, 2160)
+        assert segment_canvas([f], TranscodeConfig()) == (7680, 4320)
 
     def _file(self, w, h):
         return ScannedFile(
