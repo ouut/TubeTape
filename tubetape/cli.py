@@ -75,14 +75,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--crf",
         type=int,
-        default=18,
-        help="video re-encode quality; lower is better (default: 18)",
+        default=16,
+        help="video re-encode quality; lower is better (default: 16)",
     )
     parser.add_argument(
         "--max-resolution",
         type=durations.parse_resolution,
         default="3840x2160",
         help="max target resolution WxH, never upscaling (default: 3840x2160)",
+    )
+    parser.add_argument(
+        "--canvas-mode",
+        choices=["first", "max"],
+        default="max",
+        help="per-segment canvas resolution: 'max' = bounding box so nothing is "
+        "downscaled (default); 'first' = first file's resolution",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=60,
+        help="output frame rate (default: 60; preserves up to 60fps sources)",
+    )
+    parser.add_argument(
+        "--x264-preset",
+        choices=[
+            "ultrafast", "superfast", "veryfast", "faster", "fast",
+            "medium", "slow", "slower", "veryslow",
+        ],
+        default="slow",
+        help="x264 speed/efficiency preset; slower = better quality per bitrate "
+        "(default: slow)",
     )
     parser.add_argument(
         "--ken-burns",
@@ -187,12 +210,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--image-duration must be > 0")
     if args.segment_duration <= 0:
         parser.error("--segment-duration must be > 0")
+    if args.fps <= 0:
+        parser.error("--fps must be > 0")
 
     return args
 
 
 def _segment_params(args: argparse.Namespace) -> tuple:
-    return (args.image_duration, args.crf, args.max_resolution, args.ken_burns)
+    return (
+        args.image_duration,
+        args.crf,
+        args.max_resolution,
+        args.ken_burns,
+        args.canvas_mode,
+        args.fps,
+        args.x264_preset,
+    )
 
 
 def _file_persister(db: Database):
@@ -349,8 +382,11 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
     config = TranscodeConfig(
         crf=args.crf,
         max_resolution=args.max_resolution,
+        canvas_mode=args.canvas_mode,
         ken_burns=args.ken_burns,
         image_duration=args.image_duration,
+        fps=args.fps,
+        preset=args.x264_preset,
     )
 
     total_segments = len(plan_result.segments)

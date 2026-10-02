@@ -31,12 +31,13 @@ _logger = get_logger("transcoder")
 
 @dataclass
 class TranscodeConfig:
-    crf: int = 18
+    crf: int = 16
     max_resolution: tuple[int, int] = (3840, 2160)
+    canvas_mode: str = "max"  # "max" (bounding box) | "first"
     ken_burns: bool = False
     image_duration: float = 3.0
-    fps: int = 30
-    preset: str = "veryfast"
+    fps: int = 60
+    preset: str = "slow"
 
 
 def target_resolution(
@@ -65,12 +66,23 @@ def _parse_resolution(resolution: str | None) -> tuple[int, int] | None:
 
 
 def segment_canvas(files: list[ScannedFile], config: TranscodeConfig) -> tuple[int, int]:
-    """Pick the segment's uniform canvas resolution (first file's target size)."""
+    """Pick the segment's uniform canvas resolution.
+
+    ``max`` (default): the bounding box of all files' (capped) sizes, so no
+    file is downscaled. ``first``: the first file's (capped) size.
+    """
+    sizes: list[tuple[int, int]] = []
     for item in files:
         parsed = _parse_resolution(item.resolution)
         if parsed is not None:
-            return target_resolution(parsed[0], parsed[1], *config.max_resolution)
-    return config.max_resolution
+            sizes.append(target_resolution(parsed[0], parsed[1], *config.max_resolution))
+    if not sizes:
+        return config.max_resolution
+    if config.canvas_mode == "first":
+        return sizes[0]
+    width = max(w for w, _ in sizes)
+    height = max(h for _, h in sizes)
+    return width, height
 
 
 def _scale_pad_filter(canvas_w: int, canvas_h: int) -> str:

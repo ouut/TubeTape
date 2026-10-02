@@ -46,7 +46,7 @@ class TestCommandBuilding:
         assert "scale=640:480" in joined
         assert "pad=640:480" in joined
         assert "libx264" in cmd and "yuv420p" in cmd
-        assert "aac" in cmd and "-crf" in cmd and "18" in cmd
+        assert "aac" in cmd and "-crf" in cmd and "16" in cmd
 
     def test_image_command_ken_burns(self):
         cfg = TranscodeConfig(ken_burns=True)
@@ -83,6 +83,21 @@ class TestSegmentCanvas:
             captured_epoch=0.0, duration_seconds=3.0, resolution=None,
         )
         assert segment_canvas([f], TranscodeConfig()) == (3840, 2160)
+
+    def _file(self, w, h):
+        return ScannedFile(
+            file_id=f"{w}x{h}", abs_path="a", rel_path="a",
+            name="a", type=FILE_TYPE_IMAGE, size_bytes=1,
+            captured_epoch=0.0, duration_seconds=1.0, resolution=f"{w}x{h}",
+        )
+
+    def test_max_mode_uses_bounding_box(self):
+        files = [self._file(1280, 720), self._file(3840, 2160)]
+        assert segment_canvas(files, TranscodeConfig(canvas_mode="max")) == (3840, 2160)
+
+    def test_first_mode_uses_first_file(self):
+        files = [self._file(1280, 720), self._file(3840, 2160)]
+        assert segment_canvas(files, TranscodeConfig(canvas_mode="first")) == (1280, 720)
 
 
 class TestDiskSpace:
