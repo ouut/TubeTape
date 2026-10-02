@@ -613,6 +613,8 @@ OAuth 拿到的 `token.json` 有两种传入方式，二选一：
 - **环境变量**（推荐）：`-e TUBETAPE_TOKEN="$(cat token.json)"`
 - **挂载文件**：`-v /path/token.json:/db/token.json`（容器会到 db 同目录找 `token.json`）
 
+> `client_secret.json` **只在登录时需要**：放到 `docker-compose.yml` 同目录即可（`./:/db` 会挂成 `/db/client_secret.json`）；平时运行不需要它。
+
 #### 在容器里直接登录（交互式）
 
 如果还没有 `token.json`，可以直接在容器内跑登录流程（需要交互式 TTY 来粘贴跳转 URL）：
