@@ -33,7 +33,8 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 - **分片时间区间固定**：加一张照片只触发它所在的那一个分片重建，不会级联重传。
 - **持续监控**：`--watch` 下挂着不用管，新文件自动归入分片、自动上传。
 - **来源过滤**：可选择只保留相机拍摄的照片和手机拍摄的视频，丢弃截图和网络传输的压缩副本。
-- **配额感知**：每日配额用量持久化，超出自动排队到次日。
+- **配额感知**：以 YouTube API 返回为准，配额用尽自动退避重试，不在本地维护额度计数。
+- **上传对账**：上传前列出频道已有视频，按简介里的 `segment_id` 判断；已上传的直接跳过，本地库丢失也不会重复上传。
 - **断点续传**：进度存 JSON 库，崩溃/重启后从断点继续，已封口且未变更的分片不重复处理。
 - **扫描缓存**：文件「大小 + mtime」未变时直接复用上次的内容哈希和元数据，重复扫描极快。
 - **详细日志**：终端友好进度 + `<db>.log` 带时间戳的 DEBUG 审计日志，随时可查「程序正在做什么」。
@@ -63,8 +64,9 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
   → 章节按文件生成（间隔 <10s 自动合并，第一章 0:00）
 
 上传（upload）
+  → 先列出频道已有视频（对账），已在 YouTube 上的分片直接跳过
   → YouTube videos.insert，标题 = {首时间戳} - {末时间戳}
-  → 简介写入章节时间戳，privacyStatus、madeForKids、categoryId 显式设置
+  → 简介写入章节时间戳 + segment_id 标记，privacyStatus、madeForKids、categoryId 显式设置
   → 加入按拍摄时间排序的播放列表，标记 sealed
 
 重建（rebuild）
@@ -72,7 +74,8 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
   → 任何一步失败都保留旧片；旧 video_id 进入 previous_video_ids
 
 监控（watch）
-  → 轮询新文件 → 静默期去抖 → 自动重处理；退出时 flush 封片
+  → watchdog 事件即时发现新文件 + 目录 mtime 兜底扫描（网络盘也能用）
+  → 静默期去抖 → 自动重处理；配额用尽则退避重试；退出时 flush 封片
 ```
 
 ---
@@ -171,7 +174,9 @@ python -m tubetape --input /path/to/photos --watch
 | `--flush` | — | 立即把不足时长的待处理队列强制封片上传 |
 | `--watch` / `--no-watch` | 开 | 是否持续监控新文件 |
 | `--quiet-period` | `10m` | watch 模式下，最后一次变更后等待多久再处理（防拷贝一半） |
-| `--poll-interval` | `30s` | watch 模式下轮询新文件的间隔 |
+| `--poll-interval` | `30s` | watch 模式内部 tick：多久检查一次时间相关条件 |
+| `--mtime-interval` | `1h` | watch 模式下目录 mtime 兜底扫描间隔（补 watchdog/inotify 漏掉的事件） |
+| `--quota-backoff` | `1h` | YouTube 报配额用尽后，等待多久再重试 |
 | `--only-camera-photos` | 关 | 只保留相机拍摄的照片（EXIF 有 Make+Model） |
 | `--only-phone-videos` | 关 | 只保留手机拍摄的视频（元数据有 make） |
 | `--dry-run` | — | 只扫描、计算分片和 ID，不转码不上传 |
@@ -312,7 +317,7 @@ tubetape.exe --input D:\Photos --dry-run
 
 ## 长期挂机（持续运行）
 
-数据量大时（几万张照片/视频），受配额限制（约 6 片/天）需要连续跑很多天。`--watch` 模式就是为「启动后挂着不管」设计的：自动检测新文件、自动归入分片、自动上传，配额耗尽自动暂停、每日自动续传。
+数据量大时（几万张照片/视频），受配额限制（约 6 片/天）需要连续跑很多天。`--watch` 模式就是为「启动后挂着不管」设计的：watchdog 即时发现新文件 + 目录 mtime 兜底扫描，自动归入分片、自动上传；配额用尽则退避后自动重试。
 
 ### 完整启动命令
 
@@ -329,12 +334,12 @@ TUBETAPE_TOKEN="$(cat token.json)" nohup python3 -m tubetape \
 ```
 
 - 默认每片 `1h`。⚠️ **未验证**的 YouTube 账号单视频上限 15 分钟，需加 `--segment-duration 15m`；已验证账号可用默认 `1h`（或更大）减少总片数。
-- `--watch`：持续运行；配额耗尽后自动暂停，每天（UTC 零点）自动续传。
+- `--watch`：持续运行；配额用尽时按 `--quota-backoff`（默认 1 小时）自动重试，不依赖本地额度状态。
 - 日志：`tail -f /tmp/tubetape.log`。
 
 ### 运行中增加照片/视频会怎样？
 
-挂着的时候往目录里扔新文件，`--watch` 会自动检测（默认每 30s 轮询 + 10 分钟静默期去抖，防拷贝一半）并重新处理。新文件按拍摄时间落入三种情况：
+挂着的时候往目录里扔新文件，`--watch` 会自动检测（watchdog 即时 + 目录 mtime 兜底，再加 10 分钟静默期去抖，防拷贝一半）并重新处理。新文件按拍摄时间落入三种情况：
 
 | 新文件拍摄时间 | 行为 | 消耗配额 |
 |---|---|---|
@@ -345,11 +350,11 @@ TUBETAPE_TOKEN="$(cat token.json)" nohup python3 -m tubetape \
 > ⚠️ 给已封口分片「加一张照片」会触发该分片重建，消耗一次配额并改变该片 URL。可用 `--no-rebuild` 改为单独补录分片（不动旧片、不删旧视频）。
 > 默认有 24h 冷却（`--rebuild-cooldown`），同一分片多次变更会合并成一次重建。
 
-### 配额与每日续传
+### 配额与退避重试
 
-- 每天约 10000 units ≈ 6 次上传（含重建）。
-- 用完当天配额后**优雅暂停**（不崩溃、不丢进度）：已传的分片记录在库，未传的留在队列。
-- watch 每天自动重新处理，继续传剩余分片，直到全部传完。
+- YouTube 每天约 10000 units ≈ 6 次上传（含重建，具体以 YouTube 为准）。
+- 上传被 YouTube 拒绝（`quotaExceeded`）时**优雅暂停本轮**（不崩溃、不丢进度）：已传的分片记录在库，未传的留在队列。
+- 等待 `--quota-backoff`（默认 1 小时）后自动重试；配额在 YouTube 侧重置后自动继续，无需人工干预。
 - 期间随时 Ctrl+C 退出：会先 flush 封片再退出，进度全部落库。
 
 ### 停止与重启
@@ -406,14 +411,13 @@ python -m tubetape --input ~/Photos --only-camera-photos --only-phone-videos
   "segments": { "<segment_id>": { "file_ids": [...], "youtube_video_id": "...", "previous_video_ids": [...], "status": "sealed", ... } },
   "queue": { "pending_file_ids": [], "rebuild_segment_ids": [] },
   "errors": [],
-  "settings": { "quota": { "date": "2026-10-01", "used": 3200 } }
+  "settings": {}
 }
 ```
 
 - `file_id` = 头/中/尾各 64KB + 文件大小的 SHA-256（小文件整读），改路径/改名不变。
 - `segment_id` = sha256(排序后的 file_id 列表 + 分片参数)，内容或参数变了才重建。
 - `previous_video_ids` = 重建替换掉的旧视频 id。
-- `settings.quota` = 当日配额用量，跨运行持久化，每日自动归零。
 - `files.*.size_bytes` / `mtime_ns` = 哈希缓存判断依据，扫描时与磁盘 `stat` 比对。
 
 ---
@@ -456,10 +460,10 @@ scan [2/26962] a.jpg (image, 2.3 MB) [cache]
 
 ## 配额
 
-- 每次上传（含重建）消耗 **1600 units**，默认每日 **10000 units**（约 6 片/天）。
-- 用量持久化到 `settings.quota`，重启不丢失。
-- 超出后上传会抛错并排队到次日（`QuotaExceededError`）。
-- 运行日志会打印：`quota: 1600/10000 units (8400 remaining)`。
+- YouTube Data API 每天约 **10000 units**，一次 `videos.insert` 约 **1600 units**（约 6 片/天，以 YouTube 为准）。
+- **不在本地维护额度计数**，以 API 返回为准：传不上去（`quotaExceeded`）时本轮立即停止，等 `--quota-backoff`（默认 1 小时）再重试。
+- 被拒的请求不消耗配额，所以按小时轮询安全且自愈；配额在 YouTube 侧重置后自动继续。
+- 运行日志会打印：`quota exhausted ... deferring remaining N segment(s)` 及每次重试。
 
 ---
 
@@ -651,6 +655,9 @@ EXIF 被剥（微信/QQ 传输）时会优先用文件名里的时间（如 `202
 
 ## 更新记录
 
+- **上传对账**：上传前用 `channels.list` + `playlistItems.list` 列出频道已有视频，按简介里的 `segment_id` 标记匹配；已上传的直接跳过并补写本地记录（本地库丢失也不会重复上传）。不做自动删除。
+- **配额改为 API 驱动**：去掉本地额度计数与持久化，YouTube 返回 `quotaExceeded` 就暂停本轮，等 `--quota-backoff`（默认 1h）自动重试。
+- **watch 改为事件驱动**：watchdog（inotify/FSEvents）即时发现新文件 + 目录 mtime 兜底扫描（`--mtime-interval` 默认 1h），替代原来每 30s 全量遍历文件。
 - **HEIC/HEIF 支持**：扫描时读取 HEIC/HEIF 的 EXIF（分辨率/拍摄时间/Make/Model），转码前先转成 PNG 再交给 ffmpeg（ffmpeg 通常不带 HEIC 解码器）。新增 `.heif`（图片）和 `.3gp`（视频）格式。
 - **快速采样哈希**：`file_id` 改为「头/中/尾各 64KB + 文件大小」的 SHA-256（小文件整读），首次扫描读取量从 ~百 GB 降到 ~5GB，实测冷缓存约 10 倍、热缓存约 67 倍提速。
 - **哈希缓存**：按「路径 + 大小 + mtime(ns)」复用上次哈希和元数据，重复扫描几乎瞬时；扫描过程中每 1000 文件/30s 增量落盘，中断不丢已扫进度。

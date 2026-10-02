@@ -1,8 +1,8 @@
-"""YouTube upload with quota tracking and retry.
+"""YouTube upload with retry and quota-error handling.
 
-Each upload costs 1600 quota units (default daily budget 10,000). Uploads are
-resumable and retried with exponential backoff; quota-exceeded errors are not
-retried (they queue to the next day).
+Uploads are resumable and retried with exponential backoff. A quota-exceeded
+error is not retried: it is surfaced as :class:`QuotaExceededError` so the
+caller can stop and back off until the quota resets.
 """
 
 from __future__ import annotations
@@ -10,8 +10,6 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 from googleapiclient.http import MediaFileUpload
 
@@ -19,58 +17,11 @@ from .log import get_logger
 
 _logger = get_logger("uploader")
 
-UPLOAD_QUOTA_UNITS = 1600
-DAILY_QUOTA_DEFAULT = 10000
-
 DEFAULT_CATEGORY_ID = "22"  # People & Blogs
 
 
 class QuotaExceededError(RuntimeError):
-    """Raised when the daily upload quota is exhausted."""
-
-
-def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
-
-
-@dataclass
-class QuotaTracker:
-    daily_limit: int = DAILY_QUOTA_DEFAULT
-    used: int = 0
-    date: str = field(default_factory=_today)
-
-    @property
-    def remaining(self) -> int:
-        return self.daily_limit - self.used
-
-    def can_upload(self) -> bool:
-        return self.remaining >= UPLOAD_QUOTA_UNITS
-
-    def consume(self) -> bool:
-        if not self.can_upload():
-            return False
-        self.used += UPLOAD_QUOTA_UNITS
-        return True
-
-    def rollover(self, today: str | None = None) -> None:
-        """Reset the counter when the stored date is not today."""
-        today = today or _today()
-        if self.date != today:
-            self.used = 0
-            self.date = today
-
-    def to_dict(self) -> dict:
-        return {"date": self.date, "used": self.used, "daily_limit": self.daily_limit}
-
-    @classmethod
-    def from_dict(cls, data: dict | None) -> "QuotaTracker":
-        if not data:
-            return cls()
-        return cls(
-            daily_limit=int(data.get("daily_limit", DAILY_QUOTA_DEFAULT)),
-            used=int(data.get("used", 0)),
-            date=data.get("date") or _today(),
-        )
+    """Raised when the YouTube upload quota is exhausted."""
 
 
 def build_upload_body(
@@ -114,11 +65,9 @@ class Uploader:
     def __init__(
         self,
         service,
-        quota: QuotaTracker | None = None,
         playlist_id: str | None = None,
     ):
         self.service = service
-        self.quota = quota or QuotaTracker()
         self.playlist_id = playlist_id
 
     def upload(
@@ -134,16 +83,6 @@ class Uploader:
         sleep=time.sleep,
     ) -> str:
         """Upload a media file and return the new video ID."""
-        if not self.quota.can_upload():
-            _logger.warning(
-                "upload refused: daily quota exhausted (%d/%d units used)",
-                self.quota.used,
-                self.quota.daily_limit,
-            )
-            raise QuotaExceededError(
-                f"daily quota exhausted ({self.quota.used}/{self.quota.daily_limit} units used)"
-            )
-
         size = os.path.getsize(media_path)
         _logger.info(
             "uploading %s (%.1f MB) as %r (privacy=%s, category=%s)",
@@ -160,15 +99,9 @@ class Uploader:
         response = self._execute_with_retry(
             request, max_retries=max_retries, base_delay=base_delay, sleep=sleep
         )
-        self.quota.consume()
 
         video_id = response.get("id")
-        _logger.info(
-            "upload complete: video id %s (quota used %d/%d)",
-            video_id,
-            self.quota.used,
-            self.quota.daily_limit,
-        )
+        _logger.info("upload complete: video id %s", video_id)
         if self.playlist_id:
             self.add_to_playlist(video_id)
         return video_id

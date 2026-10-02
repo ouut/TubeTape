@@ -7,10 +7,7 @@ import pytest
 
 from tubetape import auth
 from tubetape.uploader import (
-    DAILY_QUOTA_DEFAULT,
-    UPLOAD_QUOTA_UNITS,
     QuotaExceededError,
-    QuotaTracker,
     Uploader,
     build_upload_body,
     is_quota_error,
@@ -71,49 +68,6 @@ class FakeService:
         return self.playlist_items
 
 
-class TestQuotaTracker:
-    def test_remaining(self):
-        q = QuotaTracker(daily_limit=10000, used=0)
-        assert q.remaining == 10000
-
-    def test_can_upload(self):
-        q = QuotaTracker(daily_limit=1600, used=0)
-        assert q.can_upload() is True
-
-    def test_cannot_upload_when_insufficient(self):
-        q = QuotaTracker(daily_limit=1600, used=1)
-        assert q.can_upload() is False
-
-    def test_consume(self):
-        q = QuotaTracker(daily_limit=10000)
-        assert q.consume() is True
-        assert q.used == UPLOAD_QUOTA_UNITS
-        assert q.remaining == 10000 - UPLOAD_QUOTA_UNITS
-
-    def test_round_trip(self):
-        q = QuotaTracker(daily_limit=10000, used=3200, date="2026-09-30")
-        q2 = QuotaTracker.from_dict(q.to_dict())
-        assert q2.daily_limit == 10000
-        assert q2.used == 3200
-        assert q2.date == "2026-09-30"
-
-    def test_rollover_resets_on_new_day(self):
-        q = QuotaTracker(daily_limit=10000, used=3200, date="2026-09-29")
-        q.rollover(today="2026-09-30")
-        assert q.used == 0
-        assert q.date == "2026-09-30"
-
-    def test_rollover_same_day_keeps_used(self):
-        q = QuotaTracker(daily_limit=10000, used=3200, date="2026-09-30")
-        q.rollover(today="2026-09-30")
-        assert q.used == 3200
-
-    def test_from_dict_empty(self):
-        q = QuotaTracker.from_dict({})
-        assert q.used == 0
-        assert q.daily_limit == DAILY_QUOTA_DEFAULT
-
-
 class TestBuildUploadBody:
     def test_all_fields(self):
         body = build_upload_body("t", "d", "unlisted", "22", False)
@@ -155,7 +109,6 @@ class TestUploader:
         uploader = Uploader(service)
         video_id = uploader.upload(str(media), "title", "desc")
         assert video_id == "vid-123"
-        assert uploader.quota.used == UPLOAD_QUOTA_UNITS
 
     def test_upload_body_passed(self, tmp_path):
         media = tmp_path / "v.mp4"
@@ -165,14 +118,6 @@ class TestUploader:
         body = service.videos_obj.last_body
         assert body["snippet"]["title"] == "title"
         assert body["status"]["privacyStatus"] == "unlisted"
-
-    def test_quota_exceeded_before_upload(self, tmp_path):
-        media = tmp_path / "v.mp4"
-        media.write_bytes(b"x")
-        quota = QuotaTracker(daily_limit=UPLOAD_QUOTA_UNITS, used=1)
-        uploader = Uploader(FakeService([{"id": "x"}]), quota=quota)
-        with pytest.raises(QuotaExceededError):
-            uploader.upload(str(media), "t", "d")
 
     def test_retry_then_success(self, tmp_path):
         media = tmp_path / "v.mp4"

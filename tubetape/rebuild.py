@@ -19,8 +19,9 @@ from .chapters import chapters_text
 from .db import SEGMENT_STATUS_FAILED, SEGMENT_STATUS_SEALED, Database
 from .log import get_logger
 from .planner import Segment
+from .reconcile import embed_segment_id
 from .scanner import utc_now_iso
-from .uploader import QuotaExceededError, QuotaTracker
+from .uploader import QuotaExceededError
 
 _logger = get_logger("rebuild")
 
@@ -63,7 +64,6 @@ class Rebuilder:
         upload_fn: Callable,
         verify_fn: Callable,
         delete_fn: Callable,
-        quota: QuotaTracker | None = None,
         config: RebuildConfig | None = None,
     ):
         self.db = db
@@ -71,7 +71,6 @@ class Rebuilder:
         self.upload_fn = upload_fn
         self.verify_fn = verify_fn
         self.delete_fn = delete_fn
-        self.quota = quota or QuotaTracker()
         self.config = config or RebuildConfig()
 
     def rebuild(
@@ -93,22 +92,12 @@ class Rebuilder:
             len(files),
         )
 
-        # Quota exhaustion defers to the next day; it is not a failure.
-        if not self.quota.can_upload():
-            _logger.warning(
-                "rebuild deferred: quota exhausted (%d/%d)",
-                self.quota.used,
-                self.quota.daily_limit,
-            )
-            raise QuotaExceededError(
-                f"quota exhausted ({self.quota.used}/{self.quota.daily_limit})"
-            )
-
         try:
             _logger.debug("step 1/5: transcoding new segment")
             output_path, chapters = self.transcode_fn(files)  # 1. transcode new
             if description is None:
                 description = chapters_text(chapters)
+            description = embed_segment_id(description, new_segment.segment_id)
             _logger.debug("step 2/5: uploading new segment")
             new_video_id = self.upload_fn(output_path, title, description)  # 2. upload new
             _logger.debug("step 3/5: verifying new video %s", new_video_id)

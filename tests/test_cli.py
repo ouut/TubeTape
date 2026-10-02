@@ -29,6 +29,8 @@ class TestDefaults:
         assert args.flush is False
         assert args.watch is True
         assert args.dry_run is False
+        assert args.mtime_interval == 3600.0
+        assert args.quota_backoff == 3600.0
         assert args.timezone is not None
 
     def test_db_default_joins_input(self, tmp_path):
@@ -146,6 +148,83 @@ class TestRunPipeline:
         assert rc == 0
         assert "0 segment(s)" in out
         assert "1 pending" in out
+
+
+class TestRunPipelineReconcile:
+    def _args(self, tmp_path):
+        from tubetape.cli import parse_args
+
+        return parse_args(
+            [
+                "--input", str(tmp_path),
+                "--db", str(tmp_path / "db.json"),
+                "--segment-duration", "20s",
+                "--flush",
+                "--no-watch",
+            ]
+        )
+
+    def test_skips_segment_already_on_youtube(self, tmp_path, monkeypatch, capsys):
+        import json
+
+        from conftest import make_png
+        from tubetape import cli, planner, scanner
+
+        make_png(tmp_path / "a.png", size=(10, 10))
+        args = self._args(tmp_path)
+        file_id = scanner.file_sha256(str(tmp_path / "a.png"))
+        sid = planner.segment_id([file_id], cli._segment_params(args))
+
+        class _FakeUploader:
+            service = object()
+
+            def __init__(self):
+                self.uploaded = []
+
+            def upload(self, *a, **k):
+                self.uploaded.append(1)
+                return "should-not-be-called"
+
+            def verify(self, *a, **k):
+                pass
+
+            def delete_video(self, *a, **k):
+                pass
+
+        fake = _FakeUploader()
+        monkeypatch.setattr(cli, "_build_uploader", lambda a, d: fake)
+        monkeypatch.setattr(cli, "fetch_remote_index", lambda service: {sid: "vid-x"})
+
+        rc = cli.run_pipeline(args)
+        assert rc == cli._EXIT_OK
+        assert fake.uploaded == []  # no upload, no transcode
+        db = json.loads((tmp_path / "db.json").read_text())
+        assert db["segments"][sid]["youtube_video_id"] == "vid-x"
+
+    def test_quota_error_returns_quota_code(self, tmp_path, monkeypatch, capsys):
+        from conftest import make_png
+        from tubetape import cli
+        from tubetape.uploader import QuotaExceededError
+
+        make_png(tmp_path / "a.png", size=(10, 10))
+        args = self._args(tmp_path)
+
+        class _FakeUploader:
+            service = object()
+
+            def upload(self, *a, **k):
+                raise QuotaExceededError("quota")
+
+            def verify(self, *a, **k):
+                pass
+
+            def delete_video(self, *a, **k):
+                pass
+
+        monkeypatch.setattr(cli, "_build_uploader", lambda a, d: _FakeUploader())
+        monkeypatch.setattr(cli, "fetch_remote_index", lambda service: {})
+
+        assert cli.run_pipeline(args) == cli._EXIT_QUOTA
 
 
 if __name__ == "__main__":

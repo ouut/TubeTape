@@ -5,7 +5,6 @@ import pytest
 from tubetape.db import SEGMENT_STATUS_FAILED, SEGMENT_STATUS_SEALED, Database
 from tubetape.planner import Segment
 from tubetape.rebuild import RebuildConfig, Rebuilder, should_rebuild
-from tubetape.uploader import QuotaExceededError, QuotaTracker, UPLOAD_QUOTA_UNITS
 
 
 def make_old_segment(db, segment_id="old-id", video_id="old-vid"):
@@ -148,17 +147,6 @@ class TestRebuilder:
         old = db.get_segment("old-id")
         assert old["youtube_video_id"] == "old-vid"  # kept
         assert old["status"] == SEGMENT_STATUS_FAILED
-
-    def test_quota_exceeded_defers_not_fails(self):
-        db = Database()
-        make_old_segment(db)
-        quota = QuotaTracker(daily_limit=UPLOAD_QUOTA_UNITS, used=1)
-        rb = Rebuilder(db, lambda f: None, lambda *a: None, lambda *a: None, lambda *a: None, quota=quota)
-        with pytest.raises(QuotaExceededError):
-            rb.rebuild("old-id", make_new_segment(), ["a", "b"])
-        old = db.get_segment("old-id")
-        assert old["status"] == SEGMENT_STATUS_SEALED  # unchanged, deferred
-        assert old["youtube_video_id"] == "old-vid"
 
     def test_no_old_video_skips_delete(self):
         db = Database()

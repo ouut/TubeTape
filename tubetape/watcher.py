@@ -43,6 +43,11 @@ class _MediaFileHandler:
         if not getattr(event, "is_directory", False) and is_media_path(event.src_path):
             self.callback(event.src_path)
 
+    def on_moved(self, event) -> None:
+        dest = getattr(event, "dest_path", None)
+        if dest and not getattr(event, "is_directory", False) and is_media_path(dest):
+            self.callback(dest)
+
 
 class Watcher:
     """Watch ``input_dir`` for new media files using watchdog (or polling)."""
@@ -92,3 +97,57 @@ class Watcher:
         if new:
             _logger.debug("poll_once found %d new media path(s)", len(new))
         return new
+
+
+class MtimeScanner:
+    """Detect changed directories cheaply via directory mtime.
+
+    A directory's mtime changes only when an entry inside it is created,
+    deleted or renamed (not when a file's content is modified). Caching each
+    directory's mtime and child list means a steady-state scan only ``stat``s
+    directories and re-lists the few that changed, so its cost is
+    O(#directories) instead of O(#files).
+
+    This is the polling safety net for file systems where inotify/watchdog
+    does not deliver events (e.g. network shares).
+    """
+
+    def __init__(self, root: str):
+        self.root = root
+        self._dirs: dict[str, tuple[int, list[str]]] = {}
+
+    def scan(self) -> list[str]:
+        """Return directories whose contents changed since the last call."""
+        changed: list[str] = []
+        self._walk(self.root, changed)
+        return changed
+
+    def _walk(self, path: str, changed: list[str]) -> None:
+        try:
+            mtime_ns = os.stat(path).st_mtime_ns
+        except OSError:
+            self._dirs.pop(path, None)
+            return
+
+        cached = self._dirs.get(path)
+        if cached is not None and cached[0] == mtime_ns:
+            # Unchanged: the set of child directories is unchanged too, so
+            # reuse it instead of re-listing this directory.
+            for child in cached[1]:
+                self._walk(child, changed)
+            return
+
+        children: list[str] = []
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if entry.name.startswith("."):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        children.append(entry.path)
+        except OSError:
+            pass
+        self._dirs[path] = (mtime_ns, children)
+        changed.append(path)
+        for child in children:
+            self._walk(child, changed)

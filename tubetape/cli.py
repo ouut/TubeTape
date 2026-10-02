@@ -13,15 +13,22 @@ import time
 
 from . import auth, durations
 from .chapters import chapters_text
-from .db import Database
+from .db import SEGMENT_STATUS_SEALED, Database
 from .log import get_logger, setup_logging
 from .planner import plan
 from .rebuild import Rebuilder
+from .reconcile import embed_segment_id, fetch_remote_index
 from .scanner import scan
 from .transcoder import TranscodeConfig, transcode_segment
 from .ui import Reporter
+from .uploader import QuotaExceededError
 
 _DEFAULT_DB_NAME = "tubetape.json"
+
+# Pipeline exit codes.
+_EXIT_OK = 0
+_EXIT_ERROR = 1  # fatal (e.g. no credentials)
+_EXIT_QUOTA = 2  # stopped early because YouTube quota is exhausted
 
 _log = get_logger("cli")
 
@@ -140,7 +147,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--poll-interval",
         type=durations.parse_duration,
         default="30s",
-        help="in watch mode, poll for new files every this many seconds (default: 30s)",
+        help="in watch mode, internal tick: how often to re-check time-based "
+        "conditions (default: 30s)",
+    )
+    parser.add_argument(
+        "--mtime-interval",
+        type=durations.parse_duration,
+        default="1h",
+        help="in watch mode, interval for the directory-mtime safety-net scan "
+        "(catches events watchdog/inotify misses; default: 1h)",
+    )
+    parser.add_argument(
+        "--quota-backoff",
+        type=durations.parse_duration,
+        default="1h",
+        help="when YouTube reports the upload quota is exhausted, wait this long "
+        "before retrying (default: 1h)",
     )
     parser.add_argument(
         "-v",
@@ -324,7 +346,16 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         _log.error("no YouTube credentials found (TUBETAPE_TOKEN env or token.json next to db)")
         db.save()
         _log.info("database saved to %s", db.path)
-        return 1
+        return _EXIT_ERROR
+
+    # Reconcile against YouTube so a lost local database does not re-upload
+    # everything: only list when there is actually something to upload.
+    remote_index: dict[str, str] = {}
+    if plan_result.segments:
+        reporter.status("listing existing uploads on YouTube ...")
+        remote_index = fetch_remote_index(uploader.service)
+        if remote_index:
+            reporter.status(f"found {len(remote_index)} segment(s) already on YouTube")
 
     config = TranscodeConfig(
         crf=args.crf,
@@ -335,20 +366,39 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
 
     total_segments = len(plan_result.segments)
     for index, segment in enumerate(plan_result.segments, start=1):
-        if not uploader.quota.can_upload():
-            reporter.status(
-                f"quota exhausted ({uploader.quota.used}/{uploader.quota.daily_limit}); "
-                f"{len(plan_result.segments)} segment(s) deferred to next run"
-            )
-            _log.warning(
-                "quota exhausted (%d/%d units used); %d segment(s) deferred",
-                uploader.quota.used,
-                uploader.quota.daily_limit,
-                len(plan_result.segments) - index + 1,
-            )
-            break
         segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
         out_path = os.path.join(os.path.dirname(args.db), f".{segment.segment_id[:12]}.mp4")
+
+        # Already on YouTube (e.g. after a lost db): record locally and skip.
+        existing_video = None if segment.is_rebuild else remote_index.get(segment.segment_id)
+        if existing_video:
+            reporter.status(
+                f"segment {segment.title} already on YouTube ({existing_video}); skipping"
+            )
+            _log.info(
+                "segment %s already uploaded as %s; recording and skipping",
+                segment.segment_id,
+                existing_video,
+            )
+            db.upsert_segment(
+                segment.segment_id,
+                {
+                    "file_ids": segment.file_ids,
+                    "range": [segment.start_ts, segment.end_ts],
+                    "duration_seconds": segment.duration_seconds,
+                    "output_path": None,
+                    "youtube_video_id": existing_video,
+                    "previous_video_ids": [],
+                    "status": SEGMENT_STATUS_SEALED,
+                    "chapters": [],
+                    "last_rebuilt_at": None,
+                    "attempts": 0,
+                    "error": None,
+                },
+            )
+            db.save()
+            continue
+
         _log.info(
             "segment %d/%d: %s (%d files, %.1fs) -> %s",
             index,
@@ -365,59 +415,76 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
 
             return transcode_segment(files, _out_path, config, progress=progress)
 
-        reporter.status(f"transcoding {segment.title} ...")
-        if segment.is_rebuild:
+        try:
+            reporter.status(f"transcoding {segment.title} ...")
+            if segment.is_rebuild:
+                reporter.status(
+                    f"rebuilding {segment.title} (replaces {segment.replaces_segment_id[:12]} ...) ..."
+                )
+                _log.info(
+                    "rebuild: replacing segment %s with %s",
+                    segment.replaces_segment_id,
+                    segment.segment_id,
+                )
+                rebuilder = Rebuilder(
+                    db,
+                    transcode_fn=transcode_fn,
+                    upload_fn=lambda out, title, desc: uploader.upload(
+                        out, title, desc, privacy=args.privacy
+                    ),
+                    verify_fn=uploader.verify,
+                    delete_fn=uploader.delete_video,
+                )
+                video_id = rebuilder.rebuild(
+                    segment.replaces_segment_id,
+                    segment,
+                    segment_files,
+                    title=segment.title,
+                )
+                _log.info("rebuild committed: new video id %s", video_id)
+            else:
+                _, chapters = transcode_fn(segment_files)
+                reporter.status(f"uploading {segment.title} ...")
+                description = embed_segment_id(
+                    chapters_text(chapters), segment.segment_id
+                )
+                video_id = uploader.upload(
+                    out_path,
+                    segment.title,
+                    description,
+                    privacy=args.privacy,
+                )
+                db.upsert_segment(
+                    segment.segment_id,
+                    {
+                        "file_ids": segment.file_ids,
+                        "range": [segment.start_ts, segment.end_ts],
+                        "duration_seconds": segment.duration_seconds,
+                        "output_path": out_path,
+                        "youtube_video_id": video_id,
+                        "previous_video_ids": [],
+                        "status": SEGMENT_STATUS_SEALED,
+                        "chapters": chapters,
+                        "last_rebuilt_at": None,
+                        "attempts": 0,
+                        "error": None,
+                    },
+                )
+                _log.info("sealed segment %s -> video id %s", segment.segment_id, video_id)
+        except QuotaExceededError as exc:
             reporter.status(
-                f"rebuilding {segment.title} (replaces {segment.replaces_segment_id[:12]} ...) ..."
+                f"YouTube quota exhausted; deferring remaining "
+                f"{total_segments - index + 1} segment(s) to a later retry"
             )
-            _log.info(
-                "rebuild: replacing segment %s with %s",
-                segment.replaces_segment_id,
-                segment.segment_id,
+            _log.warning(
+                "quota exhausted while processing segment %s: %s", segment.segment_id, exc
             )
-            rebuilder = Rebuilder(
-                db,
-                transcode_fn=transcode_fn,
-                upload_fn=lambda out, title, desc: uploader.upload(
-                    out, title, desc, privacy=args.privacy
-                ),
-                verify_fn=uploader.verify,
-                delete_fn=uploader.delete_video,
-                quota=uploader.quota,
-            )
-            video_id = rebuilder.rebuild(
-                segment.replaces_segment_id,
-                segment,
-                segment_files,
-                title=segment.title,
-            )
-            _log.info("rebuild committed: new video id %s", video_id)
-        else:
-            _, chapters = transcode_fn(segment_files)
-            reporter.status(f"uploading {segment.title} ...")
-            video_id = uploader.upload(
-                out_path,
-                segment.title,
-                chapters_text(chapters),
-                privacy=args.privacy,
-            )
-            db.upsert_segment(
-                segment.segment_id,
-                {
-                    "file_ids": segment.file_ids,
-                    "range": [segment.start_ts, segment.end_ts],
-                    "duration_seconds": segment.duration_seconds,
-                    "output_path": out_path,
-                    "youtube_video_id": video_id,
-                    "previous_video_ids": [],
-                    "status": "sealed",
-                    "chapters": chapters,
-                    "last_rebuilt_at": None,
-                    "attempts": 0,
-                    "error": None,
-                },
-            )
-            _log.info("sealed segment %s -> video id %s", segment.segment_id, video_id)
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            db.save()
+            return _EXIT_QUOTA
 
         # Clean up the local transcode output now that it's uploaded.
         try:
@@ -426,43 +493,32 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         except OSError as exc:
             _log.debug("could not remove %s: %s", out_path, exc)
 
-        db.settings["quota"] = uploader.quota.to_dict()
         db.save()
         _log.debug("database saved to %s", db.path)
-        reporter.quota(uploader.quota.used, uploader.quota.daily_limit)
 
     db.save()
     _log.info(
-        "pipeline done: %d segment(s) processed, %d pending, quota used %d/%d",
+        "pipeline done: %d segment(s) processed, %d pending",
         len(plan_result.segments),
         len(plan_result.pending_files),
-        uploader.quota.used,
-        uploader.quota.daily_limit,
     )
     reporter.status("done")
-    return 0
-
-
-def _media_paths(input_dir: str) -> set[str]:
-    import os
-
-    from .scanner import MEDIA_EXTENSIONS
-
-    paths: set[str] = set()
-    for root, dirs, names in os.walk(input_dir):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        for name in names:
-            if name.startswith("."):
-                continue
-            if os.path.splitext(name)[1].lower() in MEDIA_EXTENSIONS:
-                paths.add(os.path.join(root, name))
-    return paths
+    return _EXIT_OK
 
 
 def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int:
-    """Process once, then keep re-processing as new media files appear."""
+    """Process once, then keep re-processing as new media files appear.
+
+    New files are detected by watchdog (inotify/FSEvents/...), with a periodic
+    directory-mtime scan as a safety net for file systems where events are not
+    delivered (e.g. network shares). Quota exhaustion is handled by backing off
+    and retrying, without keeping any local quota state.
+    """
     import signal
+    import threading
     import time
+
+    from .watcher import MtimeScanner, Watcher
 
     # docker stop 发 SIGTERM，转成 KeyboardInterrupt 走同样的 flush 退出逻辑
     signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(KeyboardInterrupt()))
@@ -470,66 +526,97 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
     reporter = reporter or Reporter()
 
     code = run_pipeline(args, reporter)
-    if code != 0:
+    if code == _EXIT_ERROR:
         return code
 
     reporter.status(
-        f"watching for new files (poll {args.poll_interval:g}s, "
+        f"watching for new files (watchdog + mtime every {args.mtime_interval:g}s, "
         f"quiet {args.quiet_period:g}s, Ctrl+C to stop) ..."
     )
-    _log.info("watch mode active: poll=%.1fs quiet=%.1fs", args.poll_interval, args.quiet_period)
-    known = _media_paths(args.input)
-    _log.debug("baseline media set: %d path(s)", len(known))
-    last_change = time.time()
+    _log.info(
+        "watch mode active: watchdog + mtime every %.1fs, quiet %.1fs, quota backoff %.1fs",
+        args.mtime_interval,
+        args.quiet_period,
+        args.quota_backoff,
+    )
+
+    changed = threading.Event()
+
+    def on_new_file(path: str) -> None:
+        _log.info("watchdog detected new file: %s", path)
+        changed.set()
+
+    watcher = Watcher(args.input, on_new_file, use_watchdog=True)
+    try:
+        watcher.start()
+    except Exception as exc:  # noqa: BLE001 - fall back to mtime polling
+        _log.warning("watchdog unavailable (%s); using mtime polling only", exc)
+
+    mtime_scanner = MtimeScanner(args.input)
+    mtime_scanner.scan()  # baseline
+    last_mtime_scan = time.monotonic()
+    last_change = time.monotonic()
     has_changes = False
-
-    from datetime import datetime, timezone
-
-    last_day = datetime.now(timezone.utc).date()
+    quota_retry_at = time.monotonic() + args.quota_backoff if code == _EXIT_QUOTA else 0.0
 
     try:
         while True:
-            time.sleep(max(1.0, args.poll_interval))
+            # Wake on a watchdog event, or after the internal tick.
+            if changed.wait(timeout=max(1.0, args.poll_interval)):
+                changed.clear()
+                has_changes = True
+                last_change = time.monotonic()
+            now = time.monotonic()
 
-            # Daily re-process: quota rolls over each day, so re-run once a day
-            # to upload segments deferred by quota exhaustion.
-            today = datetime.now(timezone.utc).date()
-            if today != last_day:
-                last_day = today
-                reporter.status("new day (quota reset); re-processing ...")
-                _log.info("new UTC day %s: re-running pipeline (quota rollover)", today)
-                run_pipeline(args, reporter)
-                known = _media_paths(args.input)
+            # Safety net: cheap directory-mtime scan.
+            if now - last_mtime_scan >= args.mtime_interval:
+                last_mtime_scan = now
+                changed_dirs = mtime_scanner.scan()
+                if changed_dirs:
+                    reporter.status(f"mtime scan: {len(changed_dirs)} directory(ies) changed")
+                    _log.info(
+                        "mtime scan detected %d changed directory(ies)", len(changed_dirs)
+                    )
+                    has_changes = True
+                    last_change = now
+
+            # Quota backoff: retry once the backoff has elapsed.
+            if quota_retry_at and now >= quota_retry_at:
+                quota_retry_at = 0.0
+                reporter.status("quota backoff elapsed; retrying ...")
+                _log.info("quota backoff elapsed; re-running pipeline")
+                status = run_pipeline(args, reporter)
+                mtime_scanner.scan()
+                last_mtime_scan = time.monotonic()
                 has_changes = False
-                last_change = time.time()
+                if status == _EXIT_QUOTA:
+                    quota_retry_at = time.monotonic() + args.quota_backoff
                 continue
 
-            current = _media_paths(args.input)
-            new = current - known
-            if new:
-                reporter.status(f"detected {len(new)} new file(s)")
-                _log.info("detected %d new file(s): %s", len(new), sorted(new))
-                known = current
-                last_change = time.time()
-                has_changes = True
-            if has_changes and time.time() - last_change >= args.quiet_period:
+            # Process new files after the quiet period (debounce).
+            if has_changes and now - last_change >= args.quiet_period:
                 reporter.status("quiet period elapsed; re-processing ...")
                 _log.info("quiet period (%.1fs) elapsed; re-running pipeline", args.quiet_period)
-                run_pipeline(args, reporter)
-                known = _media_paths(args.input)
+                status = run_pipeline(args, reporter)
+                mtime_scanner.scan()
+                last_mtime_scan = time.monotonic()
                 has_changes = False
+                if status == _EXIT_QUOTA:
+                    quota_retry_at = time.monotonic() + args.quota_backoff
     except KeyboardInterrupt:
         reporter.status("exit signal: flushing pending segments ...")
         _log.info("received exit signal; flushing pending segments")
         args.flush = True
         run_pipeline(args, reporter)
+    finally:
+        watcher.stop()
     return 0
 
 
 def _build_uploader(args: argparse.Namespace, db: Database):
     import os
 
-    from .uploader import QuotaTracker, Uploader
+    from .uploader import Uploader
 
     token_str = os.environ.get(auth.TOKEN_ENV)
     if not token_str:
@@ -540,13 +627,10 @@ def _build_uploader(args: argparse.Namespace, db: Database):
     else:
         credentials = auth.credentials_from_token_string(token_str)
 
-    quota = QuotaTracker.from_dict(db.settings.get("quota"))
-    quota.rollover()
-
     from googleapiclient.discovery import build
 
     service = build("youtube", "v3", credentials=credentials)
-    return Uploader(service, quota=quota, playlist_id=getattr(args, "playlist", None))
+    return Uploader(service, playlist_id=getattr(args, "playlist", None))
 
 
 def main(argv: list[str] | None = None) -> int:
