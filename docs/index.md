@@ -122,6 +122,12 @@ docker compose run --rm tubetape \
 
 No. It operates **the channel the token belongs to**; everyone uses **their own** token, so **their own** channel. Your `token.json` is never distributed.
 
+**Q：别人能用我的 `client_secret.json` 吗？ / Can someone else use my `client_secret.json`?**
+
+技术上可以（他们会拿到自己的 `token.json`、上传到自己的频道），但**不建议**：**YouTube API 配额按 GCP 项目算（不是按用户）**，共用你的客户端就是**共用你那 10000 units/天（约 6 片/天）**的配额，会被互相抢光。让每个使用者自己建 GCP 项目 + 自己的 `client_secret.json`。
+
+Technically yes (they get their own token and upload to their own channel), but **not recommended**: the YouTube API quota is **per GCP project**, so sharing means **sharing your 10,000 units/day (~6 uploads/day)**. Let each user create their own GCP project and `client_secret.json`.
+
 ---
 
 ## 联系方式 / Contact

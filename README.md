@@ -581,6 +581,25 @@ Docker 是**最稳**的运行方式：容器自带 glibc + ffmpeg + 全部 Pytho
 
 **Docker Hub 镜像**：`chet2026/tubetape`
 
+### 快速上手（三步）
+
+```bash
+# ① 拿到镜像（拉取官方镜像，或本地构建）
+docker pull chet2026/tubetape
+# 或：docker build -t chet2026/tubetape:latest .
+
+# ② 首次登录：在容器里生成 token.json（必须交互式，不能用 up -d）
+cp /path/to/client_secret.json .            # 放进 TubeTape 目录（会以 ./:/db 挂进容器）
+docker compose run --rm tubetape \
+  --db /db/tubetape.json --client-secret /db/client_secret.json --login
+
+# ③ 启动（之后它只用 token.json，不再需要 client_secret.json）
+docker compose up -d
+docker compose logs -f
+```
+
+> `.env` 里的 `TUBETAPE_TOKEN` 要**留空**，否则环境变量会盖过 `token.json`。
+
 ### 拉取镜像
 
 ```bash
@@ -769,6 +788,11 @@ docker compose run --rm tubetape \
 
 **Q：提示 `no YouTube credentials` / 找不到 token？**
 说明既没有 `TUBETAPE_TOKEN` 环境变量，也没有 `<db 目录>/token.json`。先跑一次 `--login` 生成 token（见上一问）。
+
+**Q：别人用这个工具，能用我的 `client_secret.json` 吗？**
+技术上可以：他们会拿到**自己的 `token.json`**、上传到**自己的频道**。但**不建议**，因为 **YouTube API 配额按 GCP 项目算（不是按用户）**：共用你的客户端就是**共用你那 10000 units/天（约 6 片/天）**的配额，会被互相抢光；同意屏幕、测试用户、审核状态也都绑在你的项目上。
+
+**结论：每个使用者自己建一个 GCP 项目 + 自己的 `client_secret.json`**（一次性，几分钟）。你的 `client_secret.json` 只给自己用；`token.json` 更是每人一份。
 
 ---
 
