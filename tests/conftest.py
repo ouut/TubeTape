@@ -33,6 +33,26 @@ def make_camera_photo(
     img.save(path, exif=exif)
 
 
+def make_heic(
+    path: Path,
+    make: str = "Apple",
+    model: str = "iPhone 13",
+    dt_str: str = "2024:01:01 15:30:00",
+    size: tuple[int, int] = (100, 80),
+) -> None:
+    """Write a small HEIC image with camera EXIF (Make + Model + DateTimeOriginal)."""
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    img = Image.new("RGB", size, "red")
+    exif = img.getexif()
+    exif[0x010F] = make  # Make
+    exif[0x0110] = model  # Model
+    exif_ifd = exif.get_ifd(0x8769)  # ExifIFD
+    exif_ifd[0x9003] = dt_str  # DateTimeOriginal
+    img.save(path, format="HEIF", exif=exif)
+
+
 def make_phone_video(
     path: Path,
     make: str = "Apple",

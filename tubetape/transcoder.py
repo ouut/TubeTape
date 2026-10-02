@@ -14,10 +14,17 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from PIL import Image, ImageOps
+
 from .chapters import build_chapters
 from .log import get_logger
 from .planner import display_ts
-from .scanner import ScannedFile, FILE_TYPE_IMAGE, FILE_TYPE_VIDEO
+from .scanner import (
+    HEIF_EXTENSIONS,
+    FILE_TYPE_IMAGE,
+    FILE_TYPE_VIDEO,
+    ScannedFile,
+)
 
 _logger = get_logger("transcoder")
 
@@ -150,6 +157,16 @@ def check_disk_space(path: str, required_bytes: int) -> None:
         raise OSError(f"insufficient disk space: {free} < {required_bytes} bytes")
 
 
+def _heif_to_png(src: str, dst: str) -> None:
+    """Convert a HEIC/HEIF image to PNG for ffmpeg (which usually can't decode HEIF).
+
+    Applies the EXIF orientation so portrait photos aren't rotated in the video.
+    """
+    with Image.open(src) as img:
+        img = ImageOps.exif_transpose(img)
+        img.convert("RGB").save(dst, "PNG")
+
+
 def transcode_segment(
     files: list[ScannedFile],
     out_path: str,
@@ -189,8 +206,16 @@ def transcode_segment(
                 progress(index + 1, len(files), item)
             clip_path = os.path.join(tmp, f"clip_{index:04d}.mp4")
             if item.type == FILE_TYPE_IMAGE:
+                img_src = item.abs_path
+                if os.path.splitext(item.abs_path)[1].lower() in HEIF_EXTENSIONS:
+                    img_src = os.path.join(tmp, f"src_{index:04d}.png")
+                    _logger.info(
+                        "converting HEIF image %s to PNG for ffmpeg",
+                        item.rel_path,
+                    )
+                    _heif_to_png(item.abs_path, img_src)
                 cmd = build_image_clip_command(
-                    item.abs_path, clip_path, canvas_w, canvas_h,
+                    img_src, clip_path, canvas_w, canvas_h,
                     item.duration_seconds or config.image_duration, config,
                 )
             elif item.type == FILE_TYPE_VIDEO:

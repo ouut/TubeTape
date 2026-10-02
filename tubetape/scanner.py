@@ -31,19 +31,38 @@ from .log import get_logger
 
 _logger = get_logger("scanner")
 
+# HEIF/HEIC support needs pillow-heif; registering it lets Pillow open .heic/.heif.
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except Exception:  # noqa: BLE001 - optional; .heic then fails to open and is reported
+    _logger.debug("pillow-heif not available; .heic/.heif images cannot be read")
+
 IMAGE_EXTENSIONS = frozenset(
-    [".jpg", ".jpeg", ".png", ".heic", ".tif", ".tiff", ".webp", ".bmp"]
+    [".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".webp", ".bmp"]
 )
 VIDEO_EXTENSIONS = frozenset(
-    [".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mts", ".m2ts"]
+    [".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mts", ".m2ts", ".3gp"]
 )
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
-# Formats that actually carry EXIF metadata (skip exifread for the rest).
-EXIF_CAPABLE_EXTENSIONS = frozenset([".jpg", ".jpeg", ".tif", ".tiff", ".heic"])
+# HEIF-family containers: decoded via Pillow, converted to PNG before ffmpeg,
+# because ffmpeg builds commonly lack a HEIC/HEIF decoder.
+HEIF_EXTENSIONS = frozenset([".heic", ".heif"])
 
-FAST_HASH_THRESHOLD = 512 * 1024 * 1024  # 512 MB
-FAST_HASH_CHUNK = 4 * 1024 * 1024  # 4 MB
+# Formats that actually carry EXIF metadata (skip exifread for the rest).
+EXIF_CAPABLE_EXTENSIONS = frozenset(
+    [".jpg", ".jpeg", ".tif", ".tiff", ".heic", ".heif"]
+)
+
+# Content hashing samples the head, middle and tail of each file (plus its
+# size) instead of reading it end to end. This turns the first scan from
+# O(total bytes) into O(number of files) and is what makes large libraries
+# fast. Files smaller than 3 chunks are read in full. Raise HASH_CHUNK to
+# trade a little speed for a lower (already very small) chance of sampling
+# collisions.
+HASH_CHUNK = 64 * 1024  # bytes sampled from head, middle and tail
 
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 _RESOLUTION_RE = re.compile(r"(\d{2,5})x(\d{2,5})")
@@ -157,29 +176,36 @@ def parse_filename_time(name: str, tz) -> datetime | None:
 # ------------------------------------------------------------------- hashing
 
 
-def file_sha256(path: str, threshold: int = FAST_HASH_THRESHOLD) -> str:
+def file_sha256(path: str, chunk: int = HASH_CHUNK) -> str:
     """Return the content hash of a file.
 
-    Files larger than ``threshold`` bytes use a fast hash: first/middle/last
-    4 MB plus the file size, so re-hashing huge files stays cheap.
+    Hashes the head/middle/tail ``chunk`` bytes plus the file size, so huge
+    files are not read end to end on every scan. Files smaller than three
+    chunks are read in full (sampling would cover them anyway).
     """
     size = os.path.getsize(path)
     hasher = hashlib.sha256()
-    if size <= threshold:
+
+    if size <= 3 * chunk:
         with open(path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                hasher.update(chunk)
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(block)
         _logger.debug("hashed %s (%d bytes, full hash)", path, size)
         return hasher.hexdigest()
 
-    _logger.debug("hashed %s (%d bytes, fast hash: first/middle/last 4MB + size)", path, size)
     with open(path, "rb") as handle:
-        hasher.update(handle.read(FAST_HASH_CHUNK))  # first 4 MB
-        handle.seek(max(0, size // 2 - FAST_HASH_CHUNK // 2))
-        hasher.update(handle.read(FAST_HASH_CHUNK))  # middle 4 MB
-        handle.seek(max(0, size - FAST_HASH_CHUNK))
-        hasher.update(handle.read(FAST_HASH_CHUNK))  # last 4 MB
+        hasher.update(handle.read(chunk))  # head
+        handle.seek(max(0, size // 2 - chunk // 2))
+        hasher.update(handle.read(chunk))  # middle
+        handle.seek(max(0, size - chunk))
+        hasher.update(handle.read(chunk))  # tail
     hasher.update(str(size).encode("ascii"))
+    _logger.debug(
+        "hashed %s (%d bytes, sampled head/middle/tail %dKB + size)",
+        path,
+        size,
+        chunk // 1024,
+    )
     return hasher.hexdigest()
 
 
@@ -368,33 +394,75 @@ def _exifread_gps(tags) -> dict | None:
 # ------------------------------------------------------------- metadata read
 
 
-def _image_meta(path: str, tz) -> dict:
-    with Image.open(path) as img:
-        resolution = f"{img.width}x{img.height}"
+def _pillow_heif_gps(exif) -> dict | None:
+    """Read GPS from a Pillow EXIF object (HEIC/HEIF)."""
+    try:
+        gps = exif.get_ifd(0x8825)  # GPSInfo IFD
+    except Exception:  # noqa: BLE001
+        return None
+    if not gps:
+        return None
+    lat_ref, lat = gps.get(1), gps.get(2)
+    lng_ref, lng = gps.get(3), gps.get(4)
+    if not lat or not lng:
+        return None
+    try:
+        lat_val = _apply_gps_ref(_dms_to_decimal(lat), str(lat_ref), "S", "N")
+        lng_val = _apply_gps_ref(_dms_to_decimal(lng), str(lng_ref), "W", "E")
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if lat_val is None or lng_val is None:
+        return None
+    return {"lat": round(lat_val, 6), "lng": round(lng_val, 6)}
 
+
+def _pillow_heif_exif(exif, tz) -> dict:
+    """Extract capture time / make / model / GPS from a Pillow EXIF object.
+
+    Used for HEIC/HEIF, whose metadata ``exifread`` cannot parse.
+    """
+    captured_at_utc = None
+    captured_epoch = None
+    missing_meta = True
+    make = model = software = None
+    location = None
+    try:
+        exif_ifd = exif.get_ifd(0x8769)  # ExifIFD
+        dt_original = (
+            exif_ifd.get(0x9003)  # DateTimeOriginal
+            or exif_ifd.get(0x9004)  # DateTimeDigitized
+            or exif.get(0x0132)  # DateTime
+        )
+        if dt_original:
+            dt = parse_exif_datetime(str(dt_original), tz)
+            if dt is not None:
+                captured_at_utc = format_iso_utc(dt)
+                captured_epoch = dt.timestamp()
+                missing_meta = False
+        make = exif.get(0x010F)
+        model = exif.get(0x0110)
+        software = exif.get(0x0131)
+        location = _pillow_heif_gps(exif)
+    except Exception:  # noqa: BLE001 - EXIF is best-effort
+        pass
+    return {
+        "captured_at_utc": captured_at_utc,
+        "captured_epoch": captured_epoch,
+        "missing_meta": missing_meta,
+        "location": location,
+        "make": str(make) if make else None,
+        "model": str(model) if model else None,
+        "software": str(software) if software else None,
+    }
+
+
+def _exifread_exif(path: str, tz) -> dict:
+    """Extract capture time / make / model / GPS via exifread (JPEG/TIFF)."""
     captured_at_utc = None
     captured_epoch = None
     missing_meta = True
     location = None
-    make = None
-    model = None
-    software = None
-
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in EXIF_CAPABLE_EXTENSIONS:
-        return {
-            "resolution": resolution,
-            "duration_seconds": None,
-            "captured_at_utc": None,
-            "captured_epoch": None,
-            "location": None,
-            "missing_meta": True,
-            "make": None,
-            "model": None,
-            "software": None,
-            "is_camera": False,
-        }
-
+    make = model = software = None
     try:
         with open(path, "rb") as handle:
             tags = exifread.process_file(handle, details=False)
@@ -409,21 +477,50 @@ def _image_meta(path: str, tz) -> dict:
         make = str(tags["Image Make"]) if tags.get("Image Make") else None
         model = str(tags["Image Model"]) if tags.get("Image Model") else None
         software = str(tags["Image Software"]) if tags.get("Image Software") else None
-    except Exception:
-        # EXIF is best-effort; fall back to mtime below.
+    except Exception:  # noqa: BLE001 - EXIF is best-effort
         pass
+    return {
+        "captured_at_utc": captured_at_utc,
+        "captured_epoch": captured_epoch,
+        "missing_meta": missing_meta,
+        "location": location,
+        "make": make,
+        "model": model,
+        "software": software,
+    }
+
+
+def _image_meta(path: str, tz) -> dict:
+    ext = os.path.splitext(path)[1].lower()
+    with Image.open(path) as img:
+        resolution = f"{img.width}x{img.height}"
+        pillow_exif = None
+        if ext in HEIF_EXTENSIONS:
+            try:
+                pillow_exif = img.getexif()
+            except Exception:  # noqa: BLE001 - best-effort
+                pillow_exif = None
+
+    if ext not in EXIF_CAPABLE_EXTENSIONS:
+        info = {
+            "captured_at_utc": None,
+            "captured_epoch": None,
+            "missing_meta": True,
+            "location": None,
+            "make": None,
+            "model": None,
+            "software": None,
+        }
+    elif pillow_exif is not None:
+        info = _pillow_heif_exif(pillow_exif, tz)
+    else:
+        info = _exifread_exif(path, tz)
 
     return {
         "resolution": resolution,
         "duration_seconds": None,
-        "captured_at_utc": captured_at_utc,
-        "captured_epoch": captured_epoch,
-        "location": location,
-        "missing_meta": missing_meta,
-        "make": make,
-        "model": model,
-        "software": software,
-        "is_camera": bool(make) and bool(model),
+        **info,
+        "is_camera": bool(info["make"]) and bool(info["model"]),
     }
 
 
@@ -518,7 +615,7 @@ def scan_files(
     input_dir: str,
     timezone,
     image_duration: float = 3.0,
-    hash_threshold: int = FAST_HASH_THRESHOLD,
+    hash_chunk: int = HASH_CHUNK,
     only_camera_photos: bool = False,
     only_phone_videos: bool = False,
     cache: dict[str, dict] | None = None,
@@ -628,7 +725,7 @@ def scan_files(
         else:
             started = time.monotonic()
             try:
-                file_id = file_sha256(abs_path, hash_threshold)
+                file_id = file_sha256(abs_path, hash_chunk)
                 if ftype == FILE_TYPE_IMAGE:
                     meta = _image_meta(abs_path, timezone)
                     duration = image_duration

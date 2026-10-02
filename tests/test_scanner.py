@@ -12,6 +12,7 @@ from tubetape.db import Database
 from conftest import (
     make_camera_photo,
     make_corrupt,
+    make_heic,
     make_jpeg_with_exif,
     make_phone_video,
     make_png,
@@ -45,13 +46,27 @@ class TestHashing:
         make_png(b, size=(20, 20))
         assert scanner.file_sha256(str(a)) != scanner.file_sha256(str(b))
 
-    def test_fast_hash_large_file(self, tmp_path):
+    def test_large_file_hash_is_stable(self, tmp_path):
         path = tmp_path / "big.bin"
         with open(path, "wb") as handle:
             handle.truncate(600 * 1024 * 1024)  # 600 MB sparse
         h1 = scanner.file_sha256(str(path))
         assert len(h1) == 64
         assert scanner.file_sha256(str(path)) == h1
+
+    def test_sampled_hash_uses_head_middle_tail(self, tmp_path):
+        chunk = scanner.HASH_CHUNK
+        size = 4 * chunk
+        a = tmp_path / "a.bin"
+        b = tmp_path / "b.bin"
+        with open(a, "wb") as f:
+            f.write(b"A" * chunk + b"x" * (size - 2 * chunk) + b"A" * chunk)
+        with open(b, "wb") as f:
+            f.write(b"B" * chunk + b"x" * (size - 2 * chunk) + b"B" * chunk)
+        # Different head bytes -> different hash (sample covers the head).
+        assert scanner.file_sha256(str(a)) != scanner.file_sha256(str(b))
+        # Same content -> stable hash.
+        assert scanner.file_sha256(str(a)) == scanner.file_sha256(str(a))
 
 
 class TestTimestampParsing:
@@ -151,6 +166,13 @@ class TestSourceClassification:
         files, _, _ = scanner.scan_files(str(tmp_path), SHANGHAI)
         assert files[0].source == "other"
 
+    def test_heic_photo_is_camera(self, tmp_path):
+        make_heic(tmp_path / "cam.heic")
+        files, errors, _ = scanner.scan_files(str(tmp_path), SHANGHAI)
+        assert errors == []
+        assert files[0].source == "camera"
+        assert files[0].captured_at_utc == "2024-01-01T07:30:00Z"
+
     def test_phone_video(self, tmp_path):
         make_phone_video(tmp_path / "phone.mov")
         files, _, _ = scanner.scan_files(str(tmp_path), SHANGHAI)
@@ -210,6 +232,18 @@ class TestScanFiles:
         dt = scanner.parse_iso_utc(f.captured_at_utc)
         now = datetime.now(UTC)
         assert abs((now - dt).total_seconds()) < 300
+
+    def test_heic_exif_time_and_resolution(self, tmp_path):
+        make_heic(tmp_path / "p.heic", dt_str="2024:01:01 15:30:00", size=(100, 80))
+        files, errors, _ = scanner.scan_files(str(tmp_path), SHANGHAI)
+        assert errors == []
+        assert len(files) == 1
+        f = files[0]
+        assert f.type == "image"
+        assert f.captured_at_utc == "2024-01-01T07:30:00Z"
+        assert f.missing_meta is False
+        assert f.resolution == "100x80"
+        assert f.source == "camera"
 
     def test_image_filename_time_fallback(self, tmp_path):
         from PIL import Image

@@ -45,6 +45,7 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 ```
 扫描（scan）
   → 递归找图片/视频，提取拍摄时间、分辨率、内容哈希(file_id)
+  → 内容哈希只采样头/中/尾各 64KB + 文件大小（小文件整读），不读整个大文件
   → 与数据库对比：新增 / 已处理 / 已删除
   → 哈希缓存：文件「大小 + mtime(ns)」没变时复用上次的哈希和元数据，不重新读文件
   → 视频元数据优先用 ffprobe 结构化读取，缺失时才回退到 ffmpeg -i
@@ -83,7 +84,7 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 | 依赖 | 说明 |
 |---|---|
 | Python 3.11+ | （3.10 实测也可运行，但 pyproject 声明 ≥3.11） |
-| ffmpeg | 系统命令，用于解析视频元数据和转码 |
+| ffmpeg | 系统命令，提供 `ffmpeg` + `ffprobe`，用于视频元数据探测和转码 |
 | 网络 | 访问 YouTube Data API |
 
 ```bash
@@ -94,13 +95,22 @@ cd TubeTape
 # 2. 安装 Python 依赖
 pip install -e ".[dev]"
 # 或最小安装：
-pip install tzdata Pillow exifread google-api-python-client google-auth-oauthlib watchdog rich
+pip install tzdata Pillow pillow-heif exifread google-api-python-client google-auth-oauthlib watchdog rich
 
 # 3. 确认 ffmpeg 可用
 ffmpeg -version
 ```
 
 > 打包成可执行文件时无需装 Python，但**目标机器仍需安装 ffmpeg**。
+
+**支持的媒体格式：**
+
+| 类型 | 扩展名 |
+|---|---|
+| 图片 | `.jpg` `.jpeg` `.png` `.heic` `.heif` `.tif` `.tiff` `.webp` `.bmp` |
+| 视频 | `.mp4` `.mov` `.m4v` `.avi` `.mkv` `.mts` `.m2ts` `.3gp` |
+
+> HEIC/HEIF 由 `pillow-heif`（pip 依赖，自带 libheif）解码：扫描时读其 EXIF（分辨率/拍摄时间/Make/Model），转码时先转成 PNG 再交给 ffmpeg（ffmpeg 通常不带 HEIC 解码器）。
 
 ---
 
@@ -400,7 +410,7 @@ python -m tubetape --input ~/Photos --only-camera-photos --only-phone-videos
 }
 ```
 
-- `file_id` = 文件内容的 SHA-256（>512MB 用快速哈希），改路径/改名不变。
+- `file_id` = 头/中/尾各 64KB + 文件大小的 SHA-256（小文件整读），改路径/改名不变。
 - `segment_id` = sha256(排序后的 file_id 列表 + 分片参数)，内容或参数变了才重建。
 - `previous_video_ids` = 重建替换掉的旧视频 id。
 - `settings.quota` = 当日配额用量，跨运行持久化，每日自动归零。
@@ -440,6 +450,7 @@ scan [2/26962] a.jpg (image, 2.3 MB) [cache]
 - `--dry-run` 不写库，因此**不产生也不更新缓存**；要先生成缓存需真实运行一次。
 - 缓存按「路径 + 大小 + mtime」判断，若内容变了但大小和 mtime 被工具刻意保持原样，会误判为未变（标准取舍，家用场景基本不会遇到）。
 - 文件移动/改名：路径变了会重新哈希，但算出的 `file_id` 不变，仍会被识别为「已处理」。
+- `file_id` 只采样头/中/尾各 64KB + 文件大小；理论上两个大小相同、且这三处内容也完全相同的不同文件会被当成同一个（实际几乎不可能）。可调大代码里的 `HASH_CHUNK` 降低这个概率。
 
 ---
 
@@ -635,6 +646,17 @@ EXIF 被剥（微信/QQ 传输）时会优先用文件名里的时间（如 `202
 
 **Q：配额不够怎么办？**
 默认约 6 片/天。减少分片数（增大 `--segment-duration`），或等次日自动恢复。
+
+---
+
+## 更新记录
+
+- **HEIC/HEIF 支持**：扫描时读取 HEIC/HEIF 的 EXIF（分辨率/拍摄时间/Make/Model），转码前先转成 PNG 再交给 ffmpeg（ffmpeg 通常不带 HEIC 解码器）。新增 `.heif`（图片）和 `.3gp`（视频）格式。
+- **快速采样哈希**：`file_id` 改为「头/中/尾各 64KB + 文件大小」的 SHA-256（小文件整读），首次扫描读取量从 ~百 GB 降到 ~5GB，实测冷缓存约 10 倍、热缓存约 67 倍提速。
+- **哈希缓存**：按「路径 + 大小 + mtime(ns)」复用上次哈希和元数据，重复扫描几乎瞬时；扫描过程中每 1000 文件/30s 增量落盘，中断不丢已扫进度。
+- **详细日志**：终端友好进度 + `<db>.log` 带时间戳 DEBUG 审计日志；`-v`/`-vv` 控制终端详细度，`--log-file` 指定日志路径。
+- **ffprobe 探测**：视频元数据优先用 `ffprobe` 结构化读取，失败时回退 `ffmpeg -i`。
+- **Docker Compose**：新增 `docker-compose.yml` + `.env.example`；数据库/哈希缓存/日志落在 compose 同目录；构建脚本默认构建并推送 `chet2026/tubetape`。
 
 ---
 

@@ -17,7 +17,7 @@ from tubetape.transcoder import (
     transcode_segment,
 )
 
-from conftest import make_png, make_video
+from conftest import make_heic, make_png, make_video
 
 
 class TestTargetResolution:
@@ -100,6 +100,21 @@ class TestTranscodeSegment:
         f = ScannedFile(
             file_id="x", abs_path=str(tmp_path / "img.png"), rel_path="img.png",
             name="img.png", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=0.0, duration_seconds=2.0, resolution="64x48",
+        )
+        out = tmp_path / "seg.mp4"
+        result, chapters = transcode_segment([f], str(out), TranscodeConfig())
+        assert result == str(out)
+        assert out.exists()
+        assert chapters == [["0:00", "19700101-000000"]]
+        _assert_h264_aac(str(out))
+
+    def test_heic_image_segment(self, tmp_path):
+        src = tmp_path / "img.heic"
+        make_heic(src, size=(64, 48))
+        f = ScannedFile(
+            file_id="x", abs_path=str(src), rel_path="img.heic",
+            name="img.heic", type=FILE_TYPE_IMAGE, size_bytes=100,
             captured_epoch=0.0, duration_seconds=2.0, resolution="64x48",
         )
         out = tmp_path / "seg.mp4"
