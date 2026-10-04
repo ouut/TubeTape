@@ -51,6 +51,8 @@ services:
       - private
       - --max-resolution
       - 3840x2160
+      - --segment-duration
+      - "1200s"
       - --fps
       - "30"
       # 下面两行按需保留：只处理相机照片 + 手机视频，丢弃截图/网络传输副本
