@@ -33,107 +33,229 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 
 ## Docker 快速开始
 
-> 本程序主要以 Docker 运行。下面从零到跑起来，按顺序做即可。
+> 本程序推荐以 Docker / Docker Compose 容器化方式运行。容器内自带兼容的 glibc、完整版 ffmpeg 以及所有 Python 运行时依赖，宿主机无需配置 Python 环境。
+> 按照以下 8 个步骤从零到跑起来即可。
 
-### 0. 前置条件
+### 0. 前置准备
 
-- 装好 **Docker** 与 **Docker Compose**（`docker compose version` 能输出即可）；
-- 一个 Google 账号，并在 [youtube.com](https://youtube.com) 建好频道；
-- 按 [OAuth 配置（一次性）](#oauth-配置一次性) 拿到 `client_secret.json`。
+在开始前，请确保具备以下 3 个条件：
 
-### 1. 拿到镜像
+1. **安装 Docker 与 Docker Compose**：
+   ```bash
+   docker --version
+   docker compose version
+   ```
+   两个命令均能正常输出版本号即可。
+2. **一个具备频道的 Google 账号**：
+   - 访问 [youtube.com](https://youtube.com)，确认当前 Google 账号已**创建 YouTube 频道**（若未创建频道，上传 API 会返回 `youtubeSignupRequired` 错误）。
+   - *(强烈建议)* 前往 YouTube 账号设置完成手机短信验证，以解除单视频 15 分钟的时长限制（未验证账号单片上限 15 分钟）。
+3. **获取 OAuth 客户端凭据（`client_secret.json`）**：
+   - 访问 [Google Cloud Console](https://console.cloud.google.com)，新建项目并启用 **YouTube Data API v3**。
+   - 在「OAuth 同意屏幕」中选择 External，添加测试用户（自己的 Gmail 邮箱），添加权限范围：`https://www.googleapis.com/auth/youtube.force-ssl`。
+   - 在「凭据」页面创建 **OAuth 客户端 ID → 桌面应用（Desktop App）**，下载 JSON 文件并重命名为 `client_secret.json`。
+   *(详细步骤与图文说明可参考后文 [OAuth 配置（一次性）](#oauth-配置一次性))*。
+
+---
+
+### 1. 目录结构与镜像获取
+
+在宿主机上克隆仓库并进入目录，将下载的 `client_secret.json` 放置在该目录下：
 
 ```bash
-# 方式 A：拉取官方镜像
-docker pull chet2026/tubetape
-
-# 方式 B：本地构建（改过代码 / 想自己构建时）
+# 1. 克隆仓库并进入目录
+git clone https://github.com/ouut/TubeTape.git
 cd TubeTape
+
+# 2. 拷贝你的 client_secret.json 到当前目录
+cp /path/to/client_secret.json .
+```
+
+**获取镜像**（二选一）：
+```bash
+# 方式 A：拉取预构建官方镜像（推荐）
+docker pull chet2026/tubetape:latest
+
+# 方式 B：本地自己构建
 docker build -t chet2026/tubetape:latest .
 ```
 
-### 2. 准备配置（在 `docker-compose.yml` 同目录）
+**此时你的宿主机工作目录结构应如下**：
+```
+TubeTape/
+├── docker-compose.yml       # 容器编排定义
+├── .env.example             # 环境变量模板
+├── client_secret.json       # 【必需】你从 GCP 下载的 OAuth 凭据文件
+```
 
+---
+
+### 2. 准备环境变量与参数配置
+
+拷贝环境变量模板并编辑：
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env`：
-
+编辑 `.env` 文件，填入你的照片视频目录路径：
 ```bash
-MEDIA_DIR=/home/cc/projects/u/bone-ash   # 你的照片/视频目录（宿主机绝对路径）
-TUBETAPE_TOKEN=                          # 留空，改用 token.json
+# 你的照片和视频在宿主机上的绝对路径（只读挂载，绝不篡改你的原文件）
+MEDIA_DIR=/home/user/Photos
+
+# 留空即可，程序会自动使用 token.json
+TUBETAPE_TOKEN=
 ```
 
-把 OAuth 客户端文件也放到**同一目录**：
-
-```bash
-cp /path/to/client_secret.json .
+检查 `docker-compose.yml` 中的参数（默认已针对家庭备份优化）：
+```yaml
+    command:
+      - --input
+      - /data                      # 容器内媒体扫描路径（映射自你的 MEDIA_DIR）
+      - --db
+      - /db/tubetape.json          # 数据库文件（落入当前目录 ./tubetape.json）
+      - --client-secret
+      - /db/client_secret.json     # 声明凭据路径，启动时检测并自动刷新
+      - --timezone
+      - Asia/Shanghai              # 时区
+      - --privacy
+      - private                    # 隐私等级（私人备份）
+      - --max-resolution
+      - 3840x2160                  # 画布上限（4K，非 4K 素材保持原尺寸）
+      - --segment-duration
+      - "1200s"                    # 每片目标时长（默认 20 分钟/片）
+      - --fps
+      - "30"                       # 帧率
+      #- --only-camera-photos      # 按需启用：只处理相机实拍照片，丢弃截图/网络转存副本
+      #- --only-phone-videos       # 按需启用：只处理手机实拍视频
+      - --watch                    # 持续监控模式
+      - -v                         # 输出 INFO 日志
 ```
 
-### 3. 首次登录（生成 `token.json`）
+---
 
-必须**交互式**运行（不能用 `up -d`），且需要 `client_secret.json` 已在同目录：
+### 3. 首次授权登录（生成 `token.json`）
 
-```bash
-docker compose run --rm tubetape --db /db/tubetape.json --login
-```
-
-1. 终端会打印一个授权 URL → 浏览器打开、同意；
-2. 浏览器最后会跳到 `http://localhost:8080/?code=...`（页面打不开没关系），把**地址栏那整条 URL** 复制粘贴回终端；
-3. 成功后 `token.json` 生成在项目目录（容器内 `/db/token.json`）。
-
-### 4. 先预览（dry-run，只读，不转码不上传）
+初次运行必须以**交互式模式（带 TTY）**启动容器，完成一次性 Google OAuth 授权：
 
 ```bash
-docker compose run --rm tubetape --input /data --timezone Asia/Shanghai \
-  --db /db/tubetape.json --dry-run --no-watch
+docker compose run --rm tubetape --login
 ```
 
-看输出：多少文件、几个分片、多少 pending。
+**授权操作步骤**：
+1. 终端会打印出一串 Google 授权链接（形如 `https://accounts.google.com/o/oauth2/auth?...`）；
+2. 复制该链接并在宿主机（或手机、笔记本）浏览器中打开，登录你的 Google 账号并点击「允许」授权访问 YouTube；
+3. 授权完成后，浏览器会自动跳转到一个形如 `http://localhost:8080/?state=...&code=4/0A...` 的地址（此时若页面显示“无法连接”完全属于正常现象）；
+4. **复制浏览器地址栏中的完整 URL**，粘贴回终端光标处并敲回车；
+5. 程序完成 Code 兑换，并在当前目录下自动生成权限为 `0600` 的 `token.json`。
 
-### 5. 启动（后台持续运行）
+> 💡 **关于 Token 过期与自愈（免重复登录）**：
+> - 只要 `client_secret.json` 存在，TubeTape 每次启动和运行中若检测到 Token 过期，会**自动通过 refresh_token 在后台刷新并静默写回 `token.json`**，日常完全无需人工干预。
+> - 若是在非交互模式下（如 `docker compose up -d` 挂机运行）检测到凭据彻底失效，程序不会死循环或刷屏崩溃，而是会安全退出并输出明确指引，提示用户执行 `docker compose run --rm tubetape --login` 重新登录。
+
+---
+
+### 4. 预览检查（Dry-Run，安全零风险）
+
+正式转码与上传前，强烈建议先运行一次只读预览。**Dry-Run 模式下只读扫描，不写数据库、不调用 ffmpeg、不上载任何视频**：
+
+```bash
+docker compose run --rm tubetape --dry-run --no-watch
+```
+
+**控制台会清晰输出**：
+- 扫描发现了多少张照片、多少个视频；
+- 根据拍摄时间与时长限制规划出了多少个分片（Segment）；
+- 尾部不足时长的待处理暂存文件数量（Pending files）。
+
+确认分片规划符合预期后，即可进入长期挂机运行。
+
+---
+
+### 5. 启动长期挂机（后台持续运行）
+
+使用后台守护进程方式启动：
 
 ```bash
 docker compose up -d
-docker compose logs -f        # 看终端输出；Ctrl+C 只退出日志，不影响运行
 ```
 
-> 🌐 **Web 实时控制台**：容器已映射 `8080` 端口。启动后可直接在浏览器打开 **`http://<宿主机IP>:8080`** 实时查看运行状态、当前任务和彩色滚动的增量日志流（支持自动滚动与清屏）。
+启动后容器会在后台静默运行：
+- **自动转码与分块上传**：按照规划自动分片转码为高保真 MP4，并以 10MB 分块断点续传（`next_chunk()`）流式上传至 YouTube 私人频道。
+- **素材与时间戳精确对应**：每个素材对应独立跳转时间戳（`0:00 20240101-120000`），在 YouTube 播放器简介中全量可点击直接跳至对应片段。
+- **云端对账绝对防重**：视频标题内嵌唯一短哈希 `[{short_id}]`，云端已存在的分片直接跳过，绝无重复上传。
+- **持续监控（Watch）**：通过 inotify 事件与每小时目录扫描持续监听 `MEDIA_DIR`。扔进新照片/视频后，静默期 10 分钟（防传输一半）去抖后自动增量打包。
+- **配额感知**：遇到 YouTube 每日上传配额耗尽（`quotaExceeded`）时，自动休眠等待 1 小时后重试，次日配额刷新后自动继续，无需人工干预。
+- **开机自启**：配置了 `restart: unless-stopped`，宿主机重启或 Docker 服务重启后自动恢复运行。
 
-### 6. 停止 / 重启 / 更新
+---
 
+### 6. 查看实时日志与 Web 控制台
+
+TubeTape 提供**可视化网页**与**命令行**两种监控方式：
+
+#### 方式 A：Web 实时控制台（推荐）
+在同一局域网的浏览器中打开：
+```
+http://<宿主机IP>:8080
+```
+- **运行状态 Badge**：直观展示当前处于 `scanning`（扫描）、`transcoding`（转码中）、`uploading`（上传中）还是 `watching`（常驻监听）。
+- **彩色日志流**：自动以不同色彩高亮呈现 `INFO`（蓝色）、`WARNING`（黄色）、`ERROR`（红色）、`DEBUG`（灰色）日志。
+- **增量拉取与流畅度**：基于 offset 增量获取，初次加载仅截取末尾 64KB，长时间运行也不卡浏览器。
+- **控制开关**：支持一键「自动滚动」切换与「清屏」。
+
+#### 方式 B：终端命令行排查
 ```bash
-docker compose down                          # 停止并删容器（数据/日志/凭据保留在项目目录）
-docker compose up -d                         # 再启动（断点续传，走缓存）
+# 查看容器运行状态
+docker compose ps
 
-# 更新到新版本
-./scripts/docker_build.sh                    # 构建并推送新镜像（或 docker pull chet2026/tubetape）
+# 查看标准输出实时日志
+docker compose logs -f
+
+# 查看最详尽的底层 DEBUG 审计日志（包含哈希缓存 [cache] 命中、ffmpeg 转码进度等）
+docker compose exec tubetape tail -f /db/tubetape.json.log
+```
+
+---
+
+### 7. 优雅停止、重启与更新
+
+#### 停止容器（平稳停机）
+```bash
+docker compose down
+# 或
+docker stop tubetape
+```
+> 🛡️ **安全保证**：TubeTape 接收到 `SIGTERM` 信号后会立即平稳终止监控并安全释放文件锁退出，**不会在停机阶段强行执行耗时转码**，彻底避免 Docker 10 秒超时强制发送 `SIGKILL` 导致产生未入库的云端孤儿视频。未完成的文件将在下次启动时平稳续传。
+
+#### 重启容器
+```bash
+docker compose up -d
+```
+启动后自动载入 `./tubetape.json` 数据库与哈希缓存，已封口分片直接秒过，自动继续处理未完成部分。
+
+#### 升级到最新版本
+```bash
+# 拉取最新镜像
+docker compose pull
+
+# 重启容器应用最新版本
 docker compose down && docker compose up -d
 ```
 
-### 7. 常用排查
+---
 
-```bash
-# 方式 1（推荐）：浏览器打开 http://localhost:8080 实时查看 Web 控制台与日志
-# 方式 2：命令行查看
-docker compose ps                                                # 运行状态
-docker compose logs --tail 200 tubetape                          # 最近的终端日志
-docker compose exec tubetape tail -f /db/tubetape.json.log       # 详细 DEBUG 日志（含 [cache]）
-```
+### 文件路径与作用总览
 
-### 文件都在哪
+所有运行数据均持久化在 `docker-compose.yml` 所在的宿主机当前目录中，容器删除或重建绝不丢失数据：
 
-| 宿主机（项目目录） | 容器内 | 说明 |
-|---|---|---|
-| `MEDIA_DIR` | `/data`（只读） | 原始照片/视频 |
-| `./tubetape.json` | `/db/tubetape.json` | 数据库（含哈希缓存） |
-| `./tubetape.json.log` | `/db/tubetape.json.log` | 详细日志 |
-| `./client_secret.json` | `/db/client_secret.json` | 登录用（平时用于自动 refresh） |
-| `./token.json` | `/db/token.json` | 授权凭据（自动 refresh 换新） |
-| `.env` | 环境变量 | `MEDIA_DIR` / `TUBETAPE_TOKEN` |
+| 宿主机路径 | 容器内挂载点 | 权限 | 详细说明 |
+|---|---|---|---|
+| `.env` 中指定的 `MEDIA_DIR` | `/data` | 只读 (`:ro`) | 你的家庭原始照片与视频目录，TubeTape 绝不修改或删除任何源文件 |
+| `./tubetape.json` | `/db/tubetape.json` | 读写 | 核心元数据数据库、扫描缓存与已上传 YouTube 视频 ID 记录 |
+| `./tubetape.json.log` | `/db/tubetape.json.log` | 读写 | 包含全量纳秒级文件哈希、ffmpeg 指令与网络响应的 DEBUG 审计日志 |
+| `./client_secret.json` | `/db/client_secret.json` | 只读 | 从 Google Cloud 下载的 OAuth 客户端凭据，用于登录与后台自愈刷新 |
+| `./token.json` | `/db/token.json` | 读写 (`0600`) | 授权后的 YouTube Access/Refresh Token，程序会自动刷新并更新此文件 |
+| `.env` | — | 宿主机本地 | 存储 `MEDIA_DIR` 目录路径配置 |
 
-> 参数、场景、常见问题见下方 [Docker](#docker) 与 [常见问题](#常见问题) 章节。
 
 ---
 
