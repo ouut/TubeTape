@@ -263,6 +263,28 @@ class TestRunPipelineReconcile:
 
         assert cli.run_pipeline(args) == cli._EXIT_QUOTA
 
+    def test_pipeline_ensures_uploader_before_scan(self, tmp_path, monkeypatch):
+        from tubetape import cli
+
+        args = self._args(tmp_path)
+        events = []
+
+        def fake_build_uploader(a, d):
+            events.append("build_uploader")
+            return None  # Simulates failed / missing credentials
+
+        def fake_scan(*a, **k):
+            events.append("scan")
+            raise AssertionError("scan() must not be called when credentials are missing or waiting!")
+
+        monkeypatch.setattr(cli, "_build_uploader", fake_build_uploader)
+        monkeypatch.setattr(cli, "scan", fake_scan)
+
+        rc = cli.run_pipeline(args)
+        assert rc == cli._EXIT_ERROR
+        assert events == ["build_uploader"]
+
+
 
 class TestLogin:
     def test_login_flag_parses(self, tmp_path):
