@@ -16,6 +16,7 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 - [OAuth 配置（一次性）](#oauth-配置一次性)
 - [快速开始](#快速开始)
 - [命令行参数](#命令行参数)
+- [Web 实时控制台](#web-实时控制台)
 - [命令例子](#命令例子)
 - [长期挂机（持续运行）](#长期挂机持续运行)
 - [过滤：只要相机照片和手机视频](#过滤只要相机照片和手机视频)
@@ -26,6 +27,7 @@ TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成�
 - [构建可执行文件](#构建可执行文件)
 - [Docker](#docker)
 - [常见问题](#常见问题)
+- [更新记录](#更新记录)
 
 ---
 
@@ -94,8 +96,10 @@ docker compose run --rm tubetape --input /data --timezone Asia/Shanghai \
 
 ```bash
 docker compose up -d
-docker compose logs -f        # 看进度；Ctrl+C 只退出日志，不影响运行
+docker compose logs -f        # 看终端输出；Ctrl+C 只退出日志，不影响运行
 ```
+
+> 🌐 **Web 实时控制台**：容器已映射 `8080` 端口。启动后可直接在浏览器打开 **`http://<宿主机IP>:8080`** 实时查看运行状态、当前任务和彩色滚动的增量日志流（支持自动滚动与清屏）。
 
 ### 6. 停止 / 重启 / 更新
 
@@ -111,6 +115,8 @@ docker compose down && docker compose up -d
 ### 7. 常用排查
 
 ```bash
+# 方式 1（推荐）：浏览器打开 http://localhost:8080 实时查看 Web 控制台与日志
+# 方式 2：命令行查看
 docker compose ps                                                # 运行状态
 docker compose logs --tail 200 tubetape                          # 最近的终端日志
 docker compose exec tubetape tail -f /db/tubetape.json.log       # 详细 DEBUG 日志（含 [cache]）
@@ -123,8 +129,8 @@ docker compose exec tubetape tail -f /db/tubetape.json.log       # 详细 DEBUG 
 | `MEDIA_DIR` | `/data`（只读） | 原始照片/视频 |
 | `./tubetape.json` | `/db/tubetape.json` | 数据库（含哈希缓存） |
 | `./tubetape.json.log` | `/db/tubetape.json.log` | 详细日志 |
-| `./client_secret.json` | `/db/client_secret.json` | 登录用（平时不用） |
-| `./token.json` | `/db/token.json` | 授权（每人一份） |
+| `./client_secret.json` | `/db/client_secret.json` | 登录用（平时用于自动 refresh） |
+| `./token.json` | `/db/token.json` | 授权凭据（自动 refresh 换新） |
 | `.env` | 环境变量 | `MEDIA_DIR` / `TUBETAPE_TOKEN` |
 
 > 参数、场景、常见问题见下方 [Docker](#docker) 与 [常见问题](#常见问题) 章节。
@@ -133,13 +139,18 @@ docker compose exec tubetape tail -f /db/tubetape.json.log       # 详细 DEBUG 
 
 ## 核心特性
 
+- **Web 实时控制台**：内置轻量 Web 服务（默认 8080 端口），浏览器直连实时显示运行状态、当前任务与高亮滚动日志，支持自动滚动与清屏。
+- **标题内嵌防截断对账**：分片 ID 内嵌于视频标题尾部（`[{short_id}]`），彻底解决 YouTube API 截断简介导致对账 Marker 丢失的问题；云端已有视频直接跳过，零重复上传。
+- **纯文件时间戳简介**：视频简介为每个素材对应的时间戳（`0:00 20240101-120000`），无多余标记，所有文件在 YouTube 播放器中均可点击跳至对应片段。
+- **真实分块断点续传**：采用 10MB 分块（`next_chunk()`）执行网络传输，具备指数退避重试，网络瞬断或超时不重新发起建片。
+- **Token 自动化与自愈**：`token.json` 过期自动调用 refresh 换新并持久化回磁盘；后台非交互运行遇凭据失效友好报错指引。
+- **平稳停机防孤儿视频**：SIGTERM / SIGINT 信号优雅停机，避免 Docker 10s 超时 SIGKILL 产生未录入数据库的孤儿视频。
 - **归档优先**：最终每个文件恰好属于一个分片，分片严格按拍摄时间连续，内容完整。
-- **分片不可变 + 按需重建**：YouTube 无法替换已上传视频的文件内容，因此「更新分片」= 先上传新片、成功后删除旧片。
-- **分片时间区间固定**：加一张照片只触发它所在的那一个分片重建，不会级联重传。
+- **分片不可变 + 按需重建**：YouTube 无法替换已上传视频的文件内容，因此「更新分片」= 先上传新片、成功后删除旧片（旧片删除失败不影响新片提交）。
+- **分片时间区间固定**：加一张照片只触发它所在的那一个分片重建，且同秒照片边界严格归属原分片，不会碰撞或级联重传。
 - **持续监控**：`--watch` 下挂着不用管，新文件自动归入分片、自动上传。
 - **来源过滤**：可选择只保留相机拍摄的照片和手机拍摄的视频，丢弃截图和网络传输的压缩副本。
 - **配额感知**：以 YouTube API 返回为准，配额用尽自动退避重试，不在本地维护额度计数。
-- **上传对账**：上传前列出频道已有视频，按简介里的 `segment_id` 判断；已上传的直接跳过，本地库丢失也不会重复上传。
 - **断点续传**：进度存 JSON 库，崩溃/重启后从断点继续，已封口且未变更的分片不重复处理。
 - **扫描缓存**：文件「大小 + mtime」未变时直接复用上次的内容哈希和元数据，重复扫描极快。
 - **详细日志**：终端友好进度 + `<db>.log` 带时间戳的 DEBUG 审计日志，随时可查「程序正在做什么」。
@@ -166,21 +177,21 @@ docker compose exec tubetape tail -f /db/tubetape.json.log       # 详细 DEBUG 
 转码（transcode）
   → ffmpeg 转 MP4（H.264 High / yuv420p / AAC 48kHz）
   → 图片转静态帧（可选 Ken Burns），黑边补齐到统一分辨率
-  → 章节按文件生成（间隔 <10s 自动合并，第一章 0:00）
+  → 生成每个素材的精确起始时间戳（YouTube 可点击直接跳转）
 
 上传（upload）
-  → 先列出频道已有视频（对账），已在 YouTube 上的分片直接跳过
-  → YouTube videos.insert，标题 = {首时间戳} - {末时间戳}
-  → 简介写入章节时间戳 + segment_id 标记，privacyStatus、madeForKids、categoryId 显式设置
+  → 先列出频道已有视频（对账：优先匹配标题短 ID），云端已有的分片直接跳过
+  → YouTube videos.insert，标题 = {首时间戳} - {末时间戳} [{short_id}]
+  → 简介写入纯素材时间戳列表（点击跳转），10MB 分块断点续传（next_chunk）
   → 加入按拍摄时间排序的播放列表，标记 sealed
 
 重建（rebuild）
   → 新文件落入已封口分片区间内 → 转码上传新片 → 校验 → 删除旧片 → 更新库
-  → 任何一步失败都保留旧片；旧 video_id 进入 previous_video_ids
+  → 旧片删除失败打 Warning 并继续提交新片，绝不阻断造成重复循环
 
 监控（watch）
   → watchdog 事件即时发现新文件 + 目录 mtime 兜底扫描（网络盘也能用）
-  → 静默期去抖 → 自动重处理；配额用尽则退避重试；退出时 flush 封片
+  → 静默期去抖 → 自动重处理；配额用尽则退避重试；收到 SIGTERM/SIGINT 平稳退出
 ```
 
 ---
@@ -200,20 +211,20 @@ docker compose exec tubetape tail -f /db/tubetape.json.log       # 详细 DEBUG 
 - 与库对比得出 新增 / 已处理 / 已删除。
 
 **3. 规划**：
-- 按拍摄时间排序；已有分片的时间区间为固定边界（区间内的新文件归入该片 → 重建，区间外的打包成新片）；
+- 按拍摄时间排序；已有分片的时间区间为固定边界（区间内的新文件归入该片 → 重建，区间外的打包成新片）；同秒照片严格归属原分片，杜绝范围争抢；
 - 贪心打包，每片累计时长 ≤ `--segment-duration`；最后一片不足时长则留为 pending（除非 `--flush`）；
 - `segment_id = sha256(排序后的 file_ids + 转码参数)`，已存在则跳过。
 
 **4. `--dry-run`** 到此为止：只打印计划，不写库、不转码、不上传。
 
-**5. 上传前对账**：列出频道已有视频，按简介里的 `segment_id` 标记匹配 → 已在 YouTube 上的分片直接跳过并补写本地记录。
+**5. 上传前对账**：列出频道已有视频，优先匹配标题中的 `[{short_id}]`（简介 Marker 兼容兜底）→ 已在 YouTube 上的分片直接跳过并补写本地记录，零重复上传。
 
 **6. 逐分片处理**：
-- 定画布（`--canvas-mode`）→ 转码（每个文件一个 clip：缩放+黑边到画布，HEIC 先转 PNG；再 `-c copy` 拼接）→ 生成章节；
-- 上传（标题 = 起止时间，简介 = 章节 + `segment_id` 标记）→ 写库（`youtube_video_id`、`status=sealed`）；
+- 定画布（`--canvas-mode`）→ 转码（每个文件一个 clip：缩放+黑边到画布，HEIC 先转 PNG；再 `-c copy` 拼接）→ 为每个文件生成可点击时间戳；
+- 10MB 分块断点续传（标题 = 起止时间 [short_id]，简介 = 纯时间戳列表）→ 写库（`youtube_video_id`、`status=sealed`）；
 - 每片后保存数据库；配额用尽则本轮停止（退出码 2）。
 
-**7. 重建**（新文件落入已封口分片）：转码新片 → 上传 → 校验 → 删除旧片 → 提交新记录（旧 id 进 `previous_video_ids`）；任何一步失败都保留旧片。
+**7. 重建**（新文件落入已封口分片）：转码新片 → 10MB 分块上传 → 校验 → 删除旧片 → 提交新记录（旧 id 进 `previous_video_ids`）；删除旧片失败不阻断新片提交。
 
 ### 持续监控（`--watch`）
 
@@ -222,7 +233,7 @@ docker compose exec tubetape tail -f /db/tubetape.json.log       # 详细 DEBUG 
 3. 每 `--mtime-interval`（默认 1h）跑一次**目录 mtime 兜底扫描**（补漏事件 / 网络盘）；
 4. 检测到变更 → **静默期 `--quiet-period`（默认 10m）去抖** → 重跑；
 5. 配额用尽 → 等 `--quota-backoff`（默认 1h）自动重试；
-6. `Ctrl+C` / `SIGTERM` → 先 flush 封片再退出。
+6. `Ctrl+C` / `SIGTERM` → 立即平稳停止监控并退出（未完成文件下次启动处理，防超时 SIGKILL 产生孤儿视频）。
 
 ### 第一次运行的推荐顺序
 
@@ -354,6 +365,31 @@ python -m tubetape --input /path/to/photos --watch
 | `--log-file` | `<db>.log` | 详细运行日志文件路径（始终记录 DEBUG 级别） |
 | `--login` | — | 运行 Google OAuth 登录流程，把 `token.json` 存到 `--db` 同目录后退出 |
 | `--client-secret` | `<db目录>/client_secret.json` | `--login` 使用的 `client_secret.json` 路径 |
+| `--web-port` | `8080` | Web 实时控制台与日志查看端口（`0` 为禁用） |
+
+---
+
+## Web 实时控制台
+
+TubeTape 内置了轻量级的 Web 运行控制台，无需安装任何额外 Web 服务即可在浏览器中直观监控程序状态与实时日志流。
+
+### 访问方式
+
+- **本地运行**：打开 [http://localhost:8080](http://localhost:8080)
+- **Docker 运行**：打开 `http://<宿主机IP>:8080`（`docker-compose.yml` 已默认映射 `8080:8080` 端口）
+- **自定义端口**：通过 `--web-port <端口>` 修改端口，例如 `--web-port 9090`；传入 `--web-port 0` 可关闭 Web 控制台。
+
+### 功能特性
+
+1. **状态徽标（Status Badge）**：实时展示当前程序所处阶段（如 `scanning`、`planning`、`transcoding ...`、`uploading ...`、`watching ...`）。
+2. **彩色增量日志流**：
+   - 自动按日志级别呈现高亮色彩（`INFO` 浅蓝、`WARNING` 金黄、`ERROR` 红色、`DEBUG` 浅灰）。
+   - 采用文件增量拉取（初次加载自动截取末尾 64KB，后续按 offset 增量轮询），绝不卡顿浏览器。
+3. **便捷交互控制**：
+   - **自动滚动**：默认开启，跟随最新日志自动滚动；点击可切换开启/关闭以查看历史排查。
+   - **清屏**：一键清空当前页面显示，专注查看后续新日志。
+4. **OAuth 回调自动拦截**：
+   - 在进行 Google OAuth 授权时，浏览器跳转至 `http://localhost:8080/?code=...`，Web 服务会自动拦截授权码并提示授权成功，免除手动复杂拼接。
 
 ---
 
@@ -871,14 +907,29 @@ EXIF 被剥（微信/QQ 传输）时会优先用文件名里的时间（如 `202
 默认约 6 片/天。减少分片数（增大 `--segment-duration`），或等次日自动恢复。
 
 **Q：`client_secret.json` 是干什么的？每次运行都要吗？**
-它是你**应用的身份凭据**（GCP 项目里那个 OAuth 客户端的 `client_id`/`client_secret`），**只在登录时**用来向 Google 证明“是哪个应用在请求授权”。
+它是你**应用的身份凭据**（GCP 项目里那个 OAuth 客户端的 `client_id`/`client_secret`），用来向 Google 证明“是哪个应用在请求授权”。
 
 | 阶段 | 需要 `client_secret.json` | 需要 `token.json` |
 |---|---|---|
-| 首次登录（`--login`） | ✅ | ❌（由它生成） |
-| 平时运行 / watch | ❌ 不需要 | ✅（或 `TUBETAPE_TOKEN`） |
+| 首次登录 / 重新授权 | ✅ 必须提供 | ❌（由它生成） |
+| 平时运行 / watch | ✅ 必须在配置中指定路径（token 失效或需刷新时自动读取） | ✅（若有效直接使用；若过期且可刷新，自动自愈换新） |
 
-`token.json` 里已包含 `client_id`/`client_secret`/`refresh_token`，登录之后自给自足——**平时运行只读 `token.json`，不碰 `client_secret.json`**。
+`docker-compose.yml` 默认已配置 `--client-secret /db/client_secret.json`。只要文件放在同目录下，程序在平时启动时就会自动探测 `token.json` 的有效性并在需要时自动完成 Token 刷新。
+
+**Q：Token 过期了需要每周手动登录吗？**
+通常不需要。TubeTape 启动和运行时会自动检测 `token.json` 的有效性。只要存在有效的 `refresh_token`，程序会在后台自动调用 Google API 刷新 Access Token 并将新凭据安全写回 `token.json`（权限 `0600`），全程自愈无需人工干预。仅当 Refresh Token 被手动吊销或彻底失效且处于非交互式后台时，程序才会清晰报错并提示运行一次交互式命令：
+```bash
+docker compose run --rm tubetape --login
+```
+
+**Q：为什么视频标题尾部带有 `[xxxx]`？**
+形如 `[a1b2c3d4e5f67890]` 的标记是该分片内容与转码参数计算出的 16 位唯一短哈希。因为 YouTube API 在列出播放列表视频时可能会将长简介截断，但永远不会截断标题，将短 ID 放在标题尾部能确保云端对账 100% 可靠，彻底杜绝重启或数据库丢失后的重复上传。
+
+**Q：视频简介变成了时间戳列表，怎么用？**
+每个素材文件在视频中的精确起始秒数均生成了一条形如 `0:00 20240101-120000` 的记录。在 YouTube 播放器界面直接点击时间戳（如 `0:03`），即可瞬间跳到该张照片或视频片段，兼顾纯净视觉与快速导航。
+
+**Q：如何访问 Web 实时控制台？**
+`docker-compose.yml` 已经默认暴露了 `8080:8080` 端口。用浏览器直接打开宿主机的 `http://<IP>:8080`，即可看到带色彩高亮的运行日志流、当前运行状态徽标、自动滚动与清屏控制。
 
 **Q：没有 token，Docker 里怎么登录？**
 用内置登录命令（需**交互式**，不能用 `up -d`）：
@@ -903,6 +954,12 @@ docker compose run --rm tubetape \
 
 ## 更新记录
 
+- **Web 实时控制台（默认 8080 端口）**：内置轻量 Web 服务，实时输出带色彩高亮（INFO/WARN/ERROR/DEBUG）的增量日志流与运行状态徽标，支持一键清屏与自动滚动；Docker Compose 默认暴露 `8080:8080`。
+- **标题内嵌短 ID 对账（防截断）**：分片视频标题格式升级为 `{首时间戳} - {末时间戳} [{short_id}]`，彻底根除 YouTube API 截断简介 Marker 导致的云端对账失效与无限重复上传。
+- **纯文件时间戳简介**：视频简介生成每个文件对应的精确跳转时间戳（`0:00 20240101-120000`），在 YouTube 播放器中全量可点击直接跳转，不再受 10 秒章节合并逻辑约束。
+- **10MB 分块断点续传**：改用 10MB 分块（`request.next_chunk()`）执行流式上传并配以指数退避重试，网络超时或断流时在当前 offset 处平滑重试，不重新发起整个视频创建。播放列表加入失败做容错处理。
+- **Token 凭据流自动化与自愈**：统一通过 `ensure_credentials` 管理凭据；`token.json` 过期自动调用 Google API 完成 refresh 并将最新凭据写回磁盘；非交互后台运行遇到未授权提供明确交互式登录命令指引。
+- **规划器边界碰撞消除与 Docker 平稳停机**：对已有分片文件建立归属映射，杜绝同秒跨分片争抢；收到 `SIGTERM`/`SIGINT` 时立即安全停止监控，不再执行耗时的强制 flush，避免 Docker 10 秒超时强制 SIGKILL 产生孤儿视频。
 - **内置登录命令**：新增 `tubetape --login`（配 `--client-secret`），可直接在容器内完成 OAuth 登录并把 `token.json` 写到 `--db` 同目录（Docker 用户不再需要宿主机装 Python）。
 - **保真优先默认值**：`--canvas-mode max`（画布取分片包围盒，不降采样）、`--max-resolution 7680x4320`（上限 8K，≤4K 内容仍 4K）、`--crf 16`、`--x264-preset slow`、`--fps 60`。
 - **上传对账**：上传前用 `channels.list` + `playlistItems.list` 列出频道已有视频，按简介里的 `segment_id` 标记匹配；已上传的直接跳过并补写本地记录（本地库丢失也不会重复上传）。不做自动删除。
