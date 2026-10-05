@@ -90,6 +90,73 @@ def check_token_permissions(path: str) -> bool:
     return (mode & 0o077) == 0
 
 
+class OAuthSession:
+    """Encapsulates an InstalledAppFlow to preserve PKCE code_verifier.
+
+    Both the initial authorization URL generation and the subsequent token
+    exchange must use the exact same Flow instance so the PKCE code_verifier
+    matches Google's expected challenge.
+    """
+
+    def __init__(
+        self,
+        client_secret_path: str,
+        token_path: str | None = None,
+        redirect_uri: str = "http://localhost:8080",
+    ):
+        from google_auth_oauthlib.flow import InstalledAppFlow
+
+        self.client_secret_path = os.path.abspath(client_secret_path)
+        self.token_path = os.path.abspath(token_path) if token_path else None
+        # Ensure redirect_uri has no trailing slash (e.g. http://localhost:8080)
+        self.redirect_uri = redirect_uri.rstrip("/")
+        self.flow = InstalledAppFlow.from_client_secrets_file(self.client_secret_path, SCOPES)
+        self.flow.redirect_uri = self.redirect_uri
+        self._auth_url: str | None = None
+        self.credentials: Credentials | None = None
+
+    @property
+    def auth_url(self) -> str:
+        """Generate and cache the OAuth authorization URL."""
+        if self._auth_url is None:
+            self._auth_url, _ = self.flow.authorization_url(
+                access_type="offline",
+                prompt="consent",
+                include_granted_scopes="true",
+            )
+        return self._auth_url
+
+    def exchange(self, code_or_url: str) -> Credentials:
+        """Exchange authorization code or full redirect URL for credentials.
+
+        Accepts either:
+        - raw authorization code: "4/0AfgeX..."
+        - full redirect URL: "http://localhost:8080/?state=...&code=4%2F0Af...&scope=..."
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        input_str = code_or_url.strip().strip("'\"")
+        code = input_str
+        if "?" in input_str or "code=" in input_str:
+            query_str = urlparse(input_str).query or input_str
+            query = parse_qs(query_str)
+            if "code" not in query:
+                raise ValueError("URL 中未找到 'code' 参数，请确认复制了完整的浏览器地址栏 URL")
+            code = query["code"][0]
+
+        if not code:
+            raise ValueError("授权码为空")
+
+        _logger.debug("exchanging authorization code for token (redirect_uri=%s)", self.redirect_uri)
+        self.flow.fetch_token(code=code)
+        self.credentials = self.flow.credentials
+
+        if self.token_path and self.credentials:
+            save_token_file(self.credentials, self.token_path)
+
+        return self.credentials
+
+
 def headless_oauth_flow(
     client_secret_path: str,
     token_path: str | None = None,
@@ -103,57 +170,31 @@ def headless_oauth_flow(
     browser lands on, then exchanges the code. A single flow object is kept
     across both steps so the PKCE ``code_verifier`` matches.
     """
-    from urllib.parse import parse_qs, urlparse
-
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
-    flow.redirect_uri = redirect_uri
-    _logger.info("starting headless OAuth flow (redirect %s)", redirect_uri)
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        include_granted_scopes="true",
-    )
-
+    session = OAuthSession(client_secret_path, token_path=token_path, redirect_uri=redirect_uri)
+    _logger.info("starting headless OAuth flow (redirect %s)", session.redirect_uri)
     print_fn("在浏览器中打开下面的 URL 并完成授权：")
-    print_fn(auth_url)
+    print_fn(session.auth_url)
     redirect_url = input_fn(
         "授权后，把浏览器跳转到的 URL（形如 http://localhost:8080/?state=...&code=...）粘贴到这里: "
     ).strip()
-
-    query = parse_qs(urlparse(redirect_url).query)
-    if "code" not in query:
-        _logger.error("no 'code' parameter in the redirect URL")
-        raise ValueError("no 'code' parameter in the redirect URL")
-    code = query["code"][0]
-
-    # Exchange exactly once, with the SAME flow: this keeps both the
-    # redirect_uri (no trailing slash) and the PKCE code_verifier matching the
-    # authorization request. Retrying with a different redirect_uri can
-    # consume the one-time code, so don't.
-    _logger.debug("exchanging authorization code for token")
-    flow.fetch_token(code=code)
-    credentials = flow.credentials
-
-    if token_path is not None:
-        save_token_file(credentials, token_path)
-
-    return credentials
+    return session.exchange(redirect_url)
 
 
 def ensure_credentials(
     client_secret_path: str,
     token_path: str | None = None,
     interactive: bool | None = None,
+    web_port: int | None = 8080,
+    wait_for_web: bool = True,
 ) -> Credentials:
     """Load valid credentials, refreshing or prompting OAuth login as needed.
 
     Order of precedence:
     1. TUBETAPE_TOKEN environment variable (if set and valid).
     2. token.json file (if exists, valid or refreshable; refreshed token is saved back).
-    3. Interactive OAuth login using client_secret_path (if interactive/TTY).
-    4. If non-interactive, raises RuntimeError explaining how to run interactive login.
+    3. Web OAuth flow (if web server is running and wait_for_web is True).
+    4. Headless terminal OAuth flow (if interactive/TTY).
+    5. If non-interactive and no web server, raises RuntimeError explaining how to authorize.
     """
     token_str = os.environ.get(TOKEN_ENV)
     if token_str:
@@ -185,6 +226,32 @@ def ensure_credentials(
             f"OAuth client_secret.json not found at '{client_secret_target}'.\n"
             "Please download client_secret.json from Google Cloud Console and place it there."
         )
+
+    # Check if Web OAuth flow is available (WebServer is active)
+    from . import web
+
+    if wait_for_web and web.is_running():
+        actual_port = getattr(web, "get_web_port", lambda: web_port or 8080)()
+        redirect_uri = f"http://localhost:{actual_port}"
+        session = OAuthSession(client_secret_target, token_path=token_path, redirect_uri=redirect_uri)
+        web.set_web_oauth_session(session)
+        auth_url = session.auth_url
+
+        _logger.warning("=" * 66)
+        _logger.warning("TubeTape 尚未获得 YouTube 授权。")
+        _logger.warning("请在浏览器中打开 Web 控制台完成一键授权：")
+        _logger.warning("  http://localhost:%d  (或 http://<服务器IP>:%d)", actual_port, actual_port)
+        _logger.warning("或直接在浏览器中打开以下 Google 授权链接：")
+        _logger.warning("  %s", auth_url)
+        _logger.warning("=" * 66)
+
+        try:
+            creds = web.wait_for_auth(timeout=3600.0)
+            _logger.info("YouTube OAuth 授权成功，凭据已生效")
+            return creds
+        except Exception as exc:
+            _logger.error("等待 Web 授权失败或超时: %s", exc)
+            raise
 
     if interactive is None:
         interactive = sys.stdin.isatty()

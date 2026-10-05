@@ -292,6 +292,18 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
     )
     _log.info("database loaded: %d file(s), %d segment(s)", len(db.files), len(db.segments))
 
+    # If this is a real run (not dry-run), ensure YouTube uploader credentials
+    # early so any OAuth authorization prompts or web waits happen up-front.
+    uploader = None
+    if not args.dry_run:
+        uploader = _build_uploader(args, db)
+        if uploader is None:
+            reporter.status("no YouTube credentials; set TUBETAPE_TOKEN or token.json")
+            _log.error("no YouTube credentials found (TUBETAPE_TOKEN env or token.json next to db)")
+            db.save()
+            _log.info("database saved to %s", db.path)
+            return _EXIT_ERROR
+
     reporter.status(f"scanning {args.input} ...")
     # During a real run, persist files as they are scanned (throttled) so a
     # long scan survives interruption and the hash cache is useful next time.
@@ -380,13 +392,6 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         _log.debug("removed deleted file %s from index", file_id[:12])
 
     # Real run: transcode each new/rebuild segment, then upload.
-    uploader = _build_uploader(args, db)
-    if uploader is None:
-        reporter.status("no YouTube credentials; set TUBETAPE_TOKEN or token.json")
-        _log.error("no YouTube credentials found (TUBETAPE_TOKEN env or token.json next to db)")
-        db.save()
-        _log.info("database saved to %s", db.path)
-        return _EXIT_ERROR
 
     # Reconcile against YouTube so a lost local database does not re-upload
     # everything: only list when there is actually something to upload.
@@ -659,9 +664,14 @@ def _build_uploader(args: argparse.Namespace, db: Database):
     db_dir = os.path.dirname(args.db)
     token_path = os.path.join(db_dir, "token.json")
     client_secret = args.client_secret or os.path.join(db_dir, "client_secret.json")
+    web_port = getattr(args, "web_port", 8080)
 
     try:
-        credentials = auth.ensure_credentials(client_secret, token_path=token_path)
+        credentials = auth.ensure_credentials(
+            client_secret,
+            token_path=token_path,
+            web_port=web_port,
+        )
     except Exception as exc:  # noqa: BLE001
         _log.error("cannot obtain YouTube credentials: %s", exc)
         print(f"Error: {exc}", file=sys.stderr)

@@ -18,6 +18,8 @@
 | M8 | 文件名时间兜底 | `scanner.py`（`parse_filename_time`） | — |
 | M9 | 上传对账与云端容灾 | `reconcile.py`、`test_reconcile.py` | — |
 | M10 | 容器化、跨平台打包与运维发布 | `Dockerfile`、`docker-compose.yml`、`tubetape.spec`、`scripts/`、`docs/` | PyInstaller（build） |
+| M11 | Web 实时控制台、OAuth 自愈与分块断点续传 | `web.py`、`uploader.py`、`auth.py`、`test_web.py` | — |
+| M12 | 方案 A 一体化 Web OAuth 授权流 | `auth.py`、`web.py`、`cli.py`、`test_auth.py`、`test_web.py` | — |
 
 ## 目录结构
 
@@ -533,6 +535,39 @@ TubeTape/
 - `test_web.py` 覆盖控制台各个 API 端点与 OAuth 拦截。
 - `test_auth.py` 覆盖凭据有效性校验、自动 refresh 写入以及交互/非交互分支。
 - 全部 234 项单元测试 100% 通过。
+
+---
+
+## M12：方案 A 一体化 Web OAuth 授权流
+
+**目标**：彻底解决非交互式环境（如 `docker compose up -d`）在缺少 `token.json` 时崩溃退出的痛点，实现开箱即用的**一体化 Web OAuth 授权流（Scheme A）**：Web 控制台常驻在线，浏览器一键授权或粘贴重定向 URL 提交，凭据自动落盘后后台无缝平稳起跑，零重启要求。
+
+**新增依赖**：无。
+
+**交付**：`tubetape/auth.py`、`tubetape/web.py`、`tubetape/cli.py`、`tests/test_auth.py`、`tests/test_web.py`。
+
+**任务清单**：
+1. `OAuthSession` 会话封装（`tubetape/auth.py`）：
+   - 将 `InstalledAppFlow` 及其 PKCE 校验状态完整封装在 `OAuthSession` 对象中，确保授权 URL 生成与 Token 换取在同一个 Flow 实例内执行，消除 PKCE `code_verifier` 不匹配问题。
+   - `session.exchange(code_or_url)`：统一支持纯 `code` 或浏览器地址栏完整 URL（自动解析 `?code=...` 并解码 URL 字符），完成后以 `0600` 权限将凭据持久化至 `token.json`。
+2. Web 控制台状态感知与提交端点（`tubetape/web.py`）：
+   - 维护线程安全状态：`oauth_session`、`auth_event`、`auth_error`。
+   - `GET /api/status`：动态返回 `auth_required: bool` 与 `auth_url: str | None`。
+   - `POST /api/auth/submit` 与 `GET /api/auth/submit`：支持手动提交重定向 URL 或 code 换取 Token，换取成功唤醒等待事件。
+   - `GET /?code=...`：本地直接回调拦截，自动兑换并展示 3 秒自动返回控制台的成功页。
+   - Web 控制台前端嵌入现代化暗色卡片 `#auth-banner`：
+     - **方式一（一键直接授权）**：点击直达 Google 登录页面，本机自动回调完成。
+     - **方式二（手动粘贴地址栏 URL）**：面向远程 NAS 用户，若浏览器跳转 `localhost:8080` 报错，直接复制粘贴完整地址栏 URL 提交即可。
+   - `web.wait_for_auth(timeout=3600.0)`：以 1 秒间隔在 `threading.Event` 上响应式等待，对 SIGTERM/SIGINT 即时退出，不发生挂死。
+3. 管道早启动与无感起跑（`tubetape/cli.py`）：
+   - `main()` 启动 Web 控制台后进入管道，非 dry-run 模式下前置校验/等待凭据，避免海量扫描后再中断。
+   - Web 授权完成后，自动返回凭据并无缝继续扫描与上传，**完全无需手动重启 Docker 容器**。
+   - 保留 `--login` 作为纯命令行与 SSH 运维的交互式备用工具。
+
+**验收标准**：
+- `test_auth.py` 覆盖 `OAuthSession` 纯 code 与完整 URL 换取、异常输入处理及 Web 授权等待。
+- `test_web.py` 覆盖 `/api/auth/submit` POST 换取、GET 回调兑换、状态同步与超时处理。
+- 全部 243 项单元测试 100% 通过。
 
 ---
 

@@ -128,3 +128,71 @@ class TestEnsureCredentials:
         res = auth.ensure_credentials(cs, token_path=str(tmp_path / "token.json"), interactive=True)
         assert res is mock_creds
         assert called["client"] == os.path.abspath(cs)
+
+    def test_web_server_running_triggers_web_wait(self, tmp_path, monkeypatch):
+        from tubetape import web
+
+        cs = make_client_secret(tmp_path)
+        mock_creds = _MockCreds()
+
+        monkeypatch.setattr(web, "is_running", lambda: True)
+        monkeypatch.setattr(web, "get_web_port", lambda: 8080)
+        monkeypatch.setattr(web, "wait_for_auth", lambda timeout=3600.0: mock_creds)
+
+        res = auth.ensure_credentials(cs, token_path=str(tmp_path / "token.json"), interactive=False)
+        assert res is mock_creds
+        assert web.get_web_oauth_session() is not None
+        web.clear_web_oauth_session()
+
+
+class TestOAuthSession:
+    def test_exchange_with_raw_code(self, tmp_path, monkeypatch):
+        cs = make_client_secret(tmp_path)
+        token_path = tmp_path / "token.json"
+        session = auth.OAuthSession(cs, token_path=str(token_path))
+
+        mock_creds = _MockCreds()
+        called_code = []
+
+        def mock_fetch_token(code=None):
+            called_code.append(code)
+
+        monkeypatch.setattr(session.flow, "fetch_token", mock_fetch_token)
+        monkeypatch.setattr(type(session.flow), "credentials", property(lambda self: mock_creds))
+
+        res = session.exchange("my_raw_auth_code_123")
+        assert res is mock_creds
+        assert called_code == ["my_raw_auth_code_123"]
+        assert token_path.exists()
+
+    def test_exchange_with_full_url(self, tmp_path, monkeypatch):
+        cs = make_client_secret(tmp_path)
+        token_path = tmp_path / "token.json"
+        session = auth.OAuthSession(cs, token_path=str(token_path))
+
+        mock_creds = _MockCreds()
+        called_code = []
+
+        def mock_fetch_token(code=None):
+            called_code.append(code)
+
+        monkeypatch.setattr(session.flow, "fetch_token", mock_fetch_token)
+        monkeypatch.setattr(type(session.flow), "credentials", property(lambda self: mock_creds))
+
+        full_url = "http://localhost:8080/?state=abc&code=my_extracted_code_456&scope=youtube"
+        res = session.exchange(full_url)
+        assert res is mock_creds
+        assert called_code == ["my_extracted_code_456"]
+
+    def test_exchange_missing_code_raises(self, tmp_path):
+        cs = make_client_secret(tmp_path)
+        session = auth.OAuthSession(cs)
+        with pytest.raises(ValueError, match="未找到 'code' 参数"):
+            session.exchange("http://localhost:8080/?error=access_denied")
+
+    def test_exchange_empty_code_raises(self, tmp_path):
+        cs = make_client_secret(tmp_path)
+        session = auth.OAuthSession(cs)
+        with pytest.raises(ValueError, match="授权码为空"):
+            session.exchange("   ")
+

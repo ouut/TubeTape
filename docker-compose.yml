@@ -10,17 +10,20 @@
 #
 # 准备：
 #   1. cp .env.example .env
-#   2. 编辑 .env：填 MEDIA_DIR（宿主机照片目录绝对路径）；TUBETAPE_TOKEN 留空（改用 token.json）
-#   3. 首次登录（必须交互式，不能用 up -d；client_secret.json 需已在【本文件同目录】）：
-#        docker compose run --rm tubetape --db /db/tubetape.json \
-#          --client-secret /db/client_secret.json --login
-#      （--client-secret 的默认值就是 /db/client_secret.json，省略也行）
-#   4. docker compose up -d
+#   2. 编辑 .env：填 MEDIA_DIR（宿主机照片目录绝对路径）；TUBETAPE_TOKEN 留空
+#   3. 将 client_secret.json 放入本文件同目录下
+#   4. 直接启动：
+#        docker compose up -d
+#   5. 首次授权（一体化 Web OAuth，无需命令行交互）：
+#        浏览器打开 http://<NAS或本机IP>:8080 控制台，点击「一键授权」完成绑定。
+#        授权成功后 token.json 自动保存在本目录，程序自动在后台继续扫描与上传！
+#        （也可在纯终端环境运行交互式登录：docker compose run --rm tubetape --login）
 #
 # 常用命令：
 #   docker compose logs -f                                        # 实时终端日志
 #   docker compose exec tubetape tail -f /db/tubetape.json.log    # 详细 DEBUG 日志（含 [cache]）
 #   docker compose down                                           # 停止并删除容器（数据/日志/凭据保留在本目录）
+
 
 services:
   tubetape:
