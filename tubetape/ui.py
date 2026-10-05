@@ -29,6 +29,11 @@ class Reporter:
         # Mirror every user-facing status line into the detailed log as well,
         # so the log file tells the whole story end to end.
         _logger.info(message)
+        try:
+            from .web import set_web_status
+            set_web_status(message)
+        except Exception:  # noqa: BLE001
+            pass
         if self._console is not None:
             self._console.print(message)
         else:

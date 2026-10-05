@@ -73,7 +73,8 @@ class TestGreedyPack:
 class TestMakeSegment:
     def test_title_and_range(self):
         seg = planner._make_segment([sf("a", 100, 5), sf("b", 150, 5)], ())
-        assert seg.title == "19700101-000140 - 19700101-000230"
+        assert seg.title.startswith("19700101-000140 - 19700101-000230")
+        assert seg.title.endswith(f"[{seg.segment_id[:16]}]")
         assert seg.start_ts == iso(100)
         assert seg.end_ts == iso(150)
         assert seg.duration_seconds == 10.0

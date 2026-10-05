@@ -61,14 +61,19 @@ def is_quota_error(exc: Exception) -> bool:
     return "quota" in str(exc).lower()
 
 
+DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB resumable chunks
+
+
 class Uploader:
     def __init__(
         self,
         service,
         playlist_id: str | None = None,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
     ):
         self.service = service
         self.playlist_id = playlist_id
+        self.chunk_size = chunk_size
 
     def upload(
         self,
@@ -93,11 +98,15 @@ class Uploader:
             category_id,
         )
         body = build_upload_body(title, description, privacy, category_id, made_for_kids=False)
-        media = MediaFileUpload(media_path, chunksize=-1, resumable=True)
+        media = MediaFileUpload(media_path, chunksize=self.chunk_size, resumable=True)
         request = self.service.videos().insert(part="snippet,status", body=body, media_body=media)
 
-        response = self._execute_with_retry(
-            request, max_retries=max_retries, base_delay=base_delay, sleep=sleep
+        response = self._execute_resumable_upload(
+            request,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            sleep=sleep,
+            progress_callback=progress_callback,
         )
 
         video_id = response.get("id")
@@ -105,6 +114,43 @@ class Uploader:
         if self.playlist_id:
             self.add_to_playlist(video_id)
         return video_id
+
+    def _execute_resumable_upload(
+        self,
+        request,
+        max_retries: int = 5,
+        base_delay: float = 2.0,
+        sleep=time.sleep,
+        progress_callback=None,
+    ):
+        if hasattr(request, "next_chunk"):
+            response = None
+            retry = 0
+            while response is None:
+                try:
+                    status, response = request.next_chunk()
+                    if status and progress_callback:
+                        progress_callback(status.progress())
+                    retry = 0
+                except Exception as exc:
+                    if is_quota_error(exc):
+                        _logger.warning("upload hit quota error: %s", exc)
+                        raise QuotaExceededError(f"upload quota exceeded: {exc}") from exc
+                    retry += 1
+                    if retry > max_retries:
+                        _logger.error("resumable upload failed after %d attempt(s): %s", retry, exc)
+                        raise
+                    delay = base_delay * (2 ** (retry - 1))
+                    _logger.warning(
+                        "upload chunk failed (%s); retrying in %.1fs (attempt %d/%d)",
+                        exc,
+                        delay,
+                        retry,
+                        max_retries,
+                    )
+                    sleep(delay)
+            return response
+        return self._execute_with_retry(request, max_retries=max_retries, base_delay=base_delay, sleep=sleep)
 
     def _execute_with_retry(self, request, max_retries=5, base_delay=2.0, sleep=time.sleep):
         for attempt in range(max_retries + 1):
@@ -134,16 +180,20 @@ class Uploader:
         if not pid:
             return {}
         _logger.info("adding video %s to playlist %s", video_id, pid)
-        request = self.service.playlistItems().insert(
-            part="snippet",
-            body={
-                "snippet": {
-                    "playlistId": pid,
-                    "resourceId": {"kind": "youtube#video", "videoId": video_id},
-                }
-            },
-        )
-        return request.execute()
+        try:
+            request = self.service.playlistItems().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "playlistId": pid,
+                        "resourceId": {"kind": "youtube#video", "videoId": video_id},
+                    }
+                },
+            )
+            return request.execute()
+        except Exception as exc:  # noqa: BLE001 - playlist errors should not abort upload success
+            _logger.warning("could not add video %s to playlist %s: %s (continuing)", video_id, pid, exc)
+            return {}
 
     def verify(self, video_id: str) -> None:
         """Verify an uploaded video exists; raise if it does not."""

@@ -8,11 +8,23 @@ absent ``tubetape.json`` does not cause the whole library to be re-uploaded.
 
 from __future__ import annotations
 
+import re
 from .log import get_logger
 
 _logger = get_logger("reconcile")
 
 SEGMENT_ID_MARKER = "tubetape-segment-id:"
+TITLE_SEGMENT_ID_RE = re.compile(r"\[([0-9a-fA-F]{12,64})\]|[-_]([0-9a-fA-F]{12,64})$")
+
+
+def extract_segment_id_from_title(title: str) -> str | None:
+    """Extract a segment id from a video title (e.g. ``... [a1b2c3d4e5f67890]``)."""
+    if not title:
+        return None
+    match = TITLE_SEGMENT_ID_RE.search(title.strip())
+    if match:
+        return match.group(1) or match.group(2)
+    return None
 
 
 def embed_segment_id(description: str, segment_id: str) -> str:
@@ -53,9 +65,8 @@ def get_uploads_playlist_id(service) -> str | None:
 def fetch_remote_index(service) -> dict[str, str]:
     """Return ``{segment_id: video_id}`` for every tubetape video on the channel.
 
-    Videos without the marker are ignored. Any error is logged and yields an
-    empty/partial index: reconciliation is best-effort and must never block
-    uploads.
+    Matches segment IDs embedded in video titles (preferred, never truncated by
+    YouTube) as well as descriptions (legacy fallback).
     """
     try:
         uploads = get_uploads_playlist_id(service)
@@ -85,9 +96,13 @@ def fetch_remote_index(service) -> dict[str, str]:
             for item in response.get("items") or []:
                 snippet = item.get("snippet") or {}
                 video_id = (snippet.get("resourceId") or {}).get("videoId")
-                segment_id = extract_segment_id(snippet.get("description") or "")
-                if video_id and segment_id:
-                    index[segment_id] = video_id
+                title = snippet.get("title") or ""
+                desc = snippet.get("description") or ""
+                sid = extract_segment_id_from_title(title) or extract_segment_id(desc)
+                if video_id and sid:
+                    index[sid] = video_id
+                    if len(sid) >= 16:
+                        index[sid[:16]] = video_id
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
@@ -101,3 +116,4 @@ def fetch_remote_index(service) -> dict[str, str]:
         pages,
     )
     return index
+

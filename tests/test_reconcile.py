@@ -114,3 +114,44 @@ class TestFetchRemoteIndex:
                 return _Boom()
 
         assert fetch_remote_index(_Service()) == {}
+
+
+class TestTitleSegmentId:
+    def test_extract_from_bracketed_title(self):
+        from tubetape.reconcile import extract_segment_id_from_title
+
+        sid = "a1b2c3d4e5f67890"
+        title = f"20240101-120000 - 20240101-122000 [{sid}]"
+        assert extract_segment_id_from_title(title) == sid
+
+    def test_extract_from_hyphenated_title(self):
+        from tubetape.reconcile import extract_segment_id_from_title
+
+        sid = "a1b2c3d4e5f67890"
+        title = f"20240101-120000 - 20240101-122000-{sid}"
+        assert extract_segment_id_from_title(title) == sid
+
+    def test_extract_missing(self):
+        from tubetape.reconcile import extract_segment_id_from_title
+
+        assert extract_segment_id_from_title("just a regular title") is None
+        assert extract_segment_id_from_title("") is None
+        assert extract_segment_id_from_title(None) is None
+
+    def test_fetch_remote_index_from_title(self):
+        sid = "a1b2c3d4e5f67890"
+        pages = [
+            {
+                "items": [
+                    {
+                        "snippet": {
+                            "resourceId": {"videoId": "vid-123"},
+                            "title": f"20240101 - 20240102 [{sid}]",
+                            "description": "0:00 20240101-120000",
+                        }
+                    }
+                ]
+            }
+        ]
+        index = fetch_remote_index(_FakeService("UU123", pages))
+        assert index.get(sid) == "vid-123"

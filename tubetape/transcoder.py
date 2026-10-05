@@ -207,7 +207,8 @@ def transcode_segment(
         [
             (item.duration_seconds or config.image_duration, display_ts(item.captured_epoch or 0))
             for item in files
-        ]
+        ],
+        min_gap=0.0,
     )
     _logger.info("built %d chapter(s) from %d file(s)", len(chapters), len(files))
 

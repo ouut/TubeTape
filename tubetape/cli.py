@@ -200,6 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="path to client_secret.json for --login (default: <db dir>/client_secret.json)",
     )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=8080,
+        help="port for the web live log and status console (default: 8080, 0 to disable)",
+    )
     return parser
 
 
@@ -406,8 +412,8 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
         out_path = os.path.join(os.path.dirname(args.db), f".{segment.segment_id[:12]}.mp4")
 
-        # Already on YouTube (e.g. after a lost db): record locally and skip.
-        existing_video = None if segment.is_rebuild else remote_index.get(segment.segment_id)
+        # Already on YouTube (e.g. after a lost db or restart): record locally and skip.
+        existing_video = remote_index.get(segment.segment_id) or remote_index.get(segment.segment_id[:16])
         if existing_video:
             reporter.status(
                 f"segment {segment.title} already on YouTube ({existing_video}); skipping"
@@ -433,6 +439,8 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                     "error": None,
                 },
             )
+            if segment.is_rebuild and segment.replaces_segment_id:
+                db.segments.pop(segment.replaces_segment_id, None)
             db.save()
             continue
 
@@ -482,9 +490,7 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
             else:
                 _, chapters = transcode_fn(segment_files)
                 reporter.status(f"uploading {segment.title} ...")
-                description = embed_segment_id(
-                    chapters_text(chapters), segment.segment_id
-                )
+                description = chapters_text(chapters)
                 video_id = uploader.upload(
                     out_path,
                     segment.title,
@@ -640,28 +646,26 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
                 if status == _EXIT_QUOTA:
                     quota_retry_at = time.monotonic() + args.quota_backoff
     except KeyboardInterrupt:
-        reporter.status("exit signal: flushing pending segments ...")
-        _log.info("received exit signal; flushing pending segments")
-        args.flush = True
-        run_pipeline(args, reporter)
+        reporter.status("stopping watch mode on signal ...")
+        _log.info("received exit/interrupt signal; shutting down cleanly")
     finally:
         watcher.stop()
     return 0
 
 
 def _build_uploader(args: argparse.Namespace, db: Database):
-    import os
-
     from .uploader import Uploader
 
-    token_str = os.environ.get(auth.TOKEN_ENV)
-    if not token_str:
-        token_path = os.path.join(os.path.dirname(args.db), "token.json")
-        if not os.path.exists(token_path):
-            return None
-        credentials = auth.load_token_file(token_path)
-    else:
-        credentials = auth.credentials_from_token_string(token_str)
+    db_dir = os.path.dirname(args.db)
+    token_path = os.path.join(db_dir, "token.json")
+    client_secret = args.client_secret or os.path.join(db_dir, "client_secret.json")
+
+    try:
+        credentials = auth.ensure_credentials(client_secret, token_path=token_path)
+    except Exception as exc:  # noqa: BLE001
+        _log.error("cannot obtain YouTube credentials: %s", exc)
+        print(f"Error: {exc}", file=sys.stderr)
+        return None
 
     from googleapiclient.discovery import build
 
@@ -701,6 +705,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.login:
         return _run_login(args)
+
+    if getattr(args, "web_port", 0) > 0 and not args.dry_run:
+        from .web import WebServer
+
+        web_server = WebServer(port=args.web_port, log_file=log_file)
+        web_server.start()
 
     if args.watch and not args.dry_run:
         return run_watch(args)

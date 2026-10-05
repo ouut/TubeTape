@@ -80,8 +80,12 @@ class Rebuilder:
             self.verify_fn(new_video_id)  # 3. verify chapters/duration
             if old_video_id:
                 _logger.debug("step 4/5: deleting old video %s", old_video_id)
-                self.delete_fn(old_video_id)  # 4. delete old (only now)
-                previous = previous + [old_video_id]
+                try:
+                    self.delete_fn(old_video_id)  # 4. delete old (only now)
+                    previous = previous + [old_video_id]
+                except Exception as exc:  # noqa: BLE001
+                    _logger.warning("could not delete old video %s: %s (continuing with commit)", old_video_id, exc)
+                    previous = previous + [old_video_id]
 
             # 5. commit: new record replaces the old one.
             _logger.debug("step 5/5: committing new segment record")

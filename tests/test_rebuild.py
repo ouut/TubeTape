@@ -116,7 +116,7 @@ class TestRebuilder:
         assert rec.calls == ["transcode", "upload", "verify"]
         assert db.get_segment("old-id")["youtube_video_id"] == "old-vid"
 
-    def test_delete_failure_preserves_old_video_id(self):
+    def test_delete_failure_commits_new_and_logs(self):
         db = Database()
         make_old_segment(db)
         rec = CallRecorder()
@@ -127,12 +127,14 @@ class TestRebuilder:
             verify_fn=rec.fn("verify"),
             delete_fn=rec.fn("delete", exc=RuntimeError("delete failed")),
         )
-        with pytest.raises(RuntimeError):
-            rb.rebuild("old-id", make_new_segment(), ["a", "b"])
+        new_vid = rb.rebuild("old-id", make_new_segment(), ["a", "b"])
+        assert new_vid == "new-vid"
         assert rec.calls == ["transcode", "upload", "verify", "delete"]
-        old = db.get_segment("old-id")
-        assert old["youtube_video_id"] == "old-vid"  # kept
-        assert old["status"] == SEGMENT_STATUS_FAILED
+        # Old record removed, new record committed even though old delete failed
+        assert db.get_segment("old-id") is None
+        new = db.get_segment("new-id")
+        assert new["youtube_video_id"] == "new-vid"
+        assert "old-vid" in new["previous_video_ids"]
 
     def test_no_old_video_skips_delete(self):
         db = Database()

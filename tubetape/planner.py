@@ -83,13 +83,15 @@ def _make_segment(
 
     start = min(epochs)
     end = max(epochs)
+    sid = segment_id([f.file_id for f in ordered], params)
+    short_id = sid[:16]
     return Segment(
         file_ids=[f.file_id for f in ordered],
         start_ts=format_iso_utc(datetime.fromtimestamp(start, tz=timezone.utc)),
         end_ts=format_iso_utc(datetime.fromtimestamp(end, tz=timezone.utc)),
         duration_seconds=sum(f.duration_seconds or 0.0 for f in ordered),
-        segment_id=segment_id([f.file_id for f in ordered], params),
-        title=f"{display_ts(start)} - {display_ts(end)}",
+        segment_id=sid,
+        title=f"{display_ts(start)} - {display_ts(end)} [{short_id}]",
         replaces_segment_id=replaces_segment_id,
     )
 
@@ -172,10 +174,24 @@ def plan(
     ranges.sort(key=lambda r: (r[0], r[1], r[2]))
     _logger.debug("parsed %d existing segment time range(s)", len(ranges))
 
-    # Assign each file to the first matching existing range (inclusive bounds).
+    # Build a reverse lookup of files already belonging to existing segments.
+    # Files already in a segment remain with that segment and cannot be stolen
+    # by an adjacent segment with the same boundary timestamp.
+    existing_owner: dict[str, str] = {}
+    for sid, record in existing_segments.items():
+        for fid in record.get("file_ids", []):
+            existing_owner[fid] = sid
+
+    # Assign each file to its existing segment, or to a matching range for new files.
     assigned: dict[str, list[str]] = {sid: [] for _, _, sid, _ in ranges}
     free_files: list[ScannedFile] = []
     for item in files:
+        if item.file_id in existing_owner:
+            owner_sid = existing_owner[item.file_id]
+            if owner_sid in assigned:
+                assigned[owner_sid].append(item.file_id)
+            continue
+
         if item.captured_epoch is None:
             free_files.append(item)
             continue

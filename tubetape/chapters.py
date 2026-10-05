@@ -50,6 +50,20 @@ def build_chapters(items, min_gap: float = DEFAULT_MIN_GAP) -> list[list[str]]:
     return chapters
 
 
-def chapters_text(chapters: list[list[str]]) -> str:
-    """Render chapters as YouTube description text."""
-    return "\n".join(f"{start} {title}" for start, title in chapters)
+def chapters_text(chapters: list[list[str]], max_len: int = 4800) -> str:
+    """Render chapters as YouTube description text.
+
+    Guarantees the text does not exceed max_len (YouTube description limit is 5000 chars).
+    """
+    lines = [f"{start} {title}" for start, title in chapters]
+    text = "\n".join(lines)
+    if len(text) <= max_len:
+        return text
+    truncated_lines: list[str] = []
+    total = 0
+    for line in lines:
+        if total + len(line) + 1 > max_len:
+            break
+        truncated_lines.append(line)
+        total += len(line) + 1
+    return "\n".join(truncated_lines)
