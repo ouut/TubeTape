@@ -1,1055 +1,456 @@
 # TubeTape
 
-把家庭照片和视频自动整理成一个个组织好的视频文件，上传到 YouTube 私人频道，用于**备份和观看**。
+> **家庭照片与视频的高清时间胶囊**：自动将海量家庭照片、手机实拍与相机视频，按时间线智能聚合成高保真分段视频，安全备份至 YouTube 私人频道；内置抖音同款全屏时间线画廊与实时运行仪表盘。
 
-TubeTape 会扫描一个目录，按拍摄时间把照片/视频紧凑拼接成一个个「分片」视频，通过 ffmpeg 转码后上传到你的 YouTube 私人频道，并加入同一个按时间排序的播放列表。它支持**持续运行**：你把新照片/视频扔进目录，它自动检测、自动归入对应分片、自动（必要时重建并重传）上传。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python: 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](pyproject.toml)
+[![Docker: chet2026/tubetape](https://img.shields.io/badge/Docker-chet2026%2Ftubetape-blue.svg)](https://hub.docker.com/r/chet2026/tubetape)
 
 ---
 
 ## 目录
 
-- [Docker 快速开始](#docker-快速开始)
+- [为什么选择 TubeTape？](#为什么选择-tubetape)
 - [核心特性](#核心特性)
-- [工作原理](#工作原理)
-- [运行流程](#运行流程)
-- [安装](#安装)
-- [OAuth 配置（一次性）](#oauth-配置一次性)
+- [系统架构与工作流程](#系统架构与工作流程)
 - [快速开始](#快速开始)
-- [命令行参数](#命令行参数)
-- [Web 实时控制台](#web-实时控制台)
-- [命令例子](#命令例子)
-- [长期挂机（持续运行）](#长期挂机持续运行)
-- [过滤：只要相机照片和手机视频](#过滤只要相机照片和手机视频)
-- [数据库](#数据库)
-- [哈希缓存（扫描加速）](#哈希缓存扫描加速)
-- [分辨率与画质（保真优先）](#分辨率与画质保真优先)
-- [配额](#配额)
-- [构建可执行文件](#构建可执行文件)
-- [Docker](#docker)
-- [常见问题](#常见问题)
-- [更新记录](#更新记录)
+  - [方式一：Docker Compose（推荐，长期挂机首选）](#方式一docker-compose推荐长期挂机首选)
+  - [方式二：Docker CLI 直接运行](#方式二docker-cli-直接运行)
+  - [方式三：原生 Python 环境运行](#方式三原生-python-环境运行)
+- [Web 交互系统深度指南](#web-交互系统深度指南)
+  - [📱 全屏时间线画廊（根路径 `/`）](#-全屏时间线画廊根路径-)
+  - [📊 运行控制台与仪表盘（`/log` 与 `/logs`）](#-运行控制台与仪表盘log-与-logs)
+  - [🔑 Google YouTube OAuth 授权指南](#-google-youtube-oauth-授权指南)
+- [参数完全手册（CLI Options Reference）](#参数完全手册cli-options-reference)
+  - [1. 基础与存储参数](#1-基础与存储参数)
+  - [2. 时间线与分段规划参数](#2-时间线与分段规划参数)
+  - [3. 画质与视频编码参数](#3-画质与视频编码参数)
+  - [4. YouTube 与云端参数](#4-youtube-与云端参数)
+  - [5. 持续监控（Watch）与去抖参数](#5-持续监控watch与去抖参数)
+  - [6. Web 服务与本地分段保留参数](#6-web-服务与本地分段保留参数)
+  - [7. 日志与调试参数](#7-日志与调试参数)
+  - [常用场景推荐参数组合](#常用场景推荐参数组合)
+- [本地数据存储结构与安全规范](#本地数据存储结构与安全规范)
+- [常见问题 FAQ](#常见问题-faq)
+- [许可证](#许可证)
 
 ---
 
-## Docker 快速开始
+## 为什么选择 TubeTape？
 
-> 本程序推荐以 Docker / Docker Compose 容器化方式运行。容器内自带兼容的 glibc、完整版 ffmpeg 以及所有 Python 运行时依赖，宿主机无需配置 Python 环境。
-> 按照以下 8 个步骤从零到跑起来即可。
+家庭 NAS 或硬盘里存放着成千上万张散乱的照片和零碎视频：
+- **存储与容灾成本高**：家庭素材动辄数 TB，本地多盘冷备成本高昂，异地容灾更难维护；商业云盘存在容量上限或昂贵年费。
+- **回顾体验差**：零散的照片和短视频躺在目录深处，极少有人愿意翻看几万张静态文件，回忆往往沦为“数字遗物”。
+- **云端压缩损伤**：普通云盘或社交相册往往会对视频和照片严重降质压缩。
 
-### 0. 前置准备
-
-在开始前，请确保具备以下 3 个条件：
-
-1. **安装 Docker 与 Docker Compose**：
-   ```bash
-   docker --version
-   docker compose version
-   ```
-   两个命令均能正常输出版本号即可。
-2. **一个具备频道的 Google 账号**：
-   - 访问 [youtube.com](https://youtube.com)，确认当前 Google 账号已**创建 YouTube 频道**（若未创建频道，上传 API 会返回 `youtubeSignupRequired` 错误）。
-   - *(强烈建议)* 前往 YouTube 账号设置完成手机短信验证，以解除单视频 15 分钟的时长限制（未验证账号单片上限 15 分钟）。
-3. **获取 OAuth 客户端凭据（`client_secret.json`）**：
-   - 访问 [Google Cloud Console](https://console.cloud.google.com)，新建项目并启用 **YouTube Data API v3**。
-   - 在「OAuth 同意屏幕」中选择 External，添加测试用户（自己的 Gmail 邮箱），添加权限范围：`https://www.googleapis.com/auth/youtube.force-ssl`。
-   - 在「凭据」页面创建 **OAuth 客户端 ID → 桌面应用（Desktop App）**，下载 JSON 文件并重命名为 `client_secret.json`。
-   *(详细步骤与图文说明可参考后文 [OAuth 配置（一次性）](#oauth-配置一次性))*。
-
----
-
-### 1. 目录结构与镜像获取
-
-在宿主机上克隆仓库并进入目录，将下载的 `client_secret.json` 放置在该目录下：
-
-```bash
-# 1. 克隆仓库并进入目录
-git clone https://github.com/ouut/TubeTape.git
-cd TubeTape
-
-# 2. 拷贝你的 client_secret.json 到当前目录
-cp /path/to/client_secret.json .
-```
-
-**获取镜像**（二选一）：
-```bash
-# 方式 A：拉取预构建官方镜像（推荐）
-docker pull chet2026/tubetape:latest
-
-# 方式 B：本地自己构建
-docker build -t chet2026/tubetape:latest .
-```
-
-**此时你的宿主机工作目录结构应如下**：
-```
-TubeTape/
-├── docker-compose.yml       # 容器编排定义
-├── client_secret.json       # 【必需】你从 GCP 下载的 OAuth 凭据文件
-└── uploaded_segments/       # 【可选】根据 --keep-segments 自动保留的最新分段视频目录
-```
-
----
-
-### 2. 配置媒体目录与运行参数
-
-TubeTape 采用**零配置 .env 极简设计**：无需繁琐的 `.env` 文件，YouTube Token 凭据在网页上一键授权后自动持久化，你的原始照片视频目录直接在 `docker-compose.yml` 中声明挂载即可。
-
-打开并编辑 `docker-compose.yml`：
-```yaml
-    volumes:
-      # 将冒号前的路径修改为你宿主机上的照片和视频绝对路径（只读挂载，绝不篡改你的原文件）
-      - /path/to/your/photos:/data:ro
-      # 数据库 + 哈希缓存 + 日志 + 凭据(client_secret.json/token.json) + uploaded_segments 本地视频
-      - ./:/db
-```
-
-根据需要调整 command 启动参数（默认已针对家庭备份优化）：
-```yaml
-    command:
-      - --input
-      - /data                      # 容器内媒体扫描路径（映射自你的宿主机照片目录）
-      - --db
-      - /db/tubetape.json          # 数据库文件（落入当前目录 ./tubetape.json）
-      - --client-secret
-      - /db/client_secret.json     # 声明凭据路径，启动时检测并自动刷新
-      - --timezone
-      - Asia/Shanghai              # 时区
-      - --privacy
-      - private                    # 隐私等级（私人备份）
-      - --max-resolution
-      - 3840x2160                  # 画布上限（4K，非 4K 素材保持原尺寸）
-      - --segment-duration
-      - "1200s"                    # 每片目标时长（默认 20 分钟/片）
-      - --fps
-      - "30"                       # 帧率
-      - --keep-segments
-      - "0"                        # 本地保留构建视频数量：0 上传后即删（默认）；设置为 N 保留最新 N 个
-      #- --only-camera-photos      # 按需启用：只处理相机实拍照片，丢弃截图/网络转存副本
-      #- --only-phone-videos       # 按需启用：只处理手机实拍视频
-      - --watch                    # 持续监控模式
-      - -v                         # 输出 INFO 日志
-```
-
----
-
-### 3. 首次授权登录（生成 `token.json`）
-
-TubeTape 采用**一体化授权架构（Scheme A）**，无需复杂的终端命令交互，直接启动容器即可在 Web 控制台完成一键授权：
-
-#### 推荐方式：Web 界面一键授权（零终端门槛）
-
-1. **直接启动容器**：
-   ```bash
-   docker compose up -d
-   ```
-2. **打开 Web 控制台**：
-   在浏览器中访问 `http://<宿主机或NAS_IP>:9090/log`（若直接运行 Python 则为 `http://localhost:8080/log`）。
-3. **完成授权**：
-   - 网页上方会醒目弹出「🔑 需要完成 Google YouTube 授权」卡片。
-   - **本机环境**：点击「🔗 前往 Google 登录授权」，在弹出的 Google 授权页同意后，会自动回调并自动跳转回控制台，授权完成！
-   - **远程 NAS / 无桌面服务器**：点击授权后，若浏览器因重定向到 `localhost:8080` 提示连接失败，**直接复制浏览器地址栏的完整 URL**，粘贴到 Web 控制台卡片的输入框中并点击「提交授权凭据」即可。
-4. **后台自动开跑**：
-   授权成功后，当前目录自动生成 `token.json`，后台立即自动开始扫描文件与上传，**完全无需重启容器**！
-
-#### 备用方式：纯终端命令行交互（适合纯 SSH 用户）
-
-如果你更喜欢在纯终端黑屏环境下操作，也可使用传统的 `--login` 参数：
-
-```bash
-docker compose run --rm tubetape --login
-```
-根据终端提示在浏览器打开授权 URL，将跳转后的地址粘贴回终端敲回车即可生成 `token.json`。
-
-> 💡 **关于 Token 过期与自愈（免重复登录）**：
-> - 只要 `client_secret.json` 存在，TubeTape 每次启动和运行中若检测到 Token 过期，会**自动通过 refresh_token 在后台刷新并静默写回 `token.json`**，日常完全无需人工干预。
-> - 若检测到凭据彻底失效且无法刷新，Web 控制台会自动切入「等待授权」状态，网页随时提供一键重新授权，后台在获得授权后自动平稳续跑。
-
----
-
-### 4. 预览检查（Dry-Run，安全零风险）
-
-正式转码与上传前，强烈建议先运行一次只读预览。**Dry-Run 模式下只读扫描，不写数据库、不调用 ffmpeg、不上载任何视频**：
-
-```bash
-docker compose run --rm tubetape --dry-run --no-watch
-```
-
-**控制台会清晰输出**：
-- 扫描发现了多少张照片、多少个视频；
-- 根据拍摄时间与时长限制规划出了多少个分片（Segment）；
-- 尾部不足时长的待处理暂存文件数量（Pending files）。
-
-确认分片规划符合预期后，即可进入长期挂机运行。
-
----
-
-### 5. 启动长期挂机（后台持续运行）
-
-使用后台守护进程方式启动：
-
-```bash
-docker compose up -d
-```
-
-启动后容器会在后台静默运行：
-- **自动转码与分块上传**：按照规划自动分片转码为高保真 MP4，并以 10MB 分块断点续传（`next_chunk()`）流式上传至 YouTube 私人频道。
-- **素材与时间戳精确对应**：每个素材对应独立跳转时间戳（`0:00 20240101-120000`），在 YouTube 播放器简介中全量可点击直接跳至对应片段。
-- **云端对账绝对防重**：视频标题内嵌唯一短哈希 `[{short_id}]`，云端已存在的分片直接跳过，绝无重复上传。
-- **本地分片视频保留控制**：通过 `--keep-segments`（默认 0 上传后即删，>0 保留最新 N 个）在 `uploaded_segments/` 目录保留高画质本地分片视频，自动按修改时间轮转删除旧视频。
-- **持续监控（Watch）**：通过 inotify 事件与每小时目录扫描持续监听媒体目录。扔进新照片/视频后，静默期 10 分钟（防传输一半）去抖后自动增量打包。
-- **配额感知**：遇到 YouTube 每日上传配额耗尽（`quotaExceeded`）时，自动休眠等待 1 小时后重试，次日配额刷新后自动继续，无需人工干预。
-- **开机自启**：配置了 `restart: unless-stopped`，宿主机重启或 Docker 服务重启后自动恢复运行。
-
----
-
-### 6. 查看实时仪表盘与时间线全屏画廊
-
-TubeTape 内置了**全屏时间线画廊**与**运行控制台仪表盘**两大核心 Web 体验：
-
-#### 体验 1：📱 抖音同款时间线全屏画廊（访问根路径 `/`）
-浏览器打开：`http://<宿主机或NAS_IP>:9090`（原生命令行运行则访问 `http://localhost:8080`）：
-- **全屏沉浸式交互**：黑底全屏，支持触屏上下滑动、鼠标滚轮、键盘上下键（`↑`/`↓`）无缝切换上一个/下一个素材。
-- **图片多级缩放与平移**：双击图片放大至 2.5 倍或还原，支持触屏捏合手势缩放，放大后自由拖拽查看高清细节；iPhone HEIC/HEIF 图片服务端智能转码并缓存。
-- **视频智能播放**：当前视频切入时静音自动播放（满足浏览器策略），右上角提供全局声音切换，点击画面暂停/播放，底部带播放进度条。
-- **右侧纵向时间线滑动条（Scrubber）**：悬浮或拖拽滑动条实时显示日期气泡（如 `2024-05-18 (第 142/1580 个)`），松开或点击即可秒级跳转至指定时间点！
-- **右上角快捷导航**：随时点击「📊 控制台与日志」一键跳转至管理后台。
-
-#### 体验 2：📊 运行控制台与仪表盘（访问 `/log` 或 `/logs`）
-浏览器打开：`http://<宿主机或NAS_IP>:9090/log`：
-- **实时 Dashboard 仪表卡片**：
-  - 媒体扫描进度：展示已扫描媒体总数，扫描中实时显示当前处理文件与计数。
-  - 时间线分段统计：总分段数、已上传分段数、待构建分段数。
-  - 本地磁盘视频统计：显示当前在 `uploaded_segments/` 中保留的视频数量与 `--keep-segments` 限制。
-  - 当前流水线任务状态：清晰展示转码、上传、等待授权或常驻监听状态。
-- **时间线分段列表 (Timeline Segments)**：
-  - 完整展示时间线上的所有分片条目与起止时间区间、媒体数、预估/实际时长。
-  - 构建状态与实时进度条：正在构建的分段动态展示百分比进度与当前处理素材名。
-  - YouTube 直达链接：已上传分段直接显示可点击的 `▶️ 查看视频 (ID: xxx)` 链接跳转云端播放。
-- **实时日志流与条数配置**：
-  - 支持下拉菜单自由选择显示最近条数（**默认 100 条**，可选 50、100、200、500、全部）。
-  - 支持一键「自动滚动」与「清屏」。
-  - 语法高亮清晰呈现 `INFO`（蓝色）、`WARNING`（黄色）、`ERROR`（红色）、`DEBUG`（灰色）。
-
-#### 方式 B：终端命令行排查
-```bash
-# 查看容器运行状态
-docker compose ps
-
-# 查看标准输出实时日志
-docker compose logs -f
-
-# 查看最详尽的底层 DEBUG 审计日志（包含哈希缓存 [cache] 命中、ffmpeg 转码进度等）
-docker compose exec tubetape tail -f /db/tubetape.json.log
-```
-
----
-
-### 7. 优雅停止、重启与更新
-
-#### 停止容器（平稳停机）
-```bash
-docker compose down
-# 或
-docker stop tubetape
-```
-> 🛡️ **安全保证**：TubeTape 接收到 `SIGTERM` 信号后会立即平稳终止监控并安全释放文件锁退出，**不会在停机阶段强行执行耗时转码**，彻底避免 Docker 10 秒超时强制发送 `SIGKILL` 导致产生未入库的云端孤儿视频。未完成的文件将在下次启动时平稳续传。
-
-#### 重启容器
-```bash
-docker compose up -d
-```
-启动后自动载入 `./tubetape.json` 数据库与哈希缓存，已封口分片直接秒过，自动继续处理未完成部分。
-
-#### 升级到最新版本
-```bash
-# 拉取最新镜像
-docker compose pull
-
-# 重启容器应用最新版本
-docker compose down && docker compose up -d
-```
-
----
-
-### 文件路径与作用总览
-
-所有运行数据均持久化在 `docker-compose.yml` 所在的宿主机当前目录中，容器删除或重建绝不丢失数据：
-
-| 宿主机路径 | 容器内挂载点 | 权限 | 详细说明 |
-|---|---|---|---|
-| 宿主机照片视频目录 | `/data` | 只读 (`:ro`) | 你的家庭原始照片与视频目录（在 `docker-compose.yml` volumes 中配置），TubeTape 绝不修改或删除任何源文件 |
-| `./tubetape.json` | `/db/tubetape.json` | 读写 | 核心元数据数据库、扫描缓存与已上传 YouTube 视频 ID 记录 |
-| `./tubetape.json.log` | `/db/tubetape.json.log` | 读写 | 包含全量纳秒级文件哈希、ffmpeg 指令与网络响应的 DEBUG 审计日志 |
-| `./client_secret.json` | `/db/client_secret.json` | 只读 | 从 Google Cloud 下载的 OAuth 客户端凭据，用于登录与后台自愈刷新 |
-| `./token.json` | `/db/token.json` | 读写 (`0600`) | 授权后的 YouTube Access/Refresh Token，程序会自动刷新并更新此文件 |
-| `./uploaded_segments/` | `/db/uploaded_segments/` | 读写 | 本地转码分片视频保留目录（受 `--keep-segments` 自动轮转管理，文件非隐藏） |
+**TubeTape 的解决方案**：
+1. **聚合为时间胶囊**：按照拍摄时间自动将照片与视频智能打包串联为固定时长的长视频（如 20 分钟/片），配以章节时间戳，照片化为动态胶片。
+2. **免费无限冷备**：YouTube 支持免费无限存储高画质私人视频（最高支持 8K 60FPS），提供全球顶尖的灾备能力与流媒体回放体验。
+3. **免客户端随时随地回放**：无论是电视机、手机、平板还是投影仪，任何支持 YouTube 的设备均可一键点播家庭记录。
+4. **内置抖音同款画廊**：即使不依赖云端，TubeTape 本地也提供极致流畅的沉浸式全屏时间线滑动播放器，支持 iPhone HEIC 原图高速渲染与视频流式点播。
 
 ---
 
 ## 核心特性
 
-- **📱 抖音同款时间线全屏画廊（`/`）**：沉浸式黑底全屏展示，触屏/滚轮/方向键上下滑动切换素材，双击/捏合多级放大缩小平移，视频静音自动播放与一键开启声音，右侧交互式时间线滑动条秒级定位。
-- **📊 运行控制台与仪表盘（`/log`）**：顶部 Dashboard 实时展示媒体扫描计数与进度、全量时间线分片状态（构建中动态百分比进度与当前处理文件、YouTube 直达链接）、本地保留视频统计；下方实时日志流支持自由选择显示最近 N 条（默认 100 条）。
-- **💾 本地分片视频智能保留（`--keep-segments`）**：转码上传的高清 MP4 保存于 `uploaded_segments/`，可配置保留最新 N 个视频（默认 0 上传后即删），自动按修改时间淘汰旧视频。
-- **标题内嵌防截断对账**：分片 ID 内嵌于视频标题尾部（`[{short_id}]`），彻底解决 YouTube API 截断简介导致对账 Marker 丢失的问题；云端已有视频直接跳过，零重复上传。
-- **纯文件时间戳简介**：视频简介为每个素材对应的时间戳（`0:00 20240101-120000`），无多余标记，所有文件在 YouTube 播放器中均可点击跳至对应片段。
-- **真实分块断点续传**：采用 10MB 分块（`next_chunk()`）执行网络传输，具备指数退避重试，网络瞬断或超时不重新发起建片。
-- **Token 自动化与自愈**：`token.json` 过期自动调用 refresh 换新并持久化回磁盘；后台非交互运行遇凭据失效友好报错指引。
-- **平稳停机防孤儿视频**：SIGTERM / SIGINT 信号优雅停机，避免 Docker 10s 超时 SIGKILL 产生未录入数据库的孤儿视频。
-- **归档优先**：最终每个文件恰好属于一个分片，分片严格按拍摄时间连续，内容完整。
-- **分片不可变 + 按需重建**：YouTube 无法替换已上传视频的文件内容，因此「更新分片」= 先上传新片、成功后删除旧片（旧片删除失败不影响新片提交）。
-- **分片时间区间固定**：加一张照片只触发它所在的那一个分片重建，且同秒照片边界严格归属原分片，不会碰撞或级联重传。
-- **持续监控**：`--watch` 下挂着不用管，新文件自动归入分片、自动上传。
-- **来源过滤**：可选择只保留相机拍摄的照片和手机拍摄的视频，丢弃截图和网络传输的压缩副本。
-- **配额感知**：以 YouTube API 返回为准，配额用尽自动退避重试，不在本地维护额度计数。
-- **断点续传**：进度存 JSON 库，崩溃/重启后从断点继续，已封口且未变更的分片不重复处理。
-- **扫描缓存**：文件「大小 + mtime」未变时直接复用上次的内容哈希和元数据，重复扫描极快。
-- **详细日志**：终端友好进度 + `<db>.log` 带时间戳的 DEBUG 审计日志，随时可查「程序正在做什么」。
+- **📱 抖音同款时间线全屏画廊（`/`）**：
+  - 纯黑沉浸式全屏界面，支持触屏手势、鼠标滚轮、键盘上下键（`↑`/`↓`）流畅纵向滑动切换。
+  - 图片支持多级缩放（双击 2.5 倍缩放、触屏双指捏合缩放、放大后自由平移拖拽）。
+  - 视频智能播放：切入即静音自动播放（突破现代浏览器限制），右上角提供全局一键声音开关。
+  - 右侧纵向交互式时间线滑动条（Scrubber）：悬浮或拖拽滑块即时显示年月日期浮动气泡，秒级跨越年月定位。
+  - 服务端 iPhone HEIC/HEIF 图片自动转码 JPEG 与多级缓存，视频标准 HTTP 206 Partial Content (Range) 分块流式传输。
+- **📊 实时运行控制台与仪表盘（`/log`）**：
+  - 顶部 Dashboard：已扫描媒体总数与实时扫描进度、时间线全量分片状态（正在构建动态进度条与当前处理文件名、YouTube 视频 ID 直达链接）、本地磁盘保留视频统计与当前任务状态。
+  - 下方实时日志流：支持色彩高亮（INFO 蓝、WARN 黄、ERROR 红、DEBUG 灰），前端下拉菜单自由配置显示最近条数（**默认 100 条**，可选 50、100、200、500、全部），支持自动滚动与一键清屏。
+- **💾 本地分片智能保留（`--keep-segments`）**：
+  - 构建完成的 MP4 文件保存在 `uploaded_segments/` 目录下（非隐藏文件，便于在宿主机或 NAS 中直接访问）。
+  - 支持保留最新 $N$ 部视频（默认 $0$ 即传即删节省空间；设置为 $N$ 时按文件修改时间自动淘汰旧分段）。
+- **⚡ 零 `.env` 极简配置与 Web OAuth 授权**：
+  - 彻底移除环境变量文件，媒体目录在 `docker-compose.yml` 中声明只读挂载即可。
+  - 首次启动容器自动进入授权就绪状态，访问 Web 控制台即可一键完成 Google OAuth 授权，凭据自动写盘并无缝继续运行，无需重启容器。
+- **🎞️ 高画质自适应转码引擎**：
+  - 默认画布模式取分片内所有素材的动态包围盒（`--canvas-mode max`），决不降采样；支持高达 8K（7680x4320）60FPS。
+  - 默认采用高保真电影级参数（`--crf 16`，`--x264-preset slow`）。
+  - 智能解析 iPhone Live Photos、HEIC/HEIF、MOV、MP4、3GP 等全格式。
+- **🔒 防截断短 ID 云端容灾对账**：
+  - 视频标题内嵌唯一短哈希 `[{short_id}]`，彻底根除因 YouTube API 截断简介 Marker 导致的云端对账丢失与无限重复上传。
+  - 本地数据库即便意外损毁或丢失，TubeTape 也能自动从 YouTube 频道拉取已有列表秒级恢复，零重复上传。
+- **🚀 10MB 分块断点续传与配额自愈**：
+  - 采用 10MB 分块流式上传（`request.next_chunk()`），遇网络瞬断指数退避重试，绝不重新建片。
+  - 遇到 YouTube 每日上传配额耗尽（`quotaExceeded`）自动休眠退避（默认 1 小时），配额刷新后平稳继续。
+- **🛡️ 只读源文件与 Docker 平稳停机**：
+  - 源照片目录必须只读挂载（`:ro`），TubeTape 绝不修改或删除任何原始素材。
+  - 捕获 `SIGTERM`/`SIGINT` 信号安全平稳退出，杜绝 Docker 10 秒超时强制 `SIGKILL` 产生云端孤儿视频。
 
 ---
 
-## 工作原理
+## 系统架构与工作流程
 
+```mermaid
+flowchart TD
+    A["📸 原始照片与视频目录 (/data:ro)"] --> B["🔍 文件扫描器 (scanner.py)<br/>• EXIF/ffprobe 元数据提取<br/>• 头中尾 64KB 快速采样哈希<br/>• mtime+size 增量持久化缓存"]
+    B --> C["📋 时间线规划器 (planner.py)<br/>• 拍摄时间严格排序<br/>• 贪心装箱至目标时长 (1200s)<br/>• 同秒边界防碰撞<br/>• 稳定哈希 segment_id 计算"]
+    C --> D["⚡ 高保真转码引擎 (transcoder.py)<br/>• 自适应包围盒画布 (max)<br/>• HEIC 动态转码 PNG 缓冲<br/>• ffmpeg 生成高画质 MP4<br/>• 生成精确时间戳章节 (chapters)"]
+    D --> E["☁️ YouTube 上传引擎 (uploader.py)<br/>• 标题内嵌防截断短ID [{short_id}]<br/>• 10MB 分块断点续传<br/>• 配额感知退避 (QuotaExceeded)<br/>• 频道对账防重上传 (reconcile.py)"]
+    E --> F["💾 本地轮转管理 (cli.py)<br/>• 写入 uploaded_segments/<br/>• --keep-segments 自动保留最新 N 部"]
+    E --> G["📦 原子数据库 (tubetape.json)<br/>• tempfile + fsync + os.replace<br/>• 崩溃与断电零损坏保障"]
+    
+    H["🌐 Web 服务中心 (web.py)"]
+    G -. 提供数据 .-> H
+    H --> I["📱 GET / : 全屏时间线画廊<br/>• 抖音同款上下滑动<br/>• 双击/手势缩放平移<br/>• 视频 Range 206 流式点播<br/>• 右侧纵向时间线滑动条"]
+    H --> J["📊 GET /log : 监控仪表盘<br/>• 扫描/分段/本地视频进度<br/>• YouTube 直达链接<br/>• 实时日志前端条数过滤"]
 ```
-扫描（scan）
-  → 递归找图片/视频，提取拍摄时间、分辨率、内容哈希(file_id)
-  → 内容哈希只采样头/中/尾各 64KB + 文件大小（小文件整读），不读整个大文件
-  → 与数据库对比：新增 / 已处理 / 已删除
-  → 哈希缓存：文件「大小 + mtime(ns)」没变时复用上次的哈希和元数据，不重新读文件
-  → 视频元数据优先用 ffprobe 结构化读取，缺失时才回退到 ffmpeg -i
-  → 扫描中每 1000 个文件（或每 30s）增量落盘，中断不丢已扫进度
-
-分片规划（plan）
-  → 按拍摄时间升序，紧凑拼接（去掉时间空洞）
-  → 贪心打包，累计时长 ≤ --segment-duration
-  → 已有分片的时间区间视为固定边界：新文件落入哪个区间归哪个分片
-  → segment_id = sha256(排序后的 file_id + 分片参数)，已存在则跳过
-
-转码（transcode）
-  → ffmpeg 转 MP4（H.264 High / yuv420p / AAC 48kHz）
-  → 图片转静态帧（可选 Ken Burns），黑边补齐到统一分辨率
-  → 生成每个素材的精确起始时间戳（YouTube 可点击直接跳转）
-
-上传（upload）
-  → 先列出频道已有视频（对账：优先匹配标题短 ID），云端已有的分片直接跳过
-  → YouTube videos.insert，标题 = {首时间戳} - {末时间戳} [{short_id}]
-  → 简介写入纯素材时间戳列表（点击跳转），10MB 分块断点续传（next_chunk）
-  → 加入按拍摄时间排序的播放列表，标记 sealed
-
-重建（rebuild）
-  → 新文件落入已封口分片区间内 → 转码上传新片 → 校验 → 删除旧片 → 更新库
-  → 旧片删除失败打 Warning 并继续提交新片，绝不阻断造成重复循环
-
-监控（watch）
-  → watchdog 事件即时发现新文件 + 目录 mtime 兜底扫描（网络盘也能用）
-  → 静默期去抖 → 自动重处理；配额用尽则退避重试；收到 SIGTERM/SIGINT 平稳退出
-```
-
----
-
-## 运行流程
-
-程序从启动到结束的实际执行顺序。
-
-### 一次性运行（`--no-watch`）
-
-**1. 载入数据库**：读 `tubetape.json`（不存在则空库）。
-
-**2. 扫描**：
-- 递归遍历目录，按扩展名收集图片/视频（跳过隐藏文件/目录），打印总数；
-- 逐个文件：`stat` 拿「大小 + mtime」→ 命中哈希缓存（两者未变）就复用旧哈希和元数据（日志带 `[cache]`），否则算内容哈希 + 读 EXIF/ffprobe 元数据 + 定拍摄时间（元数据 → 文件名 → mtime）；
-- 边扫边增量落盘（每 1000 文件或每 30s），中断不丢进度；
-- 与库对比得出 新增 / 已处理 / 已删除。
-
-**3. 规划**：
-- 按拍摄时间排序；已有分片的时间区间为固定边界（区间内的新文件归入该片 → 重建，区间外的打包成新片）；同秒照片严格归属原分片，杜绝范围争抢；
-- 贪心打包，每片累计时长 ≤ `--segment-duration`；最后一片不足时长则留为 pending（除非 `--flush`）；
-- `segment_id = sha256(排序后的 file_ids + 转码参数)`，已存在则跳过。
-
-**4. `--dry-run`** 到此为止：只打印计划，不写库、不转码、不上传。
-
-**5. 上传前对账**：列出频道已有视频，优先匹配标题中的 `[{short_id}]`（简介 Marker 兼容兜底）→ 已在 YouTube 上的分片直接跳过并补写本地记录，零重复上传。
-
-**6. 逐分片处理**：
-- 定画布（`--canvas-mode`）→ 转码（每个文件一个 clip：缩放+黑边到画布，HEIC 先转 PNG；再 `-c copy` 拼接）→ 为每个文件生成可点击时间戳；
-- 10MB 分块断点续传（标题 = 起止时间 [short_id]，简介 = 纯时间戳列表）→ 写库（`youtube_video_id`、`status=sealed`）；
-- 每片后保存数据库；配额用尽则本轮停止（退出码 2）。
-
-**7. 重建**（新文件落入已封口分片）：转码新片 → 10MB 分块上传 → 校验 → 删除旧片 → 提交新记录（旧 id 进 `previous_video_ids`）；删除旧片失败不阻断新片提交。
-
-### 持续监控（`--watch`）
-
-1. 先跑一次完整流程；
-2. **watchdog**（inotify 等）即时发现新文件；
-3. 每 `--mtime-interval`（默认 1h）跑一次**目录 mtime 兜底扫描**（补漏事件 / 网络盘）；
-4. 检测到变更 → **静默期 `--quiet-period`（默认 10m）去抖** → 重跑；
-5. 配额用尽 → 等 `--quota-backoff`（默认 1h）自动重试；
-6. `Ctrl+C` / `SIGTERM` → 立即平稳停止监控并退出（未完成文件下次启动处理，防超时 SIGKILL 产生孤儿视频）。
-
-### 第一次运行的推荐顺序
-
-```bash
-# ① 预览（只读）
-python3 -m tubetape --dry-run --no-watch -v \
-  --input /path/to/photos --db /path/to/photos/tubetape.json --timezone Asia/Shanghai
-
-# ② 真实跑一次（处理完退出）
-python3 -m tubetape --no-watch -v \
-  --input /path/to/photos --db /path/to/photos/tubetape.json --timezone Asia/Shanghai
-
-# ③ 确认无误后挂机
-python3 -m tubetape --watch -v \
-  --input /path/to/photos --db /path/to/photos/tubetape.json --timezone Asia/Shanghai
-```
-
-> 想看每一步细节：`tail -f /path/to/photos/tubetape.json.log`（加 `-vv` 让终端也显示全部 DEBUG）。
-
----
-
-## 安装
-
-**要求：**
-
-| 依赖 | 说明 |
-|---|---|
-| Python 3.11+ | （3.10 实测也可运行，但 pyproject 声明 ≥3.11） |
-| ffmpeg | 系统命令，提供 `ffmpeg` + `ffprobe`，用于视频元数据探测和转码 |
-| 网络 | 访问 YouTube Data API |
-
-```bash
-# 1. 克隆仓库
-git clone <你的仓库地址>
-cd TubeTape
-
-# 2. 安装 Python 依赖
-pip install -e ".[dev]"
-# 或最小安装：
-pip install tzdata Pillow pillow-heif exifread google-api-python-client google-auth-oauthlib watchdog rich
-
-# 3. 确认 ffmpeg 可用
-ffmpeg -version
-```
-
-> 打包成可执行文件时无需装 Python，但**目标机器仍需安装 ffmpeg**。
-
-**支持的媒体格式：**
-
-| 类型 | 扩展名 |
-|---|---|
-| 图片 | `.jpg` `.jpeg` `.png` `.heic` `.heif` `.tif` `.tiff` `.webp` `.bmp` |
-| 视频 | `.mp4` `.mov` `.m4v` `.avi` `.mkv` `.mts` `.m2ts` `.3gp` |
-
-> HEIC/HEIF 由 `pillow-heif`（pip 依赖，自带 libheif）解码：扫描时读其 EXIF（分辨率/拍摄时间/Make/Model），转码时先转成 PNG 再交给 ffmpeg（ffmpeg 通常不带 HEIC 解码器）。
-
----
-
-## OAuth 配置（一次性）
-
-YouTube 上传必须 OAuth 2.0，OAuth 客户端只能来自 Google Cloud Console。
-
-1. [Google Cloud Console](https://console.cloud.google.com) 建项目 → 启用 **YouTube Data API v3**。
-2. 凭据 → 创建 **OAuth 客户端 ID → 桌面应用** → 下载 `client_secret.json`（放到项目根目录）。
-3. OAuth 同意屏幕 → External → 添加自己的邮箱为测试用户 → 加 scope：
-   `https://www.googleapis.com/auth/youtube.force-ssl`（覆盖上传/删除/播放列表/读取）。
-4. 获取 token（打印 URL → 浏览器授权 → 把跳转回来的 URL 粘回去）。两种等价方式：
-
-```bash
-# 方式一：独立脚本（源码环境）
-python scripts/oauth_login.py --client-secret client_secret.json --output token.json
-
-# 方式二：内置命令（推荐，Docker 里也能用）
-python -m tubetape --login --db tubetape.json --client-secret client_secret.json
-# token 存到 <db 同目录>/token.json
-```
-
-生成的 `token.json` 权限为 0600，含 refresh token。**两个档位：**
-
-- **Testing 模式**：免审核，立即可用，但 token 约 7 天过期，每周重跑一次上面的命令。
-- **In production（发布）**：token 长期有效；自己（owner）使用无需 Google 审核。
-
-> ⚠️ `client_secret.json` 和 `token.json` 都含机密，**切勿提交到 git**（已配 `.gitignore`）。
 
 ---
 
 ## 快速开始
 
+### 方式一：Docker Compose（推荐，长期挂机首选）
+
+这是在 NAS（群晖、威联通、TrueNAS、Unraid）或 Linux 服务器上最推荐的部署方式。
+
+#### 1. 准备工作目录与凭据
+在宿主机创建目录，并将从 Google Cloud 下载的 `client_secret.json` 放入其中：
 ```bash
-# 1. 先 dry-run 预览：只看分片计划，不转码不上传
-python -m tubetape --dry-run --input /path/to/photos
+mkdir -p TubeTape && cd TubeTape
 
-# 2. 真实运行一次：扫描 → 分片 → 转码 → 上传（私人）
-python -m tubetape --input /path/to/photos --timezone Asia/Shanghai
-
-# 3. 持续运行：挂着自动处理新文件
-python -m tubetape --input /path/to/photos --watch
-```
-
----
-
-## 命令行参数
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--image-duration` | `3` | 图片转视频时单张图片的播放秒数 |
-| `--input` | 当前目录 | 图片/视频根目录 |
-| `--db` | `<input>/tubetape.json` | JSON 数据库路径 |
-| `--segment-duration` | `1h` | 每片时长上限；支持 `1h` / `3600s` / `1:00:00` |
-| `--timezone` | 系统本地 | 无时区 EXIF 时间的解释基准（如 `Asia/Shanghai`） |
-| `--crf` | `16` | 视频重编码质量，越小越清晰 |
-| `--max-resolution` | `7680x4320` | 分辨率上限，不放大（画布是包围盒，≤4K 内容仍 4K，只有真 8K 才用 8K） |
-| `--canvas-mode` | `max` | 分片画布尺寸：`max`=所有文件尺寸的包围盒（不降采样，默认），`first`=第一个文件 |
-| `--fps` | `60` | 输出帧率（默认 60，保留最高 60fps 源的运动） |
-| `--x264-preset` | `slow` | x264 速度/压缩效率档；越慢同码率越清晰 |
-| `--ken-burns` | 关 | 图片缩放平移效果（会软化画面，保真建议关） |
-| `--privacy` | `private` | `private` 或 `unlisted` |
-| `--playlist` | 无 | 追加到的 YouTube 播放列表 ID |
-| `--flush` | — | 立即把不足时长的待处理队列强制封片上传 |
-| `--watch` / `--no-watch` | 开 | 是否持续监控新文件 |
-| `--quiet-period` | `10m` | watch 模式下，最后一次变更后等待多久再处理（防拷贝一半） |
-| `--poll-interval` | `30s` | watch 模式内部 tick：多久检查一次时间相关条件 |
-| `--mtime-interval` | `1h` | watch 模式下目录 mtime 兜底扫描间隔（补 watchdog/inotify 漏掉的事件） |
-| `--quota-backoff` | `1h` | YouTube 报配额用尽后，等待多久再重试 |
-| `--only-camera-photos` | 关 | 只保留相机拍摄的照片（EXIF 有 Make+Model） |
-| `--only-phone-videos` | 关 | 只保留手机拍摄的视频（元数据有 make） |
-| `--dry-run` | — | 只扫描、计算分片和 ID，不转码不上传 |
-| `-v` / `--verbose` | 关 | 更详细的终端输出；`-v` 显示 INFO，`-vv` 显示 DEBUG（默认仅 WARNING+） |
-| `--log-file` | `<db>.log` | 详细运行日志文件路径（始终记录 DEBUG 级别） |
-| `--login` | — | 运行 Google OAuth 登录流程，把 `token.json` 存到 `--db` 同目录后退出 |
-| `--client-secret` | `<db目录>/client_secret.json` | `--login` 使用的 `client_secret.json` 路径 |
-| `--web-port` | `8080` | Web 实时控制台与日志查看端口（`0` 为禁用） |
-
----
-
-## Web 实时控制台
-
-TubeTape 内置了轻量级的 Web 运行控制台，无需安装任何额外 Web 服务即可在浏览器中直观监控程序状态与实时日志流。
-
-### 访问方式
-
-- **本地运行**：打开 [http://localhost:8080](http://localhost:8080)
-- **Docker 运行**：打开 `http://<宿主机IP>:8080`（`docker-compose.yml` 已默认映射 `8080:8080` 端口）
-- **自定义端口**：通过 `--web-port <端口>` 修改端口，例如 `--web-port 9090`；传入 `--web-port 0` 可关闭 Web 控制台。
-
-### 功能特性
-
-1. **状态徽标（Status Badge）**：实时展示当前程序所处阶段（如 `scanning`、`planning`、`transcoding ...`、`uploading ...`、`watching ...`）。
-2. **彩色增量日志流**：
-   - 自动按日志级别呈现高亮色彩（`INFO` 浅蓝、`WARNING` 金黄、`ERROR` 红色、`DEBUG` 浅灰）。
-   - 采用文件增量拉取（初次加载自动截取末尾 64KB，后续按 offset 增量轮询），绝不卡顿浏览器。
-3. **便捷交互控制**：
-   - **自动滚动**：默认开启，跟随最新日志自动滚动；点击可切换开启/关闭以查看历史排查。
-   - **清屏**：一键清空当前页面显示，专注查看后续新日志。
-4. **OAuth 回调自动拦截**：
-   - 在进行 Google OAuth 授权时，浏览器跳转至 `http://localhost:8080/?code=...`，Web 服务会自动拦截授权码并提示授权成功，免除手动复杂拼接。
-
----
-
-## 命令例子
-
-### 运行日志
-
-程序运行时会输出三层日志：
-
-1. **终端 stdout —— 友好进度**：扫描进度 `scan [i/N] ... [cache]`、分片规划、正在转码第几片、上传结果、配额用量等。
-2. **`<db>.log` —— 完整审计日志**：默认写到数据库旁（如 `tubetape.json.log`），始终记录带时间戳的 DEBUG 细节（每个文件的哈希、ffprobe/ffmpeg 命令、上传重试、重建步骤、数据库读写等）。
-3. **终端 stderr —— 错误/警告**：默认只显示 WARNING+；加 `-v` 显示 INFO，`-vv` 显示全部 DEBUG。
-
-```bash
-# 默认：stdout 友好进度 + <db>.log 详细日志
-python -m tubetape --input ~/Photos --no-watch
-
-# 终端也要看全部细节（DEBUG）
-python -m tubetape --input ~/Photos --no-watch -vv
-
-# 日志写到指定文件
-python -m tubetape --input ~/Photos --no-watch --log-file /var/log/tubetape.log
-
-# 另开终端实时看详细日志（含缓存命中 [cache]）
-tail -f ~/Photos/tubetape.json.log
-```
-
-> Docker 里：stdout/stderr 用 `docker logs -f tubetape` 看；文件日志在数据库卷里（如 `/db/tubetape.json.log`），可用 `docker exec tubetape tail -f /db/tubetape.json.log` 看。
-
-### 基础用法
-
-```bash
-# 预览当前目录（只读，不写库、不转码、不上传）
-python -m tubetape --dry-run
-
-# 指定输入目录
-python -m tubetape --input ~/Pictures/family --dry-run
-
-# 真实运行（私人，一次性处理完退出）
-python -m tubetape --input ~/Pictures/family --no-watch
-
-# 指定时区（中国大陆照片用 Asia/Shanghai）
-python -m tubetape --input ~/Pictures/family --timezone Asia/Shanghai
-```
-
-### 分片控制
-
-```bash
-# 每片最长 5 分钟
-python -m tubetape --input ~/Photos --segment-duration 5m --dry-run
-
-# 用秒或时钟格式
-python -m tubetape --segment-duration 300s
-python -m tubetape --segment-duration 0:05:00
-
-# 图片每张播 5 秒
-python -m tubetape --image-duration 5
-```
-
-### 持续监控（挂着不管）
-
-```bash
-# 后台挂着：初始处理后，自动检测新文件并上传
-python -m tubetape --input ~/Photos --watch
-
-# 调快检测（5 秒轮询，1 分钟静默）
-python -m tubetape --input ~/Photos --watch --poll-interval 5s --quiet-period 1m
-
-# 后台运行 + 日志
-nohup python -m tubetape --input ~/Photos --watch > tubetape.log 2>&1 &
-```
-
-### 过滤（只处理相机照片 + 手机视频）
-
-```bash
-# 预览会被保留/丢弃的文件
-python -m tubetape --input ~/Photos --only-camera-photos --only-phone-videos --dry-run
-
-# 真实运行：丢弃截图和网络传输的压缩副本
-python -m tubetape --input ~/Photos --only-camera-photos --only-phone-videos
-```
-
-### 转码画质
-
-```bash
-# 更高质量（CRF 16）
-python -m tubetape --crf 16 --dry-run
-
-# 限制到 1080p
-python -m tubetape --max-resolution 1920x1080 --dry-run
-
-# 图片加 Ken Burns 效果
-python -m tubetape --ken-burns
-```
-
-### 隐私 / 播放列表
-
-```bash
-# 上传为 unlisted（知道链接的人可看）
-python -m tubetape --privacy unlisted
-
-# 追加到指定播放列表
-python -m tubetape --playlist PLxxxxxxxxxxxx
-```
-
-### 数据库与配额
-
-```bash
-# 自定义数据库路径（默认 <input>/tubetape.json）
-python -m tubetape --input ~/Photos --db ~/Photos/tubetape.json
-
-# flush：立即把不足时长的队列封片上传
-python -m tubetape --input ~/Photos --flush --no-watch
-```
-
-### 用可执行文件（打包后）
-
-```bash
-# Linux / macOS
-./tubetape --input ~/Photos --dry-run
-
-# Windows
-tubetape.exe --input D:\Photos --dry-run
-```
-
----
-
-## 长期挂机（持续运行）
-
-数据量大时（几万张照片/视频），受配额限制（约 6 片/天）需要连续跑很多天。`--watch` 模式就是为「启动后挂着不管」设计的：watchdog 即时发现新文件 + 目录 mtime 兜底扫描，自动归入分片、自动上传；配额用尽则退避后自动重试。
-
-### 完整启动命令
-
-```bash
-cd TubeTape
-TUBETAPE_TOKEN="$(cat token.json)" nohup python3 -m tubetape \
-    --input /path/to/photos \
-    --timezone Asia/Shanghai \
-    --privacy private \
-    --only-camera-photos \
-    --only-phone-videos \
-    --watch \
-    > /tmp/tubetape.log 2>&1 &
-```
-
-- 默认每片 `1h`。⚠️ **未验证**的 YouTube 账号单视频上限 15 分钟，需加 `--segment-duration 15m`；已验证账号可用默认 `1h`（或更大）减少总片数。
-- `--watch`：持续运行；配额用尽时按 `--quota-backoff`（默认 1 小时）自动重试，不依赖本地额度状态。
-- 日志：`tail -f /tmp/tubetape.log`。
-
-### 运行中增加照片/视频会怎样？
-
-挂着的时候往目录里扔新文件，`--watch` 会自动检测（watchdog 即时 + 目录 mtime 兜底，再加 10 分钟静默期去抖，防拷贝一半）并重新处理。新文件按拍摄时间落入三种情况：
-
-| 新文件拍摄时间 | 行为 | 消耗配额 |
-|---|---|---|
-| 落在**已封口分片**的区间内 | **重建该分片**：转码（并入新文件）→ 上传新片 → 删除旧片 → 更新库（旧 video_id 进 `previous_video_ids`） | 1600 units（一次重传） |
-| 落在所有区间**之外** | 进入待处理队列，攒够 `--segment-duration` 才成片上传 | 成片时 1600 units |
-| 与现有文件**内容重复**（相同哈希） | 自动去重，忽略 | 0 |
-
-> ⚠️ 给已封口分片「加一张照片」会触发该分片重建：转码上传新片、校验通过后删除旧片，消耗一次配额并改变该片 URL。
-
-### 配额与退避重试
-
-- YouTube 每天约 10000 units ≈ 6 次上传（含重建，具体以 YouTube 为准）。
-- 上传被 YouTube 拒绝（`quotaExceeded`）时**优雅暂停本轮**（不崩溃、不丢进度）：已传的分片记录在库，未传的留在队列。
-- 等待 `--quota-backoff`（默认 1 小时）后自动重试；配额在 YouTube 侧重置后自动继续，无需人工干预。
-- 期间随时 Ctrl+C 退出：会先 flush 封片再退出，进度全部落库。
-
-### 停止与重启
-
-```bash
-# 停止（发送退出信号，自动 flush 封片）
-kill -INT <pid>          # 或前台运行时按 Ctrl+C
-
-# 重启后从数据库断点续传，已封口未变更的分片不重复处理
-TUBETAPE_TOKEN="$(cat token.json)" python3 -m tubetape \
-    --input /path/to/photos --timezone Asia/Shanghai --watch
-```
-
-### 正式挂机前先 dry-run 看规模
-
-```bash
-python3 -m tubetape --dry-run --no-watch --input /path/to/photos \
-    --timezone Asia/Shanghai --only-camera-photos --only-phone-videos
-```
-
-输出会告诉你：保留/丢弃多少文件、总共多少分片、总时长多少——据此估算要跑多少天。
-
----
-
-## 过滤：只要相机照片和手机视频
-
-TubeTape 能识别文件「来源」，帮你丢弃截图和网络传输的压缩副本：
-
-| 来源 | 判定依据 |
-|---|---|
-| 相机照片（保留） | EXIF 有 `Make` + `Model`（如 Apple / iPhone 13） |
-| 手机视频（保留） | 视频元数据有 `make`（iPhone/Android 的 `make` 标签） |
-| 截图（丢弃） | 无相机 Make/Model |
-| 网络传输/下载（丢弃） | 无相机元数据（微信/QQ 传输、网页下载等 EXIF 被剥） |
-
-```bash
-python -m tubetape --input ~/Photos --only-camera-photos --only-phone-videos
-```
-
-被过滤的文件会打印 `skipped: <路径> (not a camera photo / not a phone video)`。
-
-> 注意：微信/QQ 传过的照片 EXIF 会被剥掉，即使文件名里有日期，也**不算**相机照片。如果你的某批照片只有微信副本，谨慎开启 `--only-camera-photos`，否则它们会被全部丢弃。建议先 `--dry-run` 看保留/丢弃比例再决定。
-
----
-
-## 数据库
-
-状态存于 `<db>/tubetape.json`，原子写入（临时文件 + rename），崩溃不损坏。结构：
-
-```json
-{
-  "version": 1,
-  "files": { "<file_id>": { "path": "...", "captured_at_utc": "...", "source": "camera", ... } },
-  "segments": { "<segment_id>": { "file_ids": [...], "youtube_video_id": "...", "previous_video_ids": [...], "status": "sealed", ... } }
-}
-```
-
-- `file_id` = 头/中/尾各 64KB + 文件大小的 SHA-256（小文件整读），改路径/改名不变。
-- `segment_id` = sha256(排序后的 file_id 列表 + 分片参数)，内容或参数变了才重建。
-- `previous_video_ids` = 重建替换掉的旧视频 id。
-- `files.*.size_bytes` / `mtime_ns` = 哈希缓存判断依据，扫描时与磁盘 `stat` 比对。
-
----
-
-## 哈希缓存（扫描加速）
-
-第一次扫描要为每个文件读内容算 SHA-256、并为每个视频跑 ffprobe，数据量大时最慢（几十 GB 视频可能要读很久）。之后每次扫描走缓存，未变文件基本秒过。
-
-### 判断依据（全部满足才命中）
-
-| 维度 | 比较内容 |
-|---|---|
-| 相对路径 `rel_path` | 作为缓存键，定位「上次这个文件」 |
-| 大小 `size_bytes` | 当前 `stat` 大小 == 上次记录 |
-| 修改时间 `mtime_ns` | 当前纳秒级 mtime == 上次记录 |
-| 类型 `type` | image / video 没变 |
-
-命中后直接复用上次的 `file_id`（内容哈希）、拍摄时间、分辨率、时长、GPS、来源等，**跳过读文件哈希和 ffprobe/EXIF**。日志中命中文件会带 `[cache]`：
-
-```
-scan [2/26962] a.jpg (image, 2.3 MB) [cache]
-```
-
-### 缓存存在哪里
-
-就存在 `tubetape.json` 的 `files` 记录里（`sha256` + `size_bytes` + `mtime_ns` + 元数据），**没有单独的缓存文件**。
-
-### 中断安全
-
-扫描过程中每 1000 个文件（或每 30 秒）增量保存一次。中途 Ctrl+C / 断电，已扫过的文件已落库，下次扫描直接命中缓存，不用从头再来。
-
-### 注意
-
-- `--dry-run` 不写库，因此**不产生也不更新缓存**；要先生成缓存需真实运行一次。
-- 缓存按「路径 + 大小 + mtime」判断，若内容变了但大小和 mtime 被工具刻意保持原样，会误判为未变（标准取舍，家用场景基本不会遇到）。
-- 文件移动/改名：路径变了会重新哈希，但算出的 `file_id` 不变，仍会被识别为「已处理」。
-- `file_id` 只采样头/中/尾各 64KB + 文件大小；理论上两个大小相同、且这三处内容也完全相同的不同文件会被当成同一个（实际几乎不可能）。可调大代码里的 `HASH_CHUNK` 降低这个概率。
-
----
-
-## 分辨率与画质（保真优先）
-
-每个分片（按拍摄时间打包、最终拼成一个视频）会统一到一个**画布**尺寸：
-
-- **`--canvas-mode max`（默认）**：画布 = 分片内所有文件尺寸的**包围盒**（每个先按 `--max-resolution` 封顶）→ **任何文件都不会被降采样**。
-- `--canvas-mode first`：画布 = 第一个文件（旧行为，可能把后面的高分辨率内容降下来）。
-- 每个文件等比缩放到画布并居中：大的缩小、小的放大、比例不同加黑边（`pad`，不裁切）。
-- 输出分辨率**永远不超过 `--max-resolution`**（默认 8K）。
-
-保真优先默认值：
-
-| 参数 | 默认 | 作用 |
-|---|---|---|
-| `--canvas-mode` | `max` | 不丢高分辨率细节 |
-| `--max-resolution` | `7680x4320` | 上限 8K：≤4K 内容仍 4K，只有真 8K 内容才用 8K；YouTube 对 4K 启用 VP9/AV1 |
-| `--crf` | `16` | 高画质（越小越清晰、文件越大） |
-| `--x264-preset` | `slow` | 同码率伪影更少，二次编码损失更小 |
-| `--fps` | `60` | 不丢 60fps 源的运动细节 |
-
-> ⚠️ 一个视频只能有一个尺寸/宽高比：同一分片里混有不同分辨率/比例的文件时，必然有一方要缩放或加黑边——这是「拼成一个视频」的固有限制。
-
----
-
-## 配额
-
-- YouTube Data API 每天约 **10000 units**，一次 `videos.insert` 约 **1600 units**（约 6 片/天，以 YouTube 为准）。
-- **不在本地维护额度计数**，以 API 返回为准：传不上去（`quotaExceeded`）时本轮立即停止，等 `--quota-backoff`（默认 1 小时）再重试。
-- 被拒的请求不消耗配额，所以按小时轮询安全且自愈；配额在 YouTube 侧重置后自动继续。
-- 运行日志会打印：`quota exhausted ... deferring remaining N segment(s)` 及每次重试。
-
----
-
-## 构建可执行文件
-
-### 本机构建（当前操作系统）
-
-```bash
-pip install pyinstaller
-python scripts/build.py                # 输出 dist/tubetape（Windows 为 tubetape.exe）
-python scripts/build.py --name tube    # 自定义名字
-```
-
-> PyInstaller 不能交叉编译，只能构建「当前系统」的二进制。
-
-### 三平台构建（GitHub Actions）
-
-推送到 GitHub 后，打 tag 或手动触发 workflow，自动产出 Linux / Windows / macOS 三个二进制：
-
-- 打 tag：`git tag v0.1.0 && git push --tags`
-- 或在 GitHub 仓库 Actions 页手动 Run workflow
-- 产物在 Actions 的 Artifacts 里下载（`.github/workflows/build.yml`）
-
-> 可执行文件**不捆绑 ffmpeg**，目标机器仍需安装 ffmpeg。
-
-> ⚠️ **glibc 兼容性**：Linux 可执行文件是在 Ubuntu 22.04（glibc 2.35）上构建的，只能在 glibc ≥ 2.35 的系统运行。若在更旧的系统（如 Debian 11）报 `GLIBC_2.xx not found`，请改用源码运行（`python3 -m tubetape`），或自行在目标系统上 `python scripts/build.py` 构建。
-
----
-
-## Docker
-
-Docker 是**最稳**的运行方式：容器自带 glibc + ffmpeg + 全部 Python 依赖，宿主机只需装 docker，彻底避开可执行文件的 glibc 兼容问题。
-
-**Docker Hub 镜像**：`chet2026/tubetape`
-
-### 快速上手（三步）
-
-```bash
-# ① 放置 Google OAuth 凭据文件
-cp /path/to/client_secret.json .            # 放进 TubeTape 目录（以 ./:/db 挂进容器）
-
-# ② 编辑 docker-compose.yml
-# 将 volumes 下的 /path/to/your/photos 替换为你的宿主机照片视频绝对路径（只读挂载）
-
-# ③ 启动容器并在 Web 控制台完成一键授权
-docker compose up -d
-```
-打开浏览器访问 `http://<宿主机或NAS_IP>:9090/log`：
-- 点击「前往 Google 登录授权」完成授权，`token.json` 自动生成到当前目录，后台全自动开跑！
-- 访问 `http://<宿主机或NAS_IP>:9090/` 即可体验抖音同款全屏时间线画廊。
-
-### Docker Compose（推荐：长期挂机）
-
-仓库自带 `docker-compose.yml`，采用**零 .env 配置**设计。数据库 `tubetape.json`、日志 `tubetape.json.log`、凭据与保留的分段视频 `uploaded_segments/` 均保存在 compose 同目录下。
-
-```bash
-cd TubeTape
-
-# 1. 放入从 GCP 下载的 client_secret.json
+# 将你从 Google Cloud Console 下载的 client_secret.json 拷贝到当前目录
 cp /path/to/client_secret.json .
+```
 
-# 2. 编辑 docker-compose.yml 中的 volumes，填入你的照片目录绝对路径
-#    例如: - /volume1/homes/photos:/data:ro
+#### 2. 创建 `docker-compose.yml`
+直接使用仓库提供的配置文件（或创建如下内容），修改你的照片目录路径：
+```yaml
+services:
+  tubetape:
+    image: chet2026/tubetape:latest
+    container_name: tubetape
+    restart: unless-stopped
+    ports:
+      - "9090:8080"
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      # 【必填】将冒号前的路径改为你宿主机照片/视频的实际绝对路径（只读挂载 :ro）
+      - /volume1/homes/photos:/data:ro
+      # 数据库、日志、OAuth凭据(client_secret.json/token.json)及本地分段视频保存在当前目录
+      - ./:/db
+    command:
+      - --input
+      - /data
+      - --db
+      - /db/tubetape.json
+      - --client-secret
+      - /db/client_secret.json
+      - --timezone
+      - Asia/Shanghai
+      - --privacy
+      - private
+      - --max-resolution
+      - 3840x2160
+      - --segment-duration
+      - "1200s"
+      - --fps
+      - "30"
+      - --keep-segments
+      - "0"                        # 本地保留构建视频数量：0 上传后即删（默认）；设置为 N 保留最新 N 个
+      - --watch                    # 持续监控模式：新照片扔进目录后自动增量打包
+      - -v
+```
 
-# 3. 后台启动
+#### 3. 启动并完成一键 Web 授权
+```bash
+# 启动容器（后台运行）
 docker compose up -d
-
-# 4. 查看日志或状态
-docker compose logs -f      # 实时终端日志
-docker compose ps           # 查看运行状态
-docker compose down         # 停止并删除容器（数据与凭据完整保留）
 ```
+1. 打开浏览器访问：`http://<宿主机或NAS_IP>:9090/log`
+2. 页面顶部会醒目弹出「🔑 需要完成 Google YouTube 授权」卡片。
+3. 点击「🔗 点击前往 Google 账号授权」，在 Google 页面登录并同意权限。
+4. **回调保存**：
+   - 若在本机运行，会自动回调保存凭据；
+   - 若在远程 NAS 上运行，点击授权后浏览器地址栏跳转 `http://localhost:8080/?state=...&code=...`（页面打不开无需理会），**直接复制浏览器地址栏的整条 URL**，粘贴到 Web 卡片输入框中点击「提交凭据」即可。
+5. 授权成功后，当前目录自动生成 `token.json`，后台立即开始扫描与同步，**无需重启容器**！
 
-> 💡 **首次授权**：容器启动后，直接访问 `http://<IP>:9090/log` 网页完成一键授权，无需重启容器即可自动运行！也可使用交互式命令行登录：`docker compose run --rm tubetape --login`。
+#### 4. 畅享体验
+- 访问 `http://<NAS_IP>:9090/`：直接进入沉浸式家庭全屏画廊，上下滑动浏览时光轨迹！
+- 访问 `http://<NAS_IP>:9090/log`：查看实时 Dashboard 统计与运行日志。
 
-### 挂载与参数总览
+---
 
-| 项 | 说明 |
-|---|---|
-| `-v <照片目录>:/data:ro` | 照片/视频目录**只读**挂载到容器内 `/data`，杜绝任何误删风险 |
-| `-v ./:/db` | 数据库 + 哈希缓存 + 详细日志 + OAuth 凭据保存在本地目录 |
-| `uploaded_segments/` | 本地构建视频目录，由 `--keep-segments` 自动轮转管理 |
-| `-e TZ=Asia/Shanghai` | 容器时区（与 `--timezone` 保持一致） |
-| `--keep-segments 0` | 本地保留构建视频数量（0 上传后即删，默认；>0 保留最新 N 个） |
-| `--restart unless-stopped` | 崩溃/宿主机重启自动拉起，长期挂机必备 |
-| `-p 9090:8080` | Web 端口映射：`9090` 为画廊，`9090/log` 为控制台与仪表盘 |
-| `--log-file <path>` | 详细日志路径；默认 `<db>.log`（即 `/db/tubetape.json.log`） |
+### 方式二：Docker CLI 直接运行
 
-> 注意：容器内 `--input` 写挂载路径 `/data`，不是宿主机路径。其它 CLI 参数原样透传。
-
-### 日志 / 停止 / 更新
+如果你不使用 docker-compose，可以使用纯 docker 命令：
 
 ```bash
-docker logs -f tubetape                 # 实时终端日志（stdout/stderr）
-docker logs --tail 200 tubetape         # 最近 200 行
-docker exec tubetape tail -f /db/tubetape.json.log   # 实时详细 DEBUG 日志（含 [cache]）
-
-docker stop tubetape                    # 停止（SIGTERM，会自动 flush 封片再退出）
-docker start tubetape                   # 再次启动（续传，走哈希缓存）
-docker rm tubetape                      # 删除容器（数据卷 tubetape-db 保留）
-
-# 更新到新版本
-docker pull chet2026/tubetape
-docker stop tubetape && docker rm tubetape
-# 然后重新 docker run（同上命令）
-```
-
-### 自己构建并推送到 Docker Hub
-
-脚本默认在构建完成后直接推送到 `chet2026/tubetape`（可用 `TUBETAPE_IMAGE` 环境变量覆盖）。推送前先 `docker login`。
-
-```bash
-./scripts/docker_build.sh                     # 构建并推送 chet2026/tubetape:latest（当前架构）
-./scripts/docker_build.sh v0.1.1              # 构建并推送指定 tag
-./scripts/docker_build.sh v0.1.1 --no-push    # 只构建不推送（本地测试）
-./scripts/docker_build.sh latest --multi      # 多架构 amd64+arm64 构建并推送（需 buildx）
-TUBETAPE_IMAGE=myhub/tubetape ./scripts/docker_build.sh v0.1.1  # 推送到自定义仓库
+docker run -d \
+  --name tubetape \
+  --restart unless-stopped \
+  -p 9090:8080 \
+  -e TZ=Asia/Shanghai \
+  -v /volume1/homes/photos:/data:ro \
+  -v /volume1/docker/tubetape:/db \
+  chet2026/tubetape:latest \
+  --input /data \
+  --db /db/tubetape.json \
+  --client-secret /db/client_secret.json \
+  --timezone Asia/Shanghai \
+  --keep-segments 0 \
+  --watch -v
 ```
 
 ---
 
-## 常见问题
+### 方式三：原生 Python 环境运行
 
-**Q：上传报 `youtubeSignupRequired`？**
-你的 Google 账号还没有 YouTube 频道。去 youtube.com 用同一账号创建频道即可。
-
-**Q：报 `Scope has changed` / OAuth 失败？**
-这是增量授权导致返回的 scope 比请求的多。项目已设置 `OAUTHLIB_RELAX_TOKEN_SCOPE=1` 自动放行；若还报错，删掉 `token.json` 重新 `oauth_login.py`。
-
-**Q：报 `insufficientPermissions` 删不了视频？**
-旧 token 缺 `youtube.force-ssl` scope。重新走 OAuth 拿新 token。
-
-**Q：照片时间全变成拷贝时间？**
-EXIF 被剥（微信/QQ 传输）时会优先用文件名里的时间（如 `2020_12_16_01_00_IMG_6558.JPG`），再不行才用文件 mtime。可用 `--timezone` 指定正确时区。
-
-**Q：dry-run 会不会写库/上传？**
-不会。dry-run 完全只读，不写数据库、不转码、不上传。
-
-**Q：怎么把已上传的测试视频删掉？**
-用 `--privacy private` 上传后，在 YouTube Studio → 内容里手动删除；或用有 `youtube.force-ssl` 权限的脚本调 `videos().delete()`。
-
-**Q：配额不够怎么办？**
-默认约 6 片/天。减少分片数（增大 `--segment-duration`），或等次日自动恢复。
-
-**Q：`client_secret.json` 是干什么的？每次运行都要吗？**
-它是你**应用的身份凭据**（GCP 项目里那个 OAuth 客户端的 `client_id`/`client_secret`），用来向 Google 证明“是哪个应用在请求授权”。
-
-| 阶段 | 需要 `client_secret.json` | 需要 `token.json` |
-|---|---|---|
-| 首次登录 / 重新授权 | ✅ 必须提供 | ❌（由它生成） |
-| 平时运行 / watch | ✅ 必须在配置中指定路径（token 失效或需刷新时自动读取） | ✅（若有效直接使用；若过期且可刷新，自动自愈换新） |
-
-`docker-compose.yml` 默认已配置 `--client-secret /db/client_secret.json`。只要文件放在同目录下，程序在平时启动时就会自动探测 `token.json` 的有效性并在需要时自动完成 Token 刷新。
-
-**Q：Token 过期了需要每周手动登录吗？**
-通常不需要。TubeTape 启动和运行时会自动检测 `token.json` 的有效性。只要存在有效的 `refresh_token`，程序会在后台自动调用 Google API 刷新 Access Token 并将新凭据安全写回 `token.json`（权限 `0600`），全程自愈无需人工干预。仅当 Refresh Token 被手动吊销或彻底失效且处于非交互式后台时，程序才会清晰报错并提示运行一次交互式命令：
-```bash
-docker compose run --rm tubetape --login
-```
-
-**Q：为什么视频标题尾部带有 `[xxxx]`？**
-形如 `[a1b2c3d4e5f67890]` 的标记是该分片内容与转码参数计算出的 16 位唯一短哈希。因为 YouTube API 在列出播放列表视频时可能会将长简介截断，但永远不会截断标题，将短 ID 放在标题尾部能确保云端对账 100% 可靠，彻底杜绝重启或数据库丢失后的重复上传。
-
-**Q：视频简介变成了时间戳列表，怎么用？**
-每个素材文件在视频中的精确起始秒数均生成了一条形如 `0:00 20240101-120000` 的记录。在 YouTube 播放器界面直接点击时间戳（如 `0:03`），即可瞬间跳到该张照片或视频片段，兼顾纯净视觉与快速导航。
-
-**Q：如何访问 Web 实时控制台？**
-`docker-compose.yml` 已经默认暴露了 `8080:8080` 端口。用浏览器直接打开宿主机的 `http://<IP>:8080`，即可看到带色彩高亮的运行日志流、当前运行状态徽标、自动滚动与清屏控制。
-
-**Q：没有 token，Docker 里怎么登录？**
-用内置登录命令（需**交互式**，不能用 `up -d`）：
+适用于开发者或本地调试：
 
 ```bash
-docker compose run --rm tubetape \
-  --db /db/tubetape.json --client-secret /db/client_secret.json --login
+# 1. 克隆代码库
+git clone https://github.com/ouut/TubeTape.git && cd TubeTape
+
+# 2. 安装 Python 运行时依赖（需 Python 3.11+，系统中需已安装 ffmpeg）
+pip install .
+
+# 3. 运行程序（默认开启 Web 8080 端口）
+python -m tubetape \
+  --input /path/to/my/photos \
+  --db ./tubetape.json \
+  --client-secret ./client_secret.json \
+  --keep-segments 3 \
+  -v
 ```
-
-它打印授权 URL → 浏览器同意 → 把跳回 `http://localhost:8080/?code=...` 的整条 URL 粘回终端 → 生成 `/db/token.json`。之后 `docker compose up -d` 即可。
-
-**Q：提示 `no YouTube credentials` / 找不到 token？**
-说明既没有 `<db 目录>/token.json` 也没有提供凭据。启动容器后直接打开 `http://<IP>:9090/log` 一键授权，或先跑一次 `--login` 生成 token（见上一问）。
-
-**Q：别人用这个工具，能用我的 `client_secret.json` 吗？**
-技术上可以：他们会拿到**自己的 `token.json`**、上传到**自己的频道**。但**不建议**，因为 **YouTube API 配额按 GCP 项目算（不是按用户）**：共用你的客户端就是**共用你那 10000 units/天（约 6 片/天）**的配额，会被互相抢光；同意屏幕、测试用户、审核状态也都绑在你的项目上。
-
-**结论：每个使用者自己建一个 GCP 项目 + 自己的 `client_secret.json`**（一次性，几分钟）。你的 `client_secret.json` 只给自己用；`token.json` 更是每人一份。
+浏览器访问 `http://localhost:8080` 即可使用。
 
 ---
 
-## 更新记录
+## Web 交互系统深度指南
 
-- **📱 抖音同款时间线全屏画廊（根路径 `/`）**：沉浸式黑底全屏展示，支持上下滑动切换上一个/下一个素材、双击/手势放大缩小平移、视频静音自动播放与声音开关、右侧纵向时间线滑动条秒级跳转；iPhone HEIC/HEIF 图片服务端智能转码并缓存，视频规范 HTTP 206 Partial Content (Range) 流式传输。
-- **📊 运行控制台与仪表盘（`/log`）**：顶部 Dashboard 实时展示扫描媒体计数与实时进度、时间线全量分片状态（构建进度条、当前处理文件、YouTube 视频直达链接）、本地保留视频统计与当前任务；下方实时日志流前端可自由配置显示最近条数（默认 100 条，可选 50/100/200/500/全部）。
-- **💾 本地分片视频保留控制（`--keep-segments`）**：上传的 MP4 视频保存在 `uploaded_segments/`，非隐藏文件；可指定保留最新 N 个视频（默认 0 上传后即删），自动按修改时间轮转淘汰旧视频。
-- **⚡ 零 `.env` 极简容器配置**：去除 `.env` 文件，Token 由 Web OAuth 自动生成与刷新，媒体目录直接在 `docker-compose.yml` volumes 中配置只读挂载。
-- **Web 实时控制台（默认 8080 端口）**：内置轻量 Web 服务，实时输出带色彩高亮（INFO/WARN/ERROR/DEBUG）的增量日志流与运行状态徽标，支持一键清屏与自动滚动；Docker Compose 默认暴露 `9090:8080`。
-- **标题内嵌短 ID 对账（防截断）**：分片视频标题格式升级为 `{首时间戳} - {末时间戳} [{short_id}]`，彻底根除 YouTube API 截断简介 Marker 导致的云端对账失效与无限重复上传。
-- **纯文件时间戳简介**：视频简介生成每个文件对应的精确跳转时间戳（`0:00 20240101-120000`），在 YouTube 播放器中全量可点击直接跳转，不再受 10 秒章节合并逻辑约束。
-- **10MB 分块断点续传**：改用 10MB 分块（`request.next_chunk()`）执行流式上传并配以指数退避重试，网络超时或断流时在当前 offset 处平滑重试，不重新发起整个视频创建。播放列表加入失败做容错处理。
-- **Token 凭据流自动化与自愈**：统一通过 `ensure_credentials` 管理凭据；`token.json` 过期自动调用 Google API 完成 refresh 并将最新凭据写回磁盘；非交互后台运行遇到未授权提供明确交互式登录命令指引。
-- **规划器边界碰撞消除与 Docker 平稳停机**：对已有分片文件建立归属映射，杜绝同秒跨分片争抢；收到 `SIGTERM`/`SIGINT` 时立即安全停止监控，不再执行耗时的强制 flush，避免 Docker 10 秒超时强制 SIGKILL 产生孤儿视频。
-- **内置登录命令**：新增 `tubetape --login`（配 `--client-secret`），可直接在容器内完成 OAuth 登录并把 `token.json` 写到 `--db` 同目录（Docker 用户不再需要宿主机装 Python）。
-- **保真优先默认值**：`--canvas-mode max`（画布取分片包围盒，不降采样）、`--max-resolution 7680x4320`（上限 8K，≤4K 内容仍 4K）、`--crf 16`、`--x264-preset slow`、`--fps 60`。
-- **上传对账**：上传前用 `channels.list` + `playlistItems.list` 列出频道已有视频，按简介里的 `segment_id` 标记匹配；已上传的直接跳过并补写本地记录（本地库丢失也不会重复上传）。不做自动删除。
-- **配额改为 API 驱动**：去掉本地额度计数与持久化，YouTube 返回 `quotaExceeded` 就暂停本轮，等 `--quota-backoff`（默认 1h）自动重试。
-- **watch 改为事件驱动**：watchdog（inotify/FSEvents）即时发现新文件 + 目录 mtime 兜底扫描（`--mtime-interval` 默认 1h），替代原来每 30s 全量遍历文件。
-- **HEIC/HEIF 支持**：扫描时读取 HEIC/HEIF 的 EXIF（分辨率/拍摄时间/Make/Model），转码前先转成 PNG 再交给 ffmpeg（ffmpeg 通常不带 HEIC 解码器）。新增 `.heif`（图片）和 `.3gp`（视频）格式。
-- **快速采样哈希**：`file_id` 改为「头/中/尾各 64KB + 文件大小」的 SHA-256（小文件整读），首次扫描读取量从 ~百 GB 降到 ~5GB，实测冷缓存约 10 倍、热缓存约 67 倍提速。
-- **哈希缓存**：按「路径 + 大小 + mtime(ns)」复用上次哈希和元数据，重复扫描几乎瞬时；扫描过程中每 1000 文件/30s 增量落盘，中断不丢已扫进度。
-- **详细日志**：终端友好进度 + `<db>.log` 带时间戳 DEBUG 审计日志；`-v`/`-vv` 控制终端详细度，`--log-file` 指定日志路径。
-- **ffprobe 探测**：视频元数据优先用 `ffprobe` 结构化读取，失败时回退 `ffmpeg -i`。
-- **Docker Compose**：`docker-compose.yml` 数据库/哈希缓存/日志/分段保留落在 compose 同目录；构建脚本默认构建并推送 `chet2026/tubetape`。
+TubeTape 内置了专为大屏与移动端设计的双核心 Web 系统：
+
+### 📱 全屏时间线画廊（根路径 `/`）
+
+通过浏览器打开 `http://<IP>:9090/` 即可进入家庭影像全屏画廊：
+
+1. **抖音同款滑动浏览**：
+   - **触屏移动端**：向上滑动切换下一个素材，向下滑动切换上一个素材。
+   - **桌面端**：鼠标滚轮向上/向下滚动切换；键盘 `↑` / `↓` 或 `PageUp` / `PageDown` 切换；右下角提供浮动快捷按钮。
+   - **虚拟三层 DOM 架构**：内存中仅挂载上一张、当前张、下一张三个渲染容器，无论媒体库有 5,000 张还是 50,000 张照片，滑动均如丝般顺滑，杜绝移动端浏览器内存崩溃。
+2. **多级缩放与高清细节检视**：
+   - **双击缩放**：双击图片任意位置，以点击点为核心放大至 2.5 倍高清呈现；再次双击还原。
+   - **触屏双指捏合（Pinch）**：支持流畅的手势缩放。
+   - **拖拽平移**：放大状态下按住鼠标或单指滑动可任意平移画面检视细节。
+3. **视频智能播放与全局声音控制**：
+   - 滑入视频时**自动静音播放**，完全符合各大浏览器原生 Autoplay 策略；滑出时自动暂停。
+   - 顶部提供「🔇 静音 / 🔊 声音」切换开关，开启声音后全局记忆，后续视频自动带声播放。
+   - 单击视频画面可暂停/继续播放，底部配有高精度播放进度指示条。
+4. **右侧纵向时间线滑动条（Scrubber）**：
+   - 屏幕右侧常驻垂直时间轴滑轨，清晰标识素材所跨越的年份与月份分布。
+   - 鼠标悬浮或手指拖动滑轨时，左侧实时弹出浮动日期气泡（例如 `📅 2023-10-15 (第 412 / 1,580 个)`）。
+   - 释放拖拽或点击滑轨任意高度，画面**毫秒级直达**对应时间点的素材！
+5. **高性能服务端转码与流式点播**：
+   - **iPhone 原生 HEIC/HEIF 全兼容**：现代浏览器均不支持 HEIC 图片格式。TubeTape 服务端通过 Pillow/pillow-heif 自动读取 EXIF 旋转角度并转码为高画质 JPEG，持久化缓存在 `.preview_cache/`，秒开秒显。
+   - **HTTP 206 Partial Content (Range) 流式点播**：视频文件严格按照 Range 协议分块供给（2MB 缓冲块），拖动进度条即可即时 Seek，不占用整片下载带宽。
+
+---
+
+### 📊 运行控制台与仪表盘（`/log` 与 `/logs`）
+
+通过浏览器打开 `http://<IP>:9090/log`：
+
+1. **顶部实时 Dashboard 仪表卡片**：
+   - **扫描进度 / 媒体总数**：显示已入库媒体总数；若后台正在扫描，实时展示当前扫描进度计数及正在检查的文件相对路径。
+   - **时间线分段 (Segments)**：展示规划的总分段数，以及 `已上传: X | 待构建: Y` 的实时对比。
+   - **本地磁盘保留视频**：展示当前存放在 `uploaded_segments/` 目录中的本地构建视频数量，以及配置的 `--keep-segments` 限制。
+   - **当前运行任务**：清晰展示后台状态（`idle` 空闲、`scanning` 扫描中、`transcoding` 正在转码、`uploading` 正在上传、`watching` 常驻监听等）。
+2. **时间线分段列表 (Timeline Segments)**：
+   - 以时间先后顺序清晰罗列每一个时间胶囊分片。
+   - **分段标题与区间**：例如 `20240101-100000 - 20240101-102000 [a1b2c3d4e5f6]`。
+   - **媒体数量与时长**：展示分段内聚合的照片/视频数量与实际秒数。
+   - **动态构建进度**：正在转码的分段会动态显示百分比进度条、已完成文件数（如 `15/45`）及当前正在送入 ffmpeg 处理的素材文件名。
+   - **YouTube 视频直达链接**：上传成功后，展示带有播放图标的链接 `▶️ 查看视频 (ID: xxxxx)`，点击直接打开 YouTube 播放。
+3. **实时运行日志与条数过滤**：
+   - **色彩高亮**：`INFO` 呈现亮蓝、`WARNING` 呈现鲜黄、`ERROR` 呈现亮红、`DEBUG` 呈现灰色。
+   - **前端条数过滤**：下拉菜单支持自由选择展示最近日志条数（**默认 100 条**，可选 50 条、100 条、200 条、500 条或全量显示），长期挂机再也不用担心浏览器 DOM 节点过多卡死。
+   - **控制开关**：提供「自动滚动：开/关」切换与「清屏」功能。
+
+---
+
+### 🔑 Google YouTube OAuth 授权指南
+
+YouTube API 免费向所有个人开发者开放（每日配额 10,000 units，上传一个视频消耗 1,600 units，每日可上传约 6 部 20 分钟的 4K 高清分片）。
+
+#### 一次性获取 `client_secret.json` 步骤：
+1. 访问 [Google Cloud Console](https://console.cloud.google.com/) 创建一个新项目（例如命名为 `My-TubeTape`）。
+2. 进入 **API 和服务 → 库**，搜索并启用 **YouTube Data API v3**。
+3. 进入 **API 和服务 → OAuth 同意屏幕**：
+   - 用户类型选择 **外部 (External)**。
+   - 填写应用名称（如 `TubeTape`）与支持邮箱。
+   - **测试用户 (Test Users)**：添加你自己的 Google 账号邮箱。
+   - 权限范围 (Scopes) 添加：`https://www.googleapis.com/auth/youtube.force-ssl`。
+   - 发布状态：个人自用点击 **Publish app（发布应用）** 进入生产状态（生产状态下个人自用无需 Google 商业审核，Refresh Token 永久有效不再过期）。
+4. 进入 **API 和服务 → 凭据 → 创建凭据 → OAuth 客户端 ID**：
+   - 应用类型选择 **桌面应用 (Desktop App)**。
+   - 创建后点击 **下载 JSON**，重命名为 `client_secret.json` 并放入 TubeTape 工作目录。
+
+---
+
+## 参数完全手册（CLI Options Reference）
+
+TubeTape 提供丰富、专业且经过严谨工程校验的命令行参数，所有参数均支持直接在 `docker-compose.yml` 的 `command` 列表中声明，或在终端命令行中使用。
+
+### 1. 基础与存储参数
+
+| 参数名 | 类型 / 取值 | 默认值 | 详细说明 | 实用示例 |
+|---|---|---|---|---|
+| `--input` | 路径字符串 | `.` | 指定待扫描的照片和视频根目录路径。在 Docker 中映射为挂载目录（如 `/data`）。 | `--input /data` |
+| `--db` | 文件路径 | `<input>/tubetape.json` | 核心 JSON 数据库文件路径。存储文件哈希缓存、元数据与已上传视频记录。若未指定，默认保存在输入目录同级。 | `--db /db/tubetape.json` |
+| `--client-secret` | 文件路径 | `<db目录>/client_secret.json` | Google Cloud OAuth 客户端密钥文件路径。若未显式指定，默认在数据库同级目录查找。 | `--client-secret /db/client_secret.json` |
+| `--login` | 开关标记 | `False` | 纯终端交互式登录流程开关。执行该参数时会启动 OAuth 换取流程，成功生成 `token.json` 后立即退出。 | `--login` |
+
+---
+
+### 2. 时间线与分段规划参数
+
+| 参数名 | 类型 / 取值 | 默认值 | 详细说明 | 实用示例 |
+|---|---|---|---|---|
+| `--segment-duration` | 时长表达式 | `1h` (3600秒) | 每个视频分段的目标最大时长上限。支持多种时间格式：`1h`、`20m`、`1200s`、`0:20:00`。达到此时长后分片将自动封口。 | `--segment-duration 1200s` |
+| `--image-duration` | 时长表达式 / 浮点数 | `3.0` (秒) | 静态照片转换为视频时的持续播放时长。默认每张照片播放 3 秒。 | `--image-duration 2.5` |
+| `--timezone` | 时区名称字符串 | 系统本地时区 | 用于解释没有时区信息的照片 EXIF 拍摄时间。支持所有标准 IANA 时区（如 `Asia/Shanghai`、`America/New_York`）。 | `--timezone Asia/Shanghai` |
+| `--only-camera-photos` | 开关标记 | `False` | 严格相机素材过滤：仅保留 EXIF 中具备相机制造厂商（`Make`）与型号（`Model`）的照片，自动剔除手机截屏、网络聊天下载图片。 | `--only-camera-photos` |
+| `--only-phone-videos` | 开关标记 | `False` | 严格手机视频过滤：仅保留元数据中包含相机厂商信息的手机实拍视频，自动过滤录屏、网络转存或二道压缩视频。 | `--only-phone-videos` |
+| `--flush` | 开关标记 | `False` | 强制清空待定队列：正常情况下末尾不足分段时长的文件会被暂存（Pending Queue），加上此参数会强制将剩余素材封口并立即转码上传。 | `--flush` |
+
+---
+
+### 3. 画质与视频编码参数
+
+| 参数名 | 类型 / 取值 | 默认值 | 详细说明 | 实用示例 |
+|---|---|---|---|---|
+| `--crf` | 整数 (≥ 0) | `16` | x264 编码恒定速率因子（CRF）。数值越小画质越好，16 属于视觉无损级别的电影级高保真参数。推荐范围 16~23。 | `--crf 18` |
+| `--max-resolution` | 分辨率 `宽x高` | `7680x4320` | 画布上限包围盒。默认 8K（7680x4320）。TubeTape 绝不上采样；全片素材不超过 4K 时输出 4K，不超过 1080p 时输出 1080p。 | `--max-resolution 3840x2160` |
+| `--canvas-mode` | `max` 或 `first` | `max` | 分片画布决议模式：`max` 会计算分片内所有照片视频的最大包围盒，确保任何纵向/横向素材均不被降采样；`first` 则以第一个素材分辨率为准。 | `--canvas-mode max` |
+| `--fps` | 整数 (> 0) | `60` | 输出视频帧率。默认 60 帧，能完美保留现代手机录制的 60FPS 流畅动态；若对转码速度敏感可设为 30。 | `--fps 30` |
+| `--x264-preset` | 编码预设 | `slow` | ffmpeg x264 压缩预设。可选：`ultrafast`、`superfast`、`veryfast`、`faster`、`fast`、`medium`、`slow`、`slower`、`veryslow`。越慢压缩率与画质越优。 | `--x264-preset medium` |
+| `--ken-burns` | 开关标记 | `False` | 动态运镜效果：对静态照片启用缓慢平移与缩放的 Ken Burns 滤镜，使照片播放更具电影纪录片感。 | `--ken-burns` |
+
+---
+
+### 4. YouTube 与云端参数
+
+| 参数名 | 类型 / 取值 | 默认值 | 详细说明 | 实用示例 |
+|---|---|---|---|---|
+| `--privacy` | `private` 或 `unlisted` | `private` | 上传到 YouTube 的视频隐私等级：`private` 为私人视频（仅自己可见），`unlisted` 为不公开视频（拥有链接者可见）。 | `--privacy private` |
+| `--playlist` | 播放列表 ID 字符串 | `None` | 上传成功后自动归入指定的 YouTube 播放列表（Playlist ID）。分片将按拍摄时间顺序追加。 | `--playlist PLxxxxxxxx` |
+| `--quota-backoff` | 时长表达式 | `1h` (3600秒) | 当 YouTube API 返回上传配额耗尽（`quotaExceeded`）时，后台休眠退避的时长。支持 `1h`、`30m` 等。 | `--quota-backoff 1h` |
+
+---
+
+### 5. 持续监控（Watch）与去抖参数
+
+| 参数名 | 类型 / 取值 | 默认值 | 详细说明 | 实用示例 |
+|---|---|---|---|---|
+| `--watch` / `--no-watch` | 布尔开关 | `--watch` (开启) | 持续文件监控模式。开启后利用 watchdog（inotify/FSEvents）长效监听目录；传入 `--no-watch` 则处理完现有文件后退出。 | `--no-watch` |
+| `--quiet-period` | 时长表达式 | `10m` (600秒) | 监控模式静默等待期：检测到新文件添加后，等待 10 分钟没有新写入事件才触发处理，防止照片还在网络传输/拷贝一半就被提前切片。 | `--quiet-period 5m` |
+| `--poll-interval` | 时长表达式 | `30s` (30秒) | 监控模式内部事件驱动轮询 tick 周期。 | `--poll-interval 15s` |
+| `--mtime-interval` | 时长表达式 | `1h` (3600秒) | 目录 mtime 安全网兜底扫描间隔：定期执行轻量级巡检，用于捕获某些网络共享存储（NFS/SMB）可能丢失的文件系统事件。 | `--mtime-interval 30m` |
+
+---
+
+### 6. Web 服务与本地分段保留参数
+
+| 参数名 | 类型 / 取值 | 默认值 | 详细说明 | 实用示例 |
+|---|---|---|---|---|
+| `--web-port` | 整数 (0~65535) | `8080` | 内置 Web 服务监听端口（画廊 `/`、仪表盘 `/log`）。传入 `0` 表示彻底禁用内置 Web 服务。 | `--web-port 8080` |
+| `--keep-segments` | 整数 (≥ 0) | `0` | 上传成功后在本地 `uploaded_segments/` 目录保留的最新分段视频数量。`0` 表示即传即删（不占磁盘）；设置为 $N$（如 `3`）时仅保留最新 $N$ 个视频，自动轮转删除旧视频。 | `--keep-segments 3` |
+
+---
+
+### 7. 日志与调试参数
+
+| 参数名 | 类型 / 取值 | 默认值 | 详细说明 | 实用示例 |
+|---|---|---|---|---|
+| `-v` / `--verbose` | 计数累加 | `0` (仅 WARNING+) | 终端日志详细度。不传显示 WARNING+；一个 `-v` 显示 INFO 信息；两个 `-vv` 显示最详尽的底层 DEBUG 信息（含哈希缓存命中情况）。 | `-v` 或 `-vv` |
+| `--log-file` | 文件路径 | `<db>.log` | 详细 DEBUG 审计日志输出路径。默认生成在 `<db路径>.log`，不受 `-v` 控制，全量持久化所有纳秒级哈希、转码与网络事件。 | `--log-file /db/audit.log` |
+| `--dry-run` | 开关标记 | `False` | 演练预检模式：执行完整的目录扫描、元数据解析与分片规划计算，但不调用 ffmpeg、不上载云端、不写数据库。安全零风险。 | `--dry-run` |
+
+---
+
+### 常用场景推荐参数组合
+
+#### 1. 家庭 NAS 长期挂机（兼顾 4K 画质与极速备份）
+```bash
+docker compose up -d
+# 对应参数:
+# --segment-duration 1200s --max-resolution 3840x2160 --fps 30 --crf 18 --keep-segments 0 --watch -v
+```
+- 分片时长 20 分钟（方便单片回放与 YouTube 处理）；
+- 画布 4K 30FPS，在保证极高视觉质量的同时大幅减少 NAS CPU 负担；
+- 上传后不占本地磁盘。
+
+#### 2. 极致发烧友归档（8K 60FPS 影院级母带参数）
+```bash
+python -m tubetape \
+  --input /photos --segment-duration 1h \
+  --max-resolution 7680x4320 --fps 60 --crf 16 --x264-preset slow \
+  --keep-segments 5 --watch -v
+```
+- 保留最新 5 部高清分段在本地 `uploaded_segments/`，其余同步至 YouTube 备份。
+
+#### 3. 过滤非家庭实拍（丢弃截图与转发文件）
+```bash
+python -m tubetape \
+  --input /photos \
+  --only-camera-photos --only-phone-videos \
+  --watch -v
+```
+
+---
+
+## 本地数据存储结构与安全规范
+
+当 TubeTape 启动后，宿主机工作目录的典型文件布局如下：
+
+```
+TubeTape/
+├── docker-compose.yml           # 容器配置
+├── client_secret.json           # [只读] Google Cloud OAuth 客户端文件
+├── token.json                   # [读写 0600] 授权后的 YouTube 凭据（程序自动刷新）
+├── tubetape.json                # [读写] 核心数据库（原子写入，含扫描缓存与已传记录）
+├── tubetape.json.log            # [读写] 详细 DEBUG 审计日志
+├── uploaded_segments/           # [读写] 本地分段视频目录（由 --keep-segments 管理）
+│   ├── 20240101-100000 - 20240101-102000 [a1b2c3d4e5f6].mp4
+│   └── 20240101-102000 - 20240101-104000 [7890abcdef12].mp4
+└── .preview_cache/              # [内部缓存] HEIC/HEIF 图片转换后的缩略缓存
+```
+
+### 🛡️ 源文件绝对保护原则
+- 原始家庭媒体目录在容器内**必须只读挂载**（`:ro`）。
+- TubeTape 从代码层面只有读操作（读取 EXIF、计算采样哈希、提取视频帧），任何转码临时文件均在隔离目录生成，**绝对不会修改、覆盖或删除用户的原始照片和视频**。
+
+---
+
+## 常见问题 FAQ
+
+### Q1：YouTube 上传配额用完了会怎样？
+- YouTube Data API 默认给每个项目每日 10,000 units 配额。
+- 每次上传一个视频消耗约 1,600 units，因此每天大约能上传 6 个分段（若每片 20 分钟，每天可同步 2 小时的高清内容）。
+- 当遇到配额上限时，TubeTape 会记录 `YouTube quota exhausted` 并自动休眠退避（默认 1 小时）。次日太平洋时间午夜 Google 配额自动刷新后，TubeTape 会平稳自动继续上传，**无需人工干预**。
+
+### Q2：为什么视频标题里有 `[{short_id}]` 这种奇怪字符？
+- 这是 TubeTape 独创的**防截断云端对账标记**。
+- YouTube API 会在视频发布后对长简介执行截断或清洗，导致传统的简介 Marker 对账机制丢失。
+- 将分片唯一指纹短哈希（`sha256(file_ids + params)[:16]`）嵌入标题末尾，永远不会被截断。本地哪怕数据库完全丢失或更换新电脑，TubeTape 联网瞬间就能比对出云端已存在哪些分片，**绝对不会重复上传**。
+
+### Q3：为什么视频简介里的时间戳可以点击跳转？
+- TubeTape 在转码过程中精确记录了每一张照片与每一段视频在合成片中的准确起止秒数。
+- 生成的简介严格符合 YouTube 播放器识别规范（例如 `0:00 20240101-120000`、`0:03 20240101-120003`）。在 YouTube 播放器中，这些时间戳全量可点击直接跳播。
+
+### Q4：多台设备或朋友能共用我的 `client_secret.json` 吗？
+- **强烈不建议**。因为 YouTube API 的配额是绑定在 Google Cloud 项目上的，如果多人共用同一个 `client_secret.json`，每天 10,000 点配额会被互相抢光。
+- 建议每个使用者独立花 3 分钟按照本指南创建属于自己的 GCP 项目与客户端密钥。
 
 ---
 
 ## 许可证
 
-（按需填写，例如 MIT）
+本项目基于 [MIT 许可证](LICENSE) 开源。欢迎提交 Issue 与 Pull Request 共同完善！
