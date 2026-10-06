@@ -20,3 +20,4 @@ dist/
 *.spec
 
 uploaded_segments
+.preview_cache
