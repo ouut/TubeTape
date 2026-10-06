@@ -20,6 +20,7 @@
 | M10 | 容器化、跨平台打包与运维发布 | `Dockerfile`、`docker-compose.yml`、`tubetape.spec`、`scripts/`、`docs/` | PyInstaller（build） |
 | M11 | Web 实时控制台、OAuth 自愈与分块断点续传 | `web.py`、`uploader.py`、`auth.py`、`test_web.py` | — |
 | M12 | 方案 A 一体化 Web OAuth 授权流 | `auth.py`、`web.py`、`cli.py`、`test_auth.py`、`test_web.py` | — |
+| M13 | 时间线全屏画廊、仪表盘与日志过滤、本地分片轮转 | `web.py`、`cli.py`、`test_cli.py`、`test_web.py` | — |
 
 ## 目录结构
 
@@ -158,6 +159,7 @@ TubeTape/
    | `--login` | 关 | 启动 Google OAuth 授权流程生成 `token.json` 后退出 |
    | `--client-secret` | `<db目录>/client_secret.json` | `--login` 所用的凭据文件路径 |
    | `--web-port` | `8080` | Web 实时控制台与日志查看端口（0为禁用） |
+   | `--keep-segments` | `0` | 上传后在 `uploaded_segments/` 目录保留的最新分段视频数量（0为上传后立即删除） |
 
 3. `durations.py`：
    - `parse_duration("1h" | "20m" | "1200s" | "0:20:00" | "1200") -> float 秒`，非法输入抛出清晰错误。
@@ -568,6 +570,30 @@ TubeTape/
 - `test_auth.py` 覆盖 `OAuthSession` 纯 code 与完整 URL 换取、异常输入处理及 Web 授权等待。
 - `test_web.py` 覆盖 `/api/auth/submit` POST 换取、GET 回调兑换、状态同步与超时处理。
 - 全部 243 项单元测试 100% 通过。
+
+---
+
+## M13：时间线全屏画廊、仪表盘与日志过滤、本地分片轮转
+
+**目标**：
+1. 去除 `.env` 配置文件，媒体目录直接通过 `docker-compose.yml` 挂载，Token 凭据由 Web OAuth 流程全自动管理。
+2. 增加 `--keep-segments` 启动参数与本地分片轮转逻辑（保存在 `uploaded_segments/`，非隐藏 mp4 文件），按 mtime 保留最新 N 个分片，0 为上传后立即删除。
+3. 实现 `/log`（与 `/logs`）仪表盘与日志流控制台：
+   - 顶部 Dashboard：展示全量时间线 segment 条目状态（已构建/正在构建及进度与当前处理文件/等待构建/已上传带 YouTube 视频 ID 直达链接）、扫描媒体总数与实时扫描进度、磁盘保留视频数量与限制、当前任务。
+   - 下方实时日志打印：前端可配置显示最近 N 条（默认 100 条，可选 50、100、200、500、全部）。
+4. 实现 `/` 抖音同款全屏时间线画廊：
+   - 全屏沉浸式黑底展示，上下滑动（触屏上下滑、滚轮、方向键 ↑/↓）无缝切换上一个/下一个素材。
+   - 照片支持双击放大/还原、触屏捏合手势缩放、拖拽平移。
+   - 视频支持静音自动播放（满足浏览器策略）、声音全局一键切换、点击播放/暂停、播放进度条。
+   - 右侧纵向交互式时间线滑动条（Scrubber）：悬浮/拖动展示日期浮动气泡，拖动或点击即可秒级跳转至目标时间点。
+   - 服务端 iPhone HEIC/HEIF 图片按需自动转码 JPEG 并缓存至 `.preview_cache/`，视频采用 HTTP 206 Partial Content (Range) 规范流式传输。
+
+**交付**：`tubetape/web.py`、`tubetape/cli.py`、`tests/test_cli.py`、`tests/test_web.py`。
+
+**验收标准**：
+- `test_cli.py` 覆盖 `--keep-segments` 参数解析与 `rotate_uploaded_segments` 轮转测试（0 删除全部，N 保留最新 N 个）。
+- `test_web.py` 覆盖 `/log` 页面、`/api/dashboard`、`/api/media/summary`、`/api/media/items`、`/api/media/view`（图片转换）及 `/api/media/stream`（HTTP 206 Range 视频分段流式传输）。
+- 全部 249 项单元测试 100% 通过。
 
 ---
 

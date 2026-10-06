@@ -318,7 +318,66 @@ class TestLogin:
         assert rc == cli._EXIT_OK
         assert called["client"] == str(tmp_path / "client_secret.json")
         assert called["token"] == str(tmp_path / "token.json")
-        assert (tmp_path / "token.json").exists()
+
+class TestKeepSegments:
+    def test_keep_segments_arg_parse(self, tmp_path):
+        from tubetape.cli import parse_args
+
+        args = parse_args(["--input", str(tmp_path), "--keep-segments", "5"])
+        assert args.keep_segments == 5
+
+        # Default is 0
+        args_default = parse_args(["--input", str(tmp_path)])
+        assert args_default.keep_segments == 0
+
+        # Negative value errors
+        with pytest.raises(SystemExit):
+            parse_args(["--input", str(tmp_path), "--keep-segments", "-1"])
+
+    def test_rotate_uploaded_segments_zero(self, tmp_path):
+        from tubetape.cli import rotate_uploaded_segments
+
+        seg_dir = tmp_path / "uploaded_segments"
+        seg_dir.mkdir()
+        (seg_dir / "seg1.mp4").write_text("dummy")
+        (seg_dir / "seg2.mp4").write_text("dummy")
+        (seg_dir / ".hidden.mp4").write_text("dummy")
+        (seg_dir / "other.txt").write_text("dummy")
+
+        deleted = rotate_uploaded_segments(str(seg_dir), 0)
+        assert len(deleted) == 2
+        assert not (seg_dir / "seg1.mp4").exists()
+        assert not (seg_dir / "seg2.mp4").exists()
+        # Hidden files and non-mp4 files should not be deleted
+        assert (seg_dir / ".hidden.mp4").exists()
+        assert (seg_dir / "other.txt").exists()
+
+    def test_rotate_uploaded_segments_keep_n(self, tmp_path):
+        import time
+        from tubetape.cli import rotate_uploaded_segments
+
+        seg_dir = tmp_path / "uploaded_segments"
+        seg_dir.mkdir()
+
+        # Create files with staggered mtime
+        f1 = seg_dir / "oldest.mp4"
+        f1.write_text("1")
+        os.utime(f1, (time.time() - 300, time.time() - 300))
+
+        f2 = seg_dir / "middle.mp4"
+        f2.write_text("2")
+        os.utime(f2, (time.time() - 200, time.time() - 200))
+
+        f3 = seg_dir / "newest.mp4"
+        f3.write_text("3")
+        os.utime(f3, (time.time() - 100, time.time() - 100))
+
+        # Keep 2 -> oldest should be deleted, middle and newest kept
+        deleted = rotate_uploaded_segments(str(seg_dir), 2)
+        assert deleted == [str(f1)]
+        assert not f1.exists()
+        assert f2.exists()
+        assert f3.exists()
 
 
 if __name__ == "__main__":

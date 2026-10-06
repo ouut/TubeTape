@@ -1,53 +1,51 @@
-# TubeTape 长期挂机（参数与 README「长期挂机（持续运行）」的 Docker 示例一致）
+# TubeTape 长期挂机运行配置
 #
 # 挂载（见下方 volumes）：
-#   ./           -> /db    （读写）：数据库、日志、OAuth 凭据都放这里
-#   ${MEDIA_DIR} -> /data  （只读）：照片/视频目录
+#   /path/to/your/photos -> /data  （只读）：宿主机照片/视频目录，请直接修改为实际绝对路径
+#   ./                   -> /db    （读写）：数据库、日志、本地分片、OAuth 凭据都保存在此
 #
-# OAuth 凭据放哪里（因为 ./ 挂成了 /db）：
-#   - client_secret.json：放到【本文件同目录】，容器内就是 /db/client_secret.json
-#   - token.json：登录后自动生成到【本文件同目录】，容器内就是 /db/token.json
+# OAuth 凭据位置（./ 挂载为 /db）：
+#   - client_secret.json：放到本文件同目录，容器内即为 /db/client_secret.json
+#   - token.json：Web 登录后自动生成到本文件同目录，容器内即为 /db/token.json
 #
-# 准备：
-#   1. cp .env.example .env
-#   2. 编辑 .env：填 MEDIA_DIR（宿主机照片目录绝对路径）；TUBETAPE_TOKEN 留空
-#   3. 将 client_secret.json 放入本文件同目录下
-#   4. 直接启动：
+# 准备与运行：
+#   1. 将 client_secret.json 放入本文件同目录下
+#   2. 修改下方 volumes 中的 /path/to/your/photos 为你的照片视频绝对路径
+#   3. 直接后台启动：
 #        docker compose up -d
-#   5. 首次授权（一体化 Web OAuth，无需命令行交互）：
-#        浏览器打开 http://<NAS或本机IP>:8080 控制台，点击「一键授权」完成绑定。
-#        授权成功后 token.json 自动保存在本目录，程序自动在后台继续扫描与上传！
-#        （也可在纯终端环境运行交互式登录：docker compose run --rm tubetape --login）
+#   4. 首次授权与状态查看：
+#        浏览器打开 http://<NAS或本机IP>:9090 控制台（对应容器 8080 端口），点击「一键授权」完成绑定。
+#        授权成功后 token.json 自动落盘，程序在后台自动扫描与上传！
+#        （也可使用纯终端方式登录：docker compose run --rm tubetape --login）
+#   5. 浏览家庭影院：
+#        浏览器打开 http://<NAS或本机IP>:9090 直接进入全屏沉浸式照片视频时间线（类似抖音滑动浏览）！
+#        管理与日志控制台请访问 http://<NAS或本机IP>:9090/log
 #
 # 常用命令：
 #   docker compose logs -f                                        # 实时终端日志
 #   docker compose exec tubetape tail -f /db/tubetape.json.log    # 详细 DEBUG 日志（含 [cache]）
-#   docker compose down                                           # 停止并删除容器（数据/日志/凭据保留在本目录）
-
+#   docker compose down                                           # 停止容器（数据/日志/凭据完整保留）
 
 services:
   tubetape:
     image: chet2026/tubetape
     container_name: tubetape
     restart: unless-stopped
-    env_file: .env
     ports:
       - "9090:8080"
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      # 照片/视频目录：只读挂载进容器 /data
-      - "${MEDIA_DIR:?请在 .env 中设置 MEDIA_DIR}:/data:ro"
-      # 数据库 + 哈希缓存 + 日志 + OAuth 凭据(client_secret.json/token.json)：都落在
-      # docker-compose.yml 同目录（容器内 /db）
+      # 照片/视频目录：只读挂载进容器 /data，请将冒号前的路径修改为你的宿主机实际路径
+      - /path/to/your/photos:/data:ro
+      # 数据库 + 哈希缓存 + 日志 + 凭据(client_secret.json/token.json) + uploaded_segments 本地视频
       - ./:/db
     command:
       - --input
       - /data
       - --db
       - /db/tubetape.json
-      # client_secret.json 放在 ./ （= /db）。此项只在 --login 时用到，
-      # 平时运行忽略；写在这里是为了显式声明路径。
+      # client_secret.json 显式声明路径
       - --client-secret
       - /db/client_secret.json
       - --timezone
@@ -60,6 +58,9 @@ services:
       - "1200s"
       - --fps
       - "30"
+      # 本地保留构建视频数量：0 表示上传后即删，3 表示保留最新的 3 个视频在 uploaded_segments/ 目录下
+      - --keep-segments
+      - "0"
       # 下面两行按需保留：只处理相机照片 + 手机视频，丢弃截图/网络传输副本
       #- --only-camera-photos
       #- --only-phone-videos

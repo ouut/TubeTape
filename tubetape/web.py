@@ -1,4 +1,4 @@
-"""Lightweight HTTP server for live log viewing and OAuth callbacks.
+"""Lightweight HTTP server for timeline viewer, dashboard, live logs, and OAuth callbacks.
 
 Runs in a daemon thread so it never blocks or prevents clean shutdown.
 """
@@ -29,6 +29,26 @@ _server_state = {
     "is_running": False,
     "host": "0.0.0.0",
     "port": 8080,
+    "media_dir": None,
+    "db": None,
+    "db_path": None,
+    "keep_segments": 0,
+    "scanner": {
+        "is_scanning": False,
+        "count": 0,
+        "current": None,
+    },
+    "transcode": {
+        "segment_id": None,
+        "title": None,
+        "done": 0,
+        "total": 0,
+        "current_file": None,
+    },
+    "planned_segments": [],
+    "_file_cache": None,
+    "_file_cache_db_len": -1,
+    "_date_groups_cache": None,
 }
 
 
@@ -50,6 +70,68 @@ def set_web_status(status: str, task: str = "") -> None:
 
 def set_web_log_file(path: str) -> None:
     _server_state["log_file"] = path
+
+
+def set_web_context(
+    media_dir: str | None = None,
+    db=None,
+    db_path: str | None = None,
+    keep_segments: int = 0,
+) -> None:
+    """Set media directory, database instance/path, and keep_segments limit."""
+    if media_dir:
+        _server_state["media_dir"] = os.path.abspath(media_dir)
+    if db is not None:
+        _server_state["db"] = db
+        _server_state["_file_cache"] = None
+        _server_state["_date_groups_cache"] = None
+    if db_path:
+        _server_state["db_path"] = os.path.abspath(db_path)
+    _server_state["keep_segments"] = max(0, keep_segments)
+
+
+def update_web_scanner(is_scanning: bool, count: int = 0, current: str | None = None) -> None:
+    """Update scanner state for real-time progress display in dashboard."""
+    _server_state["scanner"]["is_scanning"] = is_scanning
+    _server_state["scanner"]["count"] = count
+    if current is not None:
+        _server_state["scanner"]["current"] = current
+    elif not is_scanning:
+        _server_state["scanner"]["current"] = None
+
+
+def set_web_planned_segments(segments: list) -> None:
+    """Register the planned segments for the current run."""
+    _server_state["planned_segments"] = list(segments)
+
+
+def update_web_transcode(
+    segment_id: str,
+    title: str,
+    done: int,
+    total: int,
+    current_file: str,
+) -> None:
+    """Update transcode progress for real-time progress display in dashboard."""
+    _server_state["transcode"] = {
+        "segment_id": segment_id,
+        "title": title,
+        "done": done,
+        "total": total,
+        "current_file": current_file,
+    }
+
+
+def finish_web_segment(segment_id: str, youtube_video_id: str | None = None) -> None:
+    """Mark a segment as finished transcoding / uploading."""
+    if _server_state["transcode"].get("segment_id") == segment_id:
+        _server_state["transcode"] = {
+            "segment_id": None,
+            "title": None,
+            "done": 0,
+            "total": 0,
+            "current_file": None,
+        }
 
 
 def set_web_oauth_session(session) -> None:
@@ -107,22 +189,905 @@ def get_auth_code(timeout: float = 300.0) -> str | None:
         return None
 
 
-_HTML_PAGE = """<!DOCTYPE html>
+def get_db():
+    """Get active Database object or attempt to load from db_path."""
+    db = _server_state.get("db")
+    if db is not None:
+        return db
+    db_path = _server_state.get("db_path")
+    if db_path and os.path.exists(db_path):
+        from .db import Database
+
+        try:
+            db = Database.load(db_path)
+            _server_state["db"] = db
+            return db
+        except Exception as exc:
+            _logger.debug("could not load db from %s: %s", db_path, exc)
+            return None
+    return None
+
+
+def _get_sorted_media_files() -> list[dict]:
+    """Return all media files in chronological order (earliest first)."""
+    db = get_db()
+    if not db or not db.files:
+        return []
+
+    cache = _server_state.get("_file_cache")
+    if cache is not None and _server_state.get("_file_cache_db_len") == len(db.files):
+        return cache
+
+    file_list = []
+    for fid, f in db.files.items():
+        file_list.append(
+            {
+                "id": fid,
+                "name": f.get("name") or os.path.basename(f.get("path", "")),
+                "rel_path": f.get("path") or "",
+                "type": f.get("type", "image"),
+                "captured_at": f.get("captured_at_utc") or "",
+                "resolution": f.get("resolution") or "",
+                "duration": float(f.get("duration_seconds") or 0.0),
+                "size": int(f.get("size_bytes") or 0),
+            }
+        )
+
+    def sort_key(item: dict):
+        cap = item["captured_at"]
+        return (0 if cap else 1, cap, item["rel_path"])
+
+    file_list.sort(key=sort_key)
+    _server_state["_file_cache"] = file_list
+    _server_state["_file_cache_db_len"] = len(db.files)
+    _server_state["_date_groups_cache"] = None
+    return file_list
+
+
+def _resolve_media_path(file_id: str) -> tuple[str | None, dict | None]:
+    """Safely resolve file_id to an absolute path within media_dir."""
+    db = get_db()
+    if not db or file_id not in db.files:
+        return None, None
+
+    media_dir = _server_state.get("media_dir")
+    if not media_dir:
+        db_path = _server_state.get("db_path")
+        if db_path:
+            media_dir = os.path.dirname(db_path)
+        else:
+            return None, None
+
+    file_info = db.files[file_id]
+    rel_path = file_info.get("path")
+    if not rel_path:
+        return None, None
+
+    abs_path = os.path.abspath(os.path.join(media_dir, rel_path))
+    if not abs_path.startswith(os.path.abspath(media_dir)):
+        return None, None
+
+    return abs_path, file_info
+
+
+def _format_seconds(sec: float) -> str:
+    s = int(sec)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+# ---------------------------------------------------------------------- HTML Pages
+
+_TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>TubeTape 时间线全屏画廊</title>
+  <style>
+    :root {
+      --bg: #000;
+      --text: #fff;
+      --card-bg: rgba(20, 20, 24, 0.75);
+      --border: rgba(255, 255, 255, 0.15);
+      --accent: #e50914;
+      --blue: #3b82f6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      touch-action: none;
+    }
+    #viewport {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      overflow: hidden;
+    }
+    .slide-layer {
+      position: absolute;
+      top: 0; left: 0; width: 100%; height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+      will-change: transform;
+    }
+    .media-box {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .media-box img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      pointer-events: auto;
+      transform-origin: center center;
+      transition: transform 0.15s ease-out;
+      cursor: zoom-in;
+    }
+    .media-box img.zoomed {
+      cursor: grab;
+    }
+    .media-box img.dragging {
+      cursor: grabbing;
+      transition: none;
+    }
+    .media-box video {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      outline: none;
+      background: #000;
+    }
+    /* Top Bar */
+    header {
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 56px;
+      padding: 0 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: linear-gradient(180deg, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0) 100%);
+      z-index: 50;
+      pointer-events: auto;
+    }
+    .header-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 1.1rem;
+    }
+    .header-brand span {
+      background: var(--accent);
+      color: #fff;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 0.8rem;
+    }
+    .header-links {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .btn-header {
+      background: rgba(255, 255, 255, 0.16);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border);
+      color: #fff;
+      padding: 6px 14px;
+      border-radius: 20px;
+      text-decoration: none;
+      font-size: 0.84rem;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-header:hover {
+      background: rgba(255, 255, 255, 0.28);
+    }
+    /* Bottom Info Overlay */
+    .bottom-overlay {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      padding: 24px 20px 20px 20px;
+      background: linear-gradient(0deg, rgba(0,0,0,0.88) 0%, rgba(0,0,0,0) 100%);
+      z-index: 50;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .info-date {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: #fff;
+      text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .info-badge {
+      background: rgba(59, 130, 246, 0.35);
+      border: 1px solid #3b82f6;
+      color: #93c5fd;
+      font-size: 0.72rem;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+    }
+    .info-meta {
+      font-size: 0.84rem;
+      color: #d1d5db;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .info-counter {
+      color: #9ca3af;
+      font-size: 0.82rem;
+    }
+    /* Video progress line */
+    .video-progress-container {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.2);
+      z-index: 55;
+      cursor: pointer;
+      pointer-events: auto;
+    }
+    .video-progress-bar {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.1s linear;
+    }
+    /* Right side Timeline Scrubber */
+    .timeline-scrubber {
+      position: absolute;
+      right: 14px;
+      top: 15%;
+      bottom: 15%;
+      width: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 60;
+      pointer-events: auto;
+    }
+    .scrubber-track {
+      width: 4px;
+      height: 100%;
+      background: rgba(255, 255, 255, 0.25);
+      border-radius: 2px;
+      position: relative;
+      cursor: pointer;
+    }
+    .scrubber-handle {
+      position: absolute;
+      left: 50%;
+      width: 16px;
+      height: 16px;
+      background: #fff;
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 8px rgba(0, 0, 0, 0.8);
+      cursor: grab;
+      touch-action: none;
+    }
+    .scrubber-tooltip {
+      position: absolute;
+      right: 42px;
+      background: rgba(18, 18, 22, 0.92);
+      border: 1px solid var(--border);
+      color: #fff;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      white-space: nowrap;
+      pointer-events: none;
+      display: none;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+      transform: translateY(-50%);
+    }
+    /* Floating action buttons */
+    .floating-nav {
+      position: absolute;
+      right: 20px;
+      bottom: 80px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      z-index: 55;
+    }
+    .fab-btn {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: rgba(25, 25, 30, 0.7);
+      backdrop-filter: blur(10px);
+      border: 1px solid var(--border);
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 1.15rem;
+      transition: background 0.15s, transform 0.15s;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+    .fab-btn:active {
+      transform: scale(0.92);
+    }
+    .fab-btn:hover {
+      background: rgba(45, 45, 52, 0.85);
+    }
+    /* Empty State */
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      gap: 16px;
+      text-align: center;
+      padding: 20px;
+    }
+    .empty-icon { font-size: 3rem; animation: bounce 2s infinite; }
+    @keyframes bounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+    .empty-title { font-size: 1.3rem; font-weight: 700; }
+    .empty-desc { color: #9ca3af; font-size: 0.92rem; max-width: 420px; line-height: 1.5; }
+    .loading-spinner {
+      width: 40px; height: 40px;
+      border: 3px solid rgba(255, 255, 255, 0.15);
+      border-top-color: var(--blue);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div id="viewport">
+    <div id="layer-prev" class="slide-layer" style="transform: translateY(-100%);">
+      <div class="media-box" id="box-prev"></div>
+    </div>
+    <div id="layer-curr" class="slide-layer" style="transform: translateY(0);">
+      <div class="media-box" id="box-curr"></div>
+    </div>
+    <div id="layer-next" class="slide-layer" style="transform: translateY(100%);">
+      <div class="media-box" id="box-next"></div>
+    </div>
+  </div>
+
+  <header>
+    <div class="header-brand">
+      <span>TubeTape</span>
+      <div>画廊</div>
+    </div>
+    <div class="header-links">
+      <button id="sound-btn" class="btn-header" onclick="toggleMute()">🔇 静音</button>
+      <button id="zoom-btn" class="btn-header" onclick="toggleZoomCurr()">🔍 放大</button>
+      <a href="/log" class="btn-header">📊 控制台与日志</a>
+    </div>
+  </header>
+
+  <div class="bottom-overlay" id="bottom-info">
+    <div class="info-date">
+      <span id="info-date-text">-</span>
+      <span id="info-type-badge" class="info-badge">照片</span>
+    </div>
+    <div class="info-meta">
+      <span id="info-filename">-</span>
+      <span id="info-extra">-</span>
+      <span id="info-counter" class="info-counter">-</span>
+    </div>
+  </div>
+
+  <div class="video-progress-container" id="video-progress-container" style="display: none;">
+    <div class="video-progress-bar" id="video-progress-bar"></div>
+  </div>
+
+  <div class="timeline-scrubber" id="timeline-scrubber">
+    <div class="scrubber-track" id="scrubber-track">
+      <div class="scrubber-handle" id="scrubber-handle" style="top: 0%;"></div>
+    </div>
+    <div class="scrubber-tooltip" id="scrubber-tooltip">2024-01-01</div>
+  </div>
+
+  <div class="floating-nav">
+    <button class="fab-btn" onclick="goPrev()" title="上一张 (↑)">▲</button>
+    <button class="fab-btn" onclick="goNext()" title="下一张 (↓)">▼</button>
+  </div>
+
+  <script>
+    let totalItems = 0;
+    let itemsCache = {};
+    let dateGroups = [];
+    let currentIndex = 0;
+    let isMuted = true;
+    let isZoomed = false;
+    let isTransitioning = false;
+
+    // Zoom/Pan state for current image
+    let currentScale = 1;
+    let panX = 0, panY = 0;
+    let isDragging = false, dragStartX = 0, dragStartY = 0;
+
+    const layerPrev = document.getElementById('layer-prev');
+    const layerCurr = document.getElementById('layer-curr');
+    const layerNext = document.getElementById('layer-next');
+    const boxPrev = document.getElementById('box-prev');
+    const boxCurr = document.getElementById('box-curr');
+    const boxNext = document.getElementById('box-next');
+
+    const scrubberTrack = document.getElementById('scrubber-track');
+    const scrubberHandle = document.getElementById('scrubber-handle');
+    const scrubberTooltip = document.getElementById('scrubber-tooltip');
+
+    const soundBtn = document.getElementById('sound-btn');
+    const videoProgressContainer = document.getElementById('video-progress-container');
+    const videoProgressBar = document.getElementById('video-progress-bar');
+
+    async function init() {
+      try {
+        const res = await fetch('/api/media/summary');
+        if (res.ok) {
+          const data = await res.json();
+          totalItems = data.total || 0;
+          dateGroups = data.date_groups || [];
+          if (totalItems === 0) {
+            renderEmpty();
+            setTimeout(init, 3000);
+            return;
+          }
+          await prefetchRange(0, 10);
+          showSlide(0);
+        } else {
+          renderEmpty();
+          setTimeout(init, 3000);
+        }
+      } catch (e) {
+        renderEmpty();
+        setTimeout(init, 3000);
+      }
+    }
+
+    function renderEmpty() {
+      boxCurr.innerHTML = `
+        <div class="empty-state">
+          <div class="loading-spinner"></div>
+          <div class="empty-title">正在扫描媒体文件...</div>
+          <div class="empty-desc">TubeTape 正在建立时间线媒体索引。您可以前往控制台查看实时扫描进度与构建状态。</div>
+          <a href="/log" class="btn-header" style="padding: 10px 22px; font-size: 0.95rem; margin-top: 8px;">📊 前往运行控制台与日志</a>
+        </div>
+      `;
+      document.getElementById('bottom-info').style.display = 'none';
+      document.getElementById('timeline-scrubber').style.display = 'none';
+    }
+
+    async function prefetchRange(start, count) {
+      const needed = [];
+      for (let i = start; i < start + count && i < totalItems; i++) {
+        if (!itemsCache[i]) needed.push(i);
+      }
+      if (needed.length === 0) return;
+
+      const offset = Math.max(0, start);
+      const limit = Math.min(100, Math.max(count, 50));
+      try {
+        const res = await fetch(`/api/media/items?offset=${offset}&limit=${limit}`);
+        if (res.ok) {
+          const data = await res.json();
+          (data.items || []).forEach(item => {
+            itemsCache[item.index] = item;
+          });
+        }
+      } catch (e) {}
+    }
+
+    function buildMediaElement(item, isActive) {
+      if (!item) return '<div class="loading-spinner"></div>';
+      if (item.type === 'video') {
+        return `
+          <video id="vid-${item.index}"
+                 src="/api/media/stream?id=${item.id}"
+                 playsinline loop
+                 ${isMuted ? 'muted' : ''}
+                 preload="${isActive ? 'auto' : 'metadata'}">
+          </video>
+        `;
+      } else {
+        return `
+          <img id="img-${item.index}"
+               src="/api/media/view?id=${item.id}"
+               alt="${escapeHtml(item.name)}"
+               draggable="false"
+               loading="${isActive ? 'eager' : 'lazy'}" />
+        `;
+      }
+    }
+
+    async function showSlide(index) {
+      if (index < 0 || index >= totalItems) return;
+      currentIndex = index;
+
+      prefetchRange(Math.max(0, index - 5), 15);
+      resetZoom();
+
+      const itemCurr = itemsCache[index];
+      const itemPrev = index > 0 ? itemsCache[index - 1] : null;
+      const itemNext = index < totalItems - 1 ? itemsCache[index + 1] : null;
+
+      boxCurr.innerHTML = buildMediaElement(itemCurr, true);
+      boxPrev.innerHTML = buildMediaElement(itemPrev, false);
+      boxNext.innerHTML = buildMediaElement(itemNext, false);
+
+      updateInfoOverlay(itemCurr);
+      updateScrubberPosition();
+      bindCurrEvents(itemCurr);
+    }
+
+    function bindCurrEvents(item) {
+      if (!item) return;
+      if (item.type === 'video') {
+        videoProgressContainer.style.display = 'block';
+        const vid = document.getElementById(`vid-${item.index}`);
+        if (vid) {
+          vid.muted = isMuted;
+          vid.play().catch(() => {});
+          vid.ontimeupdate = () => {
+            if (vid.duration) {
+              const pct = (vid.currentTime / vid.duration) * 100;
+              videoProgressBar.style.width = pct + '%';
+            }
+          };
+          vid.onclick = () => {
+            if (vid.paused) vid.play();
+            else vid.pause();
+          };
+        }
+      } else {
+        videoProgressContainer.style.display = 'none';
+        const img = document.getElementById(`img-${item.index}`);
+        if (img) {
+          img.ondblclick = (e) => handleDblClickZoom(e, img);
+          setupPanEvents(img);
+        }
+      }
+    }
+
+    function updateInfoOverlay(item) {
+      if (!item) return;
+      document.getElementById('bottom-info').style.display = 'flex';
+      document.getElementById('timeline-scrubber').style.display = 'flex';
+
+      let dStr = item.captured_at ? item.captured_at.replace('T', ' ').replace('Z', ' UTC') : '无拍摄时间';
+      document.getElementById('info-date-text').textContent = dStr;
+      document.getElementById('info-type-badge').textContent = item.type === 'video' ? '🎬 视频' : '📷 照片';
+      document.getElementById('info-filename').textContent = item.name;
+
+      let extra = [];
+      if (item.resolution) extra.push(item.resolution);
+      if (item.duration > 0) extra.push(formatSec(item.duration));
+      if (item.size > 0) extra.push(formatSize(item.size));
+      document.getElementById('info-extra').textContent = extra.join(' · ');
+      document.getElementById('info-counter').textContent = `${currentIndex + 1} / ${totalItems}`;
+    }
+
+    function updateScrubberPosition() {
+      if (totalItems <= 1) return;
+      const pct = (currentIndex / (totalItems - 1)) * 100;
+      scrubberHandle.style.top = pct + '%';
+    }
+
+    function goNext() {
+      if (isTransitioning || currentIndex >= totalItems - 1) return;
+      isTransitioning = true;
+
+      // Animate curr up to -100%, next up to 0%
+      layerCurr.style.transform = 'translateY(-100%)';
+      layerNext.style.transform = 'translateY(0)';
+
+      setTimeout(() => {
+        // Reset transforms without transition
+        layerCurr.style.transition = 'none';
+        layerNext.style.transition = 'none';
+        layerPrev.style.transition = 'none';
+
+        layerCurr.style.transform = 'translateY(0)';
+        layerNext.style.transform = 'translateY(100%)';
+        layerPrev.style.transform = 'translateY(-100%)';
+
+        void layerCurr.offsetHeight; // force reflow
+
+        layerCurr.style.transition = '';
+        layerNext.style.transition = '';
+        layerPrev.style.transition = '';
+
+        showSlide(currentIndex + 1);
+        isTransitioning = false;
+      }, 330);
+    }
+
+    function goPrev() {
+      if (isTransitioning || currentIndex <= 0) return;
+      isTransitioning = true;
+
+      // Animate curr down to 100%, prev down to 0%
+      layerCurr.style.transform = 'translateY(100%)';
+      layerPrev.style.transform = 'translateY(0)';
+
+      setTimeout(() => {
+        layerCurr.style.transition = 'none';
+        layerPrev.style.transition = 'none';
+        layerNext.style.transition = 'none';
+
+        layerCurr.style.transform = 'translateY(0)';
+        layerPrev.style.transform = 'translateY(-100%)';
+        layerNext.style.transform = 'translateY(100%)';
+
+        void layerCurr.offsetHeight;
+
+        layerCurr.style.transition = '';
+        layerPrev.style.transition = '';
+        layerNext.style.transition = '';
+
+        showSlide(currentIndex - 1);
+        isTransitioning = false;
+      }, 330);
+    }
+
+    // Touch swipe navigation
+    let touchStartY = 0;
+    let touchStartTime = 0;
+
+    window.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 1 && !isZoomed) {
+        touchStartY = e.touches[0].clientY;
+        touchStartTime = Date.now();
+      }
+    }, { passive: true });
+
+    window.addEventListener('touchend', (e) => {
+      if (isZoomed || e.changedTouches.length !== 1) return;
+      const deltaY = e.changedTouches[0].clientY - touchStartY;
+      const duration = Date.now() - touchStartTime;
+
+      if (Math.abs(deltaY) > 40 && duration < 500) {
+        if (deltaY < 0) goNext();
+        else goPrev();
+      }
+    }, { passive: true });
+
+    // Wheel navigation (debounced)
+    let wheelTimeout = null;
+    window.addEventListener('wheel', (e) => {
+      if (isZoomed) return;
+      if (wheelTimeout) return;
+      wheelTimeout = setTimeout(() => { wheelTimeout = null; }, 260);
+
+      if (e.deltaY > 20) goNext();
+      else if (e.deltaY < -20) goPrev();
+    }, { passive: true });
+
+    // Keyboard navigation
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowDown' || e.key === 'PageDown') {
+        e.preventDefault();
+        goNext();
+      } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
+        e.preventDefault();
+        goPrev();
+      } else if (e.key === ' ') {
+        e.preventDefault();
+        const vid = document.getElementById(`vid-${currentIndex}`);
+        if (vid) {
+          if (vid.paused) vid.play();
+          else vid.pause();
+        } else {
+          goNext();
+        }
+      }
+    });
+
+    // Zoom and pan logic
+    function handleDblClickZoom(e, img) {
+      if (currentScale > 1) {
+        resetZoom();
+      } else {
+        currentScale = 2.5;
+        isZoomed = true;
+        img.classList.add('zoomed');
+        const rect = img.getBoundingClientRect();
+        panX = (rect.width / 2 - (e.clientX - rect.left)) * 1.5;
+        panY = (rect.height / 2 - (e.clientY - rect.top)) * 1.5;
+        applyTransform(img);
+        document.getElementById('zoom-btn').textContent = '🔍 还原';
+      }
+    }
+
+    function toggleZoomCurr() {
+      const img = document.getElementById(`img-${currentIndex}`);
+      if (!img) return;
+      if (currentScale > 1) {
+        resetZoom();
+      } else {
+        currentScale = 2.5;
+        isZoomed = true;
+        img.classList.add('zoomed');
+        panX = 0; panY = 0;
+        applyTransform(img);
+        document.getElementById('zoom-btn').textContent = '🔍 还原';
+      }
+    }
+
+    function resetZoom() {
+      currentScale = 1;
+      panX = 0; panY = 0;
+      isZoomed = false;
+      const img = document.getElementById(`img-${currentIndex}`);
+      if (img) {
+        img.classList.remove('zoomed', 'dragging');
+        img.style.transform = '';
+      }
+      document.getElementById('zoom-btn').textContent = '🔍 放大';
+    }
+
+    function applyTransform(img) {
+      img.style.transform = `scale(${currentScale}) translate(${panX / currentScale}px, ${panY / currentScale}px)`;
+    }
+
+    function setupPanEvents(img) {
+      img.onmousedown = (e) => {
+        if (currentScale <= 1) return;
+        isDragging = true;
+        dragStartX = e.clientX - panX;
+        dragStartY = e.clientY - panY;
+        img.classList.add('dragging');
+      };
+      window.onmousemove = (e) => {
+        if (!isDragging) return;
+        panX = e.clientX - dragStartX;
+        panY = e.clientY - dragStartY;
+        applyTransform(img);
+      };
+      window.onmouseup = () => {
+        if (isDragging) {
+          isDragging = false;
+          img.classList.remove('dragging');
+        }
+      };
+    }
+
+    function toggleMute() {
+      isMuted = !isMuted;
+      soundBtn.textContent = isMuted ? '🔇 静音' : '🔊 声音';
+      const vid = document.getElementById(`vid-${currentIndex}`);
+      if (vid) vid.muted = isMuted;
+    }
+
+    // Timeline Scrubber Dragging
+    let isScrubbing = false;
+
+    function handleScrubberMove(clientY) {
+      const rect = scrubberTrack.getBoundingClientRect();
+      let pos = (clientY - rect.top) / rect.height;
+      pos = Math.max(0, Math.min(1, pos));
+      const targetIdx = Math.round(pos * (totalItems - 1));
+
+      scrubberHandle.style.top = (pos * 100) + '%';
+      scrubberTooltip.style.top = (pos * 100) + '%';
+      scrubberTooltip.style.display = 'block';
+
+      const item = itemsCache[targetIdx];
+      const d = item && item.captured_at ? item.captured_at.slice(0, 10) : `第 ${targetIdx + 1} 个`;
+      scrubberTooltip.textContent = `${d} (${targetIdx + 1}/${totalItems})`;
+
+      return targetIdx;
+    }
+
+    scrubberTrack.addEventListener('mousedown', (e) => {
+      isScrubbing = true;
+      const idx = handleScrubberMove(e.clientY);
+      showSlide(idx);
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!isScrubbing) return;
+      const idx = handleScrubberMove(e.clientY);
+      showSlide(idx);
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (isScrubbing) {
+        isScrubbing = false;
+        scrubberTooltip.style.display = 'none';
+      }
+    });
+
+    scrubberTrack.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 1) {
+        isScrubbing = true;
+        const idx = handleScrubberMove(e.touches[0].clientY);
+        showSlide(idx);
+      }
+    }, { passive: true });
+
+    window.addEventListener('touchmove', (e) => {
+      if (isScrubbing && e.touches.length === 1) {
+        const idx = handleScrubberMove(e.touches[0].clientY);
+        showSlide(idx);
+      }
+    }, { passive: true });
+
+    window.addEventListener('touchend', () => {
+      if (isScrubbing) {
+        isScrubbing = false;
+        scrubberTooltip.style.display = 'none';
+      }
+    });
+
+    // Helpers
+    function escapeHtml(text) {
+      return (text || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+    function formatSec(sec) {
+      const s = Math.round(sec);
+      const m = Math.floor(s / 60);
+      return `${m}:${(s % 60).toString().padStart(2, '0')}`;
+    }
+    function formatSize(bytes) {
+      if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+      if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+      return Math.round(bytes / 1024) + ' KB';
+    }
+
+    init();
+  </script>
+</body>
+</html>
+"""
+
+_LOG_DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TubeTape 控制台</title>
+  <title>TubeTape 运行控制台与仪表盘</title>
   <style>
     :root {
       --bg: #121214;
       --card: #1c1c1f;
+      --card-alt: #161619;
       --border: #2e2e33;
       --text: #e1e1e6;
       --muted: #8b8b94;
       --accent: #e50914;
       --success: #10b981;
       --blue: #3b82f6;
+      --warning: #f59e0b;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -137,7 +1102,7 @@ _HTML_PAGE = """<!DOCTYPE html>
     header {
       background: var(--card);
       border-bottom: 1px solid var(--border);
-      padding: 12px 20px;
+      padding: 10px 20px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -146,7 +1111,7 @@ _HTML_PAGE = """<!DOCTYPE html>
     .brand {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 12px;
       font-weight: 700;
       font-size: 1.15rem;
     }
@@ -155,9 +1120,25 @@ _HTML_PAGE = """<!DOCTYPE html>
       color: #fff;
       padding: 2px 8px;
       border-radius: 4px;
-      font-size: 0.85rem;
+      font-size: 0.82rem;
       letter-spacing: 0.5px;
     }
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .btn-gallery {
+      background: #2563eb;
+      color: #fff;
+      padding: 6px 14px;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 0.85rem;
+      font-weight: 600;
+      transition: background 0.15s;
+    }
+    .btn-gallery:hover { background: #1d4ed8; }
     .status-badge {
       display: flex;
       align-items: center;
@@ -178,44 +1159,22 @@ _HTML_PAGE = """<!DOCTYPE html>
       animation: pulse 2s infinite;
     }
     @keyframes pulse {
-      0% { opacity: 0.4; }
-      50% { opacity: 1; }
-      100% { opacity: 0.4; }
-    }
-    .controls {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-    }
-    button {
-      background: #2a2a30;
-      color: var(--text);
-      border: 1px solid var(--border);
-      padding: 6px 14px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 0.85rem;
-      transition: background 0.15s;
-    }
-    button:hover { background: #383840; }
-    button.active {
-      background: rgba(16, 185, 129, 0.2);
-      border-color: var(--success);
-      color: #6ee7b7;
+      0% { opacity: 0.4; } 50% { opacity: 1; } 100% { opacity: 0.4; }
     }
     main {
       flex: 1;
-      padding: 16px;
-      overflow: hidden;
+      padding: 16px 20px;
+      overflow-y: auto;
       display: flex;
       flex-direction: column;
+      gap: 16px;
     }
+    /* OAuth Banner */
     .auth-banner {
       background: #181b24;
-      border: 1px solid #3b82f6;
+      border: 1px solid var(--blue);
       border-radius: 8px;
       padding: 16px 20px;
-      margin-bottom: 14px;
       box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
       flex-shrink: 0;
     }
@@ -232,10 +1191,9 @@ _HTML_PAGE = """<!DOCTYPE html>
       align-items: center;
       gap: 8px;
     }
-    .auth-icon { font-size: 1.2rem; }
     .auth-badge {
       background: rgba(245, 158, 11, 0.2);
-      border: 1px solid #f59e0b;
+      border: 1px solid var(--warning);
       color: #fbbf24;
       padding: 2px 10px;
       border-radius: 999px;
@@ -258,7 +1216,7 @@ _HTML_PAGE = """<!DOCTYPE html>
     }
     .auth-method-card {
       background: #121316;
-      border: 1px solid #2e2e33;
+      border: 1px solid var(--border);
       border-radius: 6px;
       padding: 12px 14px;
       display: flex;
@@ -273,7 +1231,7 @@ _HTML_PAGE = """<!DOCTYPE html>
     }
     .auth-method-desc {
       font-size: 0.78rem;
-      color: #8b8b94;
+      color: var(--muted);
       line-height: 1.45;
       margin-bottom: 10px;
     }
@@ -305,33 +1263,194 @@ _HTML_PAGE = """<!DOCTYPE html>
       font-size: 0.82rem;
       outline: none;
     }
-    .auth-input-row input:focus {
-      border-color: #3b82f6;
-    }
     .auth-btn-submit {
       background: #10b981;
-      border-color: #10b981;
       color: #fff;
+      border: 1px solid #10b981;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 0.82rem;
       font-weight: 600;
-      white-space: nowrap;
+      cursor: pointer;
     }
-    .auth-btn-submit:hover { background: #059669; }
-    .auth-feedback {
-      font-size: 0.8rem;
-      min-height: 1.2rem;
-    }
+    .auth-feedback { font-size: 0.8rem; min-height: 1.2rem; }
     .fb-error { color: #f87171; font-weight: 600; }
     .fb-success { color: #34d399; font-weight: 600; }
     .fb-info { color: #93c5fd; }
+
+    /* Dashboard Metrics Cards */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      flex-shrink: 0;
+    }
+    .metric-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .metric-label {
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .metric-value {
+      font-size: 1.55rem;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+    }
+    .metric-sub {
+      font-size: 0.78rem;
+      color: #a1a1aa;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Segments Section */
+    .section-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .section-header {
+      padding: 12px 18px;
+      background: var(--card-alt);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .section-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .table-container {
+      overflow-x: auto;
+      max-height: 280px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      text-align: left;
+    }
+    th {
+      background: #141417;
+      color: var(--muted);
+      padding: 10px 16px;
+      font-weight: 600;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    td {
+      padding: 10px 16px;
+      border-bottom: 1px solid #232328;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .badge-uploaded { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-building { background: rgba(59, 130, 246, 0.15); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.3); }
+    .badge-pending { background: rgba(161, 161, 170, 0.15); color: #d4d4d8; border: 1px solid rgba(161, 161, 170, 0.3); }
+    .badge-failed { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.3); }
+
+    .yt-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: #93c5fd;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .yt-link:hover { text-decoration: underline; }
+
+    .progress-bar-wrap {
+      width: 140px;
+      background: #27272a;
+      height: 6px;
+      border-radius: 3px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: var(--blue);
+      border-radius: 3px;
+      transition: width 0.3s;
+    }
+
+    /* Log Stream Section */
+    .log-section {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 260px;
+      overflow: hidden;
+    }
+    .log-header {
+      padding: 10px 18px;
+      background: var(--card-alt);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .log-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    select, button {
+      background: #2a2a30;
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 5px 10px;
+      border-radius: 5px;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    button.active {
+      background: rgba(16, 185, 129, 0.2);
+      border-color: var(--success);
+      color: #6ee7b7;
+    }
     .log-box {
       flex: 1;
       background: #0d0d10;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 14px;
+      padding: 12px 16px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 0.84rem;
-      line-height: 1.55;
+      font-size: 0.83rem;
+      line-height: 1.5;
       color: #d4d4d8;
       overflow-y: auto;
       white-space: pre-wrap;
@@ -341,80 +1460,154 @@ _HTML_PAGE = """<!DOCTYPE html>
     .log-line-warn { color: #fcd34d; font-weight: 600; }
     .log-line-error { color: #f87171; font-weight: 700; }
     .log-line-debug { color: #71717a; }
-    footer {
-      padding: 8px 20px;
-      background: var(--card);
-      border-top: 1px solid var(--border);
-      font-size: 0.78rem;
-      color: var(--muted);
-      display: flex;
-      justify-content: space-between;
-    }
   </style>
 </head>
 <body>
   <header>
     <div class="brand">
       <span>TubeTape</span>
-      <div>实时运行控制台</div>
+      <div>运行控制台与仪表盘</div>
     </div>
-    <div class="status-badge">
-      <div class="status-dot"></div>
-      <div id="status-text">初始化中...</div>
-    </div>
-    <div class="controls">
-      <button id="autoscroll-btn" class="active" onclick="toggleAutoScroll()">自动滚动: 开</button>
-      <button onclick="clearConsole()">清屏</button>
+    <div class="header-right">
+      <a href="/" class="btn-gallery">📱 打开全屏画廊 (/)</a>
+      <div class="status-badge">
+        <div class="status-dot"></div>
+        <div id="status-text">初始化中...</div>
+      </div>
     </div>
   </header>
+
   <main>
+    <!-- OAuth Banner -->
     <div id="auth-banner" class="auth-banner" style="display: none;">
       <div class="auth-banner-header">
         <div class="auth-banner-title">
-          <span class="auth-icon">🔑</span>
+          <span>🔑</span>
           <strong>需要完成 Google YouTube 授权</strong>
         </div>
         <div class="auth-badge">等待授权中</div>
       </div>
       <div class="auth-banner-desc">
-        TubeTape 尚未获得 YouTube 访问凭据（<code>token.json</code> 不存在或已失效）。请通过以下任一方式完成授权以开始同步：
+        TubeTape 尚未获得 YouTube 访问凭据（<code>token.json</code> 不存在或已失效）。请通过以下任一方式完成授权：
       </div>
       <div class="auth-methods">
         <div class="auth-method-card">
           <div>
             <div class="auth-method-title">方式一：一键直接授权（本机或端口映射环境）</div>
-            <div class="auth-method-desc">点击下方按钮前往 Google 登录授权。若本机可直接访问 <code>http://localhost:8080</code>，授权后将自动回调完成凭据保存并继续运行。</div>
+            <div class="auth-method-desc">点击下方按钮前往 Google 授权。若本机可直接访问 <code>http://localhost:8080</code>，授权后将自动回调保存凭据。</div>
           </div>
           <a id="auth-link-btn" href="#" target="_blank" class="auth-btn-primary">🔗 点击前往 Google 账号授权</a>
         </div>
         <div class="auth-method-card">
           <div>
             <div class="auth-method-title">方式二：手动粘贴地址栏 URL（远程 NAS / 无桌面服务器）</div>
-            <div class="auth-method-desc">若在局域网 NAS 上运行，点击上方授权后，浏览器跳转 <code>http://localhost:8080</code> 可能会提示“无法访问此网站”。<strong>不必担心</strong>，直接将浏览器地址栏中的完整 URL 复制并粘贴到下方即可：</div>
+            <div class="auth-method-desc">若在局域网 NAS 上运行，点击上方授权后，直接将浏览器地址栏中的完整 URL 粘贴到下方即可：</div>
           </div>
           <div class="auth-input-row">
-            <input type="text" id="auth-url-input" placeholder="粘贴浏览器地址栏完整 URL（形如 http://localhost:8080/?state=...&code=...）或 code..." />
-            <button id="auth-submit-btn" class="btn auth-btn-submit" onclick="submitAuthCode()">提交授权凭据</button>
+            <input type="text" id="auth-url-input" placeholder="粘贴浏览器地址栏完整 URL 或 code..." />
+            <button id="auth-submit-btn" class="auth-btn-submit" onclick="submitAuthCode()">提交凭据</button>
           </div>
           <div id="auth-feedback" class="auth-feedback"></div>
         </div>
       </div>
     </div>
-    <div id="log-box" class="log-box">正在连接日志流...\\n</div>
+
+    <!-- Metrics Cards -->
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-label">扫描进度 / 媒体总数</div>
+        <div class="metric-value">
+          <span id="metric-files">0</span>
+          <span style="font-size: 0.85rem; font-weight: normal; color: #a1a1aa;">个文件</span>
+        </div>
+        <div class="metric-sub" id="metric-scan-detail">正在检查...</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">时间线分段 (Segments)</div>
+        <div class="metric-value">
+          <span id="metric-segments">0</span>
+          <span style="font-size: 0.85rem; font-weight: normal; color: #a1a1aa;">个分段</span>
+        </div>
+        <div class="metric-sub" id="metric-segments-sub">已上传: 0 | 待构建: 0</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">本地磁盘保留视频</div>
+        <div class="metric-value">
+          <span id="metric-disk-segments">0</span>
+          <span style="font-size: 0.85rem; font-weight: normal; color: #a1a1aa;">部 (限制: <span id="metric-keep-limit">0</span>)</span>
+        </div>
+        <div class="metric-sub">目录: uploaded_segments/</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">当前运行任务</div>
+        <div class="metric-value" style="font-size: 1.15rem;" id="metric-task">
+          空闲
+        </div>
+        <div class="metric-sub" id="metric-task-sub">就绪</div>
+      </div>
+    </div>
+
+    <!-- Timeline Segments Section -->
+    <div class="section-card">
+      <div class="section-header">
+        <div class="section-title">
+          <span>🎞️</span>
+          <span>时间线分段列表 (Timeline Segments)</span>
+        </div>
+        <div style="font-size: 0.8rem; color: var(--muted);" id="segments-count-text">共 0 个分段</div>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>时间区间 / 分段标题</th>
+              <th>媒体数</th>
+              <th>时长</th>
+              <th>构建状态 / 进度</th>
+              <th>YouTube 视频</th>
+            </tr>
+          </thead>
+          <tbody id="segments-table-body">
+            <tr><td colspan="5" style="text-align: center; color: #888;">暂无分段信息</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Live Log Stream Section -->
+    <div class="log-section">
+      <div class="log-header">
+        <div class="section-title">
+          <span>📜</span>
+          <span>实时运行日志 (Live Audit Log)</span>
+        </div>
+        <div class="log-controls">
+          <label style="font-size: 0.82rem; color: var(--muted);">显示最近:</label>
+          <select id="log-limit-select" onchange="changeLogLimit(this.value)">
+            <option value="50">50 条</option>
+            <option value="100" selected>100 条 (默认)</option>
+            <option value="200">200 条</option>
+            <option value="500">500 条</option>
+            <option value="0">全部</option>
+          </select>
+          <button id="autoscroll-btn" class="active" onclick="toggleAutoScroll()">自动滚动: 开</button>
+          <button onclick="clearConsole()">清屏</button>
+        </div>
+      </div>
+      <div id="log-box" class="log-box">正在连接日志流...\n</div>
+    </div>
   </main>
-  <footer>
-    <div id="footer-task">当前任务: -</div>
-    <div id="footer-stats">已连接</div>
-  </footer>
 
   <script>
     let autoScroll = true;
     let offset = 0;
     let isInitial = true;
     let currentAuthUrl = '';
+    let maxLines = 100;
+    let logLines = [];
+
     const logBox = document.getElementById('log-box');
     const statusText = document.getElementById('status-text');
-    const footerTask = document.getElementById('footer-task');
 
     function toggleAutoScroll() {
       autoScroll = !autoScroll;
@@ -424,7 +1617,13 @@ _HTML_PAGE = """<!DOCTYPE html>
     }
 
     function clearConsole() {
+      logLines = [];
       logBox.textContent = '';
+    }
+
+    function changeLogLimit(val) {
+      maxLines = parseInt(val, 10);
+      renderLogBox();
     }
 
     function formatLine(line) {
@@ -435,8 +1634,19 @@ _HTML_PAGE = """<!DOCTYPE html>
       return escapeHtml(line);
     }
 
+    function renderLogBox() {
+      let linesToRender = logLines;
+      if (maxLines > 0 && logLines.length > maxLines) {
+        linesToRender = logLines.slice(logLines.length - maxLines);
+      }
+      logBox.innerHTML = linesToRender.map(l => formatLine(l)).join('\\n') + '\\n';
+      if (autoScroll) {
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+    }
+
     function escapeHtml(text) {
-      return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      return (text || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
 
     async function submitAuthCode() {
@@ -473,8 +1683,93 @@ _HTML_PAGE = """<!DOCTYPE html>
         fb.innerHTML = `<span class="fb-error">❌ 网络请求失败: ${escapeHtml(err.message)}</span>`;
       } finally {
         btn.disabled = false;
-        btn.textContent = '提交授权凭据';
+        btn.textContent = '提交凭据';
       }
+    }
+
+    async function pollDashboard() {
+      try {
+        const res = await fetch('/api/dashboard');
+        if (res.ok) {
+          const d = await res.json();
+          statusText.textContent = d.task || d.status || '就绪';
+
+          // OAuth banner
+          const authBanner = document.getElementById('auth-banner');
+          if (d.auth_required && d.auth_url) {
+            authBanner.style.display = 'block';
+            if (currentAuthUrl !== d.auth_url) {
+              currentAuthUrl = d.auth_url;
+              document.getElementById('auth-link-btn').href = d.auth_url;
+            }
+          } else {
+            authBanner.style.display = 'none';
+          }
+
+          // Metrics
+          document.getElementById('metric-files').textContent = d.stats.total_files.toLocaleString();
+          if (d.scanner && d.scanner.is_scanning) {
+            document.getElementById('metric-scan-detail').innerHTML = `🔍 扫描中: ${d.scanner.count} 个 (${escapeHtml(d.scanner.current || '')})`;
+          } else {
+            document.getElementById('metric-scan-detail').textContent = '✅ 扫描就绪';
+          }
+
+          document.getElementById('metric-segments').textContent = d.stats.total_segments;
+          document.getElementById('metric-segments-sub').textContent =
+            `已上传: ${d.stats.uploaded_segments} | 待处理: ${d.stats.total_segments - d.stats.uploaded_segments}`;
+
+          document.getElementById('metric-disk-segments').textContent = d.stats.disk_segments_count;
+          document.getElementById('metric-keep-limit').textContent = d.stats.keep_segments;
+
+          document.getElementById('metric-task').textContent = d.status;
+          document.getElementById('metric-task-sub').textContent = d.task || '-';
+
+          // Segments Table
+          const tbody = document.getElementById('segments-table-body');
+          document.getElementById('segments-count-text').textContent = `共 ${d.segments.length} 个分段`;
+          if (d.segments.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #888;">暂无分段信息</td></tr>';
+          } else {
+            tbody.innerHTML = d.segments.map(seg => {
+              let statusHtml = '';
+              if (seg.status === 'uploaded') {
+                statusHtml = '<span class="badge badge-uploaded">✅ 已上传</span>';
+              } else if (seg.status === 'building') {
+                const prog = seg.progress || { done: 0, total: 1, current_file: '' };
+                const pct = prog.total > 0 ? Math.round((prog.done / prog.total) * 100) : 0;
+                statusHtml = `
+                  <div>
+                    <span class="badge badge-building">⚡ 正在构建 (${prog.done}/${prog.total})</span>
+                    <div class="progress-bar-wrap"><div class="progress-bar-fill" style="width: ${pct}%"></div></div>
+                    <div style="font-size: 0.72rem; color: #888; max-width: 180px; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(prog.current_file || '')}</div>
+                  </div>
+                `;
+              } else if (seg.status === 'pending') {
+                statusHtml = '<span class="badge badge-pending">⏳ 等待构建</span>';
+              } else if (seg.status === 'failed') {
+                statusHtml = '<span class="badge badge-failed">❌ 构建失败</span>';
+              } else {
+                statusHtml = `<span class="badge badge-pending">${escapeHtml(seg.status)}</span>`;
+              }
+
+              let ytHtml = '-';
+              if (seg.youtube_video_id) {
+                ytHtml = `<a href="https://youtu.be/${seg.youtube_video_id}" target="_blank" class="yt-link">▶️ 查看视频 (${seg.youtube_video_id})</a>`;
+              }
+
+              return `
+                <tr>
+                  <td><strong>${escapeHtml(seg.title)}</strong></td>
+                  <td>${seg.file_count} 张/条</td>
+                  <td>${seg.duration_text}</td>
+                  <td>${statusHtml}</td>
+                  <td>${ytHtml}</td>
+                </tr>
+              `;
+            }).join('');
+          }
+        }
+      } catch (e) {}
     }
 
     async function pollLogs() {
@@ -485,41 +1780,17 @@ _HTML_PAGE = """<!DOCTYPE html>
           const data = await res.json();
           offset = data.offset;
           if (isInitial) {
-            logBox.innerHTML = '';
+            logLines = [];
             isInitial = false;
           }
           if (data.content) {
             const lines = data.content.split('\\n');
             for (let i = 0; i < lines.length; i++) {
               if (lines[i] || i < lines.length - 1) {
-                logBox.innerHTML += formatLine(lines[i]) + '\\n';
+                logLines.push(lines[i]);
               }
             }
-            if (autoScroll) {
-              logBox.scrollTop = logBox.scrollHeight;
-            }
-          }
-        }
-      } catch (e) {
-        // network issue, retry
-      }
-
-      try {
-        const sRes = await fetch('/api/status');
-        if (sRes.ok) {
-          const sData = await sRes.json();
-          statusText.textContent = sData.status || 'running';
-          footerTask.textContent = '当前任务: ' + (sData.task || sData.status || '-');
-
-          const authBanner = document.getElementById('auth-banner');
-          if (sData.auth_required && sData.auth_url) {
-            authBanner.style.display = 'block';
-            if (currentAuthUrl !== sData.auth_url) {
-              currentAuthUrl = sData.auth_url;
-              document.getElementById('auth-link-btn').href = sData.auth_url;
-            }
-          } else {
-            authBanner.style.display = 'none';
+            renderLogBox();
           }
         }
       } catch (e) {}
@@ -527,6 +1798,8 @@ _HTML_PAGE = """<!DOCTYPE html>
       setTimeout(pollLogs, 1500);
     }
 
+    setInterval(pollDashboard, 2000);
+    pollDashboard();
     pollLogs();
   </script>
 </body>
@@ -552,11 +1825,11 @@ _AUTH_SUCCESS_HTML = """<!DOCTYPE html>
   <div class="card">
     <h1>✅ Google OAuth 授权成功！</h1>
     <p>TubeTape 已成功接收到您的 Google 授权凭据，token.json 已自动保存。后台正在自动继续处理媒体与上传，无需重启容器。</p>
-    <a href="/">返回实时控制台</a>
+    <a href="/log">返回控制台与仪表盘</a>
     <div class="hint">3 秒后将自动跳转返回控制台...</div>
   </div>
   <script>
-    setTimeout(function() { window.location.href = '/'; }, 3000);
+    setTimeout(function() { window.location.href = '/log'; }, 3000);
   </script>
 </body>
 </html>
@@ -582,11 +1855,14 @@ _AUTH_ERROR_HTML = """<!DOCTYPE html>
     <h1>❌ Google OAuth 授权失败</h1>
     <p>凭据换取失败，错误信息如下：</p>
     <div class="error-box">{error}</div>
-    <a href="/">返回控制台重试</a>
+    <a href="/log">返回控制台重试</a>
   </div>
 </body>
 </html>
 """
+
+
+# ---------------------------------------------------------------------- Request Handler
 
 
 class _RequestHandler(BaseHTTPRequestHandler):
@@ -599,6 +1875,143 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode("utf-8"))
+
+    def _send_html(self, status: int, html_str: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html_str.encode("utf-8"))
+
+    def _serve_file(self, file_path: str, content_type: str) -> None:
+        try:
+            file_size = os.path.getsize(file_path)
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            with open(file_path, "rb") as f:
+                chunk_size = 64 * 1024
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except OSError:
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve_media_view(self, abs_path: str, file_id: str) -> None:
+        ext = os.path.splitext(abs_path)[1].lower()
+
+        # Check for HEIC/HEIF needing JPEG conversion
+        if ext in (".heic", ".heif"):
+            db_path = _server_state.get("db_path")
+            cache_base = os.path.dirname(db_path) if db_path else "/tmp"
+            cache_dir = os.path.join(cache_base, ".preview_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            cached_file = os.path.join(cache_dir, f"{file_id}.jpg")
+
+            if not os.path.exists(cached_file):
+                try:
+                    from PIL import Image, ImageOps
+                    import pillow_heif
+
+                    pillow_heif.register_heif_opener()
+                    with Image.open(abs_path) as im:
+                        im = ImageOps.exif_transpose(im)
+                        im.thumbnail((2560, 2560), Image.Resampling.LANCZOS)
+                        if im.mode not in ("RGB", "L"):
+                            im = im.convert("RGB")
+                        tmp_cache = cached_file + f".{os.getpid()}.tmp"
+                        im.save(tmp_cache, "JPEG", quality=85)
+                        os.replace(tmp_cache, cached_file)
+                except Exception as exc:
+                    _logger.warning("failed converting HEIC %s: %s", abs_path, exc)
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Failed converting image")
+                    return
+
+            self._serve_file(cached_file, "image/jpeg")
+            return
+
+        mime_types = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }
+        content_type = mime_types.get(ext, "image/jpeg")
+        self._serve_file(abs_path, content_type)
+
+    def _serve_media_stream(self, abs_path: str) -> None:
+        ext = os.path.splitext(abs_path)[1].lower()
+        content_type = "video/quicktime" if ext in (".mov", ".qt") else "video/mp4"
+
+        try:
+            file_size = os.path.getsize(abs_path)
+        except OSError:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        range_header = self.headers.get("Range")
+        if range_header:
+            match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+            if match:
+                start = int(match.group(1))
+                end_group = match.group(2)
+                if end_group:
+                    end = int(end_group)
+                else:
+                    # Serve up to 2MB per chunk for responsive buffering
+                    end = min(start + 2 * 1024 * 1024 - 1, file_size - 1)
+                end = min(end, file_size - 1)
+
+                if start >= file_size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+
+                length = end - start + 1
+                self.send_response(206)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+
+                with open(abs_path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    chunk_size = 64 * 1024
+                    while remaining > 0:
+                        read_len = min(remaining, chunk_size)
+                        chunk = f.read(read_len)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+
+        # No Range header
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        with open(abs_path, "rb") as f:
+            chunk_size = 64 * 1024
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
     def _handle_auth_exchange(self, target: str) -> None:
         session = _server_state.get("oauth_session")
@@ -645,7 +2058,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
 
-        # Check for OAuth callback landing on the root or callback path
+        # Check for OAuth callback landing anywhere
         if "code" in query:
             code = query["code"][0]
             session = _server_state.get("oauth_session")
@@ -655,35 +2068,30 @@ class _RequestHandler(BaseHTTPRequestHandler):
                     _server_state["auth_event"].set()
                     _server_state["auth_code_queue"].put(code)
                     _logger.info("web server intercepted and exchanged OAuth code")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(_AUTH_SUCCESS_HTML.encode("utf-8"))
+                    self._send_html(200, _AUTH_SUCCESS_HTML)
                     return
                 except Exception as exc:
                     _logger.error("OAuth exchange failed on callback: %s", exc)
                     _server_state["auth_error"] = str(exc)
-                    self.send_response(400)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(_AUTH_ERROR_HTML.format(error=str(exc)).encode("utf-8"))
+                    self._send_html(400, _AUTH_ERROR_HTML.format(error=str(exc)))
                     return
             else:
                 _server_state["auth_code_queue"].put(code)
                 _logger.info("web server intercepted OAuth authorization code")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(_AUTH_SUCCESS_HTML.encode("utf-8"))
+                self._send_html(200, _AUTH_SUCCESS_HTML)
                 return
 
+        # Route / -> Fullscreen Timeline Viewer
         if path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(_HTML_PAGE.encode("utf-8"))
+            self._send_html(200, _TIMELINE_VIEWER_HTML)
             return
 
+        # Route /log and /logs -> Dashboard & Live Log Stream
+        if path in ("/log", "/logs"):
+            self._send_html(200, _LOG_DASHBOARD_HTML)
+            return
+
+        # Route /api/status
         if path == "/api/status":
             session = _server_state.get("oauth_session")
             auth_required = session is not None and not _server_state["auth_event"].is_set()
@@ -697,11 +2105,58 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        # Route /api/dashboard
+        if path == "/api/dashboard":
+            self._api_dashboard()
+            return
+
+        # Route /api/media/summary
+        if path == "/api/media/summary":
+            self._api_media_summary()
+            return
+
+        # Route /api/media/items
+        if path == "/api/media/items":
+            self._api_media_items(query)
+            return
+
+        # Route /api/media/view?id=...
+        if path == "/api/media/view":
+            fid = query.get("id", [None])[0]
+            if not fid:
+                self.send_response(400)
+                self.end_headers()
+                return
+            abs_path, _ = _resolve_media_path(fid)
+            if not abs_path or not os.path.isfile(abs_path):
+                self.send_response(404)
+                self.end_headers()
+                return
+            self._serve_media_view(abs_path, fid)
+            return
+
+        # Route /api/media/stream?id=...
+        if path == "/api/media/stream":
+            fid = query.get("id", [None])[0]
+            if not fid:
+                self.send_response(400)
+                self.end_headers()
+                return
+            abs_path, _ = _resolve_media_path(fid)
+            if not abs_path or not os.path.isfile(abs_path):
+                self.send_response(404)
+                self.end_headers()
+                return
+            self._serve_media_stream(abs_path)
+            return
+
+        # Route /api/auth/submit (GET query parameter fallback)
         if path == "/api/auth/submit":
             target = query.get("url", [None])[0] or query.get("code", [None])[0] or ""
             self._handle_auth_exchange(target)
             return
 
+        # Route /api/logs
         if path == "/api/logs":
             log_file = _server_state.get("log_file")
             offset = 0
@@ -717,7 +2172,6 @@ class _RequestHandler(BaseHTTPRequestHandler):
             if log_file and os.path.exists(log_file):
                 try:
                     file_size = os.path.getsize(log_file)
-                    # For initial load, limit to last 64 KB so browser doesn't choke
                     if is_initial and offset == 0 and file_size > 64 * 1024:
                         offset = max(0, file_size - 64 * 1024)
 
@@ -726,7 +2180,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                         content = f.read()
                         new_offset = f.tell()
                 except OSError as exc:
-                    content = f"[无法读取日志文件: {exc}]\\n"
+                    content = f"[无法读取日志文件: {exc}]\n"
 
             payload = {"offset": new_offset, "content": content}
             self._send_json(200, payload)
@@ -735,15 +2189,182 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def _api_dashboard(self) -> None:
+        db = get_db()
+        files_count = len(db.files) if db else _server_state["scanner"]["count"]
+
+        # Count disk segments in uploaded_segments/
+        disk_count = 0
+        db_path = _server_state.get("db_path")
+        if db_path:
+            segments_dir = os.path.join(os.path.dirname(db_path), "uploaded_segments")
+            if os.path.isdir(segments_dir):
+                for entry in os.scandir(segments_dir):
+                    if entry.is_file() and entry.name.lower().endswith(".mp4") and not entry.name.startswith("."):
+                        disk_count += 1
+
+        # Combine db segments and planned segments
+        segments_dict = {}
+        if db:
+            for sid, srec in db.segments.items():
+                title = srec.get("title")
+                rng = srec.get("range", ["", ""])
+                if not title:
+                    title = f"{rng[0]} - {rng[1]} [{sid[:16]}]" if rng[0] else sid[:16]
+                dur = float(srec.get("duration_seconds", 0.0))
+                segments_dict[sid] = {
+                    "segment_id": sid,
+                    "title": title,
+                    "start_ts": rng[0],
+                    "end_ts": rng[1],
+                    "duration_seconds": dur,
+                    "duration_text": _format_seconds(dur),
+                    "file_count": len(srec.get("file_ids", [])),
+                    "status": "uploaded" if srec.get("youtube_video_id") else srec.get("status", "sealed"),
+                    "youtube_video_id": srec.get("youtube_video_id"),
+                    "progress": None,
+                }
+
+        # Planned segments
+        for seg in _server_state.get("planned_segments", []):
+            sid = getattr(seg, "segment_id", "")
+            title = getattr(seg, "title", "")
+            dur = float(getattr(seg, "duration_seconds", 0.0))
+            fcount = len(getattr(seg, "file_ids", []))
+            start_ts = getattr(seg, "start_ts", "")
+            end_ts = getattr(seg, "end_ts", "")
+            if sid not in segments_dict:
+                segments_dict[sid] = {
+                    "segment_id": sid,
+                    "title": title or f"{start_ts} - {end_ts}",
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "duration_seconds": dur,
+                    "duration_text": _format_seconds(dur),
+                    "file_count": fcount,
+                    "status": "pending",
+                    "youtube_video_id": None,
+                    "progress": None,
+                }
+
+        # Current transcode
+        cur_tc = _server_state.get("transcode", {})
+        active_sid = cur_tc.get("segment_id")
+        if active_sid and active_sid in segments_dict:
+            segments_dict[active_sid]["status"] = "building"
+            segments_dict[active_sid]["progress"] = {
+                "done": cur_tc.get("done", 0),
+                "total": cur_tc.get("total", 0),
+                "current_file": cur_tc.get("current_file", ""),
+            }
+
+        # Sort segments chronologically
+        segments_list = list(segments_dict.values())
+        segments_list.sort(key=lambda x: (x["start_ts"] or "", x["title"]))
+
+        uploaded_count = sum(1 for s in segments_list if s.get("youtube_video_id"))
+        session = _server_state.get("oauth_session")
+        auth_required = session is not None and not _server_state["auth_event"].is_set()
+
+        payload = {
+            "status": _server_state["status"],
+            "task": _server_state["task"],
+            "auth_required": auth_required,
+            "auth_url": session.auth_url if auth_required else None,
+            "scanner": _server_state["scanner"],
+            "transcode": cur_tc,
+            "stats": {
+                "total_files": files_count,
+                "total_segments": len(segments_list),
+                "uploaded_segments": uploaded_count,
+                "disk_segments_count": disk_count,
+                "keep_segments": _server_state.get("keep_segments", 0),
+            },
+            "segments": segments_list,
+        }
+        self._send_json(200, payload)
+
+    def _api_media_summary(self) -> None:
+        files = _get_sorted_media_files()
+        total = len(files)
+
+        # Build date groups
+        groups_cache = _server_state.get("_date_groups_cache")
+        if groups_cache is None:
+            groups = []
+            cur_month = None
+            cur_group = None
+            for idx, f in enumerate(files):
+                cap = f["captured_at"]
+                ym = cap[:7] if len(cap) >= 7 else "其他"
+                if ym != cur_month:
+                    cur_month = ym
+                    cur_group = {
+                        "year_month": ym,
+                        "label": ym,
+                        "start_index": idx,
+                        "count": 1,
+                    }
+                    groups.append(cur_group)
+                else:
+                    cur_group["count"] += 1
+            groups_cache = groups
+            _server_state["_date_groups_cache"] = groups_cache
+
+        payload = {
+            "total": total,
+            "date_groups": groups_cache,
+        }
+        self._send_json(200, payload)
+
+    def _api_media_items(self, query: dict) -> None:
+        files = _get_sorted_media_files()
+        total = len(files)
+        offset = 0
+        limit = 50
+        try:
+            offset = max(0, int(query.get("offset", [0])[0]))
+            limit = min(200, max(1, int(query.get("limit", [50])[0])))
+        except (ValueError, TypeError):
+            pass
+
+        items_slice = files[offset : offset + limit]
+        items_with_index = []
+        for i, f in enumerate(items_slice):
+            item = dict(f)
+            item["index"] = offset + i
+            items_with_index.append(item)
+
+        payload = {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "items": items_with_index,
+        }
+        self._send_json(200, payload)
+
+
+# ---------------------------------------------------------------------- WebServer
+
 
 class WebServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 8080, log_file: str | None = None):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8080,
+        log_file: str | None = None,
+        media_dir: str | None = None,
+        db_path: str | None = None,
+        keep_segments: int = 0,
+    ):
         self.host = host
         self.port = port
         _server_state["host"] = host
         _server_state["port"] = port
         if log_file:
             set_web_log_file(log_file)
+        if media_dir:
+            set_web_context(media_dir=media_dir, db_path=db_path, keep_segments=keep_segments)
         self._server = None
         self._thread = None
 

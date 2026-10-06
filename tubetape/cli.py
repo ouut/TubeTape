@@ -206,6 +206,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=8080,
         help="port for the web live log and status console (default: 8080, 0 to disable)",
     )
+    parser.add_argument(
+        "--keep-segments",
+        type=int,
+        default=0,
+        help="number of latest transcoded segment videos to keep in uploaded_segments/ directory (default: 0 = delete immediately after upload)",
+    )
     return parser
 
 
@@ -230,6 +236,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--segment-duration must be > 0")
     if args.fps <= 0:
         parser.error("--fps must be > 0")
+    if args.keep_segments < 0:
+        parser.error("--keep-segments must be >= 0")
 
     return args
 
@@ -246,6 +254,39 @@ def _segment_params(args: argparse.Namespace) -> tuple:
     )
 
 
+def rotate_uploaded_segments(directory: str, keep_count: int) -> list[str]:
+    """Maintain at most `keep_count` newest .mp4 files in `directory`.
+
+    If keep_count <= 0, deletes all non-hidden .mp4 files.
+    Returns list of deleted file paths.
+    """
+    if not os.path.isdir(directory):
+        return []
+
+    mp4_files = []
+    for entry in os.scandir(directory):
+        if entry.is_file() and entry.name.lower().endswith(".mp4") and not entry.name.startswith("."):
+            try:
+                mp4_files.append((entry.path, entry.stat().st_mtime))
+            except OSError:
+                continue
+
+    # Sort descending by mtime (newest first)
+    mp4_files.sort(key=lambda x: x[1], reverse=True)
+
+    deleted = []
+    to_delete = mp4_files[max(0, keep_count):]
+    for path, _ in to_delete:
+        try:
+            os.remove(path)
+            deleted.append(path)
+            _log.info("removed old segment video: %s (keeping latest %d)", os.path.basename(path), keep_count)
+        except OSError as exc:
+            _log.warning("could not delete old segment video %s: %s", path, exc)
+
+    return deleted
+
+
 def _file_persister(db: Database):
     """Return a scan callback that upserts files and periodically saves the db.
 
@@ -253,11 +294,15 @@ def _file_persister(db: Database):
     interrupted without losing all of its progress: already-scanned files are
     already persisted with their size+mtime, so the next run reuses the cache.
     """
-    state = {"count": 0, "last_save": time.monotonic()}
+    state = {"count": 0, "last_save": time.monotonic(), "indexed": 0}
 
     def persist(item) -> None:
         db.upsert_file(item.file_id, item.to_record())
         state["count"] += 1
+        state["indexed"] += 1
+        from . import web
+
+        web.update_web_scanner(is_scanning=True, count=state["indexed"], current=item.rel_path)
         now = time.monotonic()
         if state["count"] >= 1000 or now - state["last_save"] >= 30.0:
             db.save()
@@ -272,10 +317,19 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
     reporter = reporter or Reporter()
     db = Database.load(args.db)
 
+    from . import web
+
+    web.set_web_context(
+        media_dir=args.input,
+        db=db,
+        db_path=args.db,
+        keep_segments=getattr(args, "keep_segments", 0),
+    )
+
     _log.info(
         "pipeline start: input=%s db=%s timezone=%s segment_duration=%.1fs "
         "crf=%d max_resolution=%s ken_burns=%s privacy=%s watch=%s dry_run=%s "
-        "only_camera_photos=%s only_phone_videos=%s flush=%s",
+        "only_camera_photos=%s only_phone_videos=%s flush=%s keep_segments=%d",
         args.input,
         args.db,
         args.timezone,
@@ -289,6 +343,7 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         args.only_camera_photos,
         args.only_phone_videos,
         args.flush,
+        getattr(args, "keep_segments", 0),
     )
     _log.info("database loaded: %d file(s), %d segment(s)", len(db.files), len(db.segments))
 
@@ -304,6 +359,8 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
             _log.info("database saved to %s", db.path)
             return _EXIT_ERROR
 
+    web.update_web_scanner(is_scanning=True, count=0)
+    web.set_web_status("scanning", f"正在扫描 {args.input} ...")
     reporter.status(f"scanning {args.input} ...")
     # During a real run, persist files as they are scanned (throttled) so a
     # long scan survives interruption and the hash cache is useful next time.
@@ -318,6 +375,7 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         only_phone_videos=args.only_phone_videos,
         on_file=on_file,
     )
+    web.update_web_scanner(is_scanning=False, count=len(result.files))
     _log.info(
         "scan complete: %d media file(s) (%d new, %d already processed, %d deleted), "
         "%d error(s), %d skipped",
@@ -347,6 +405,7 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         params=_segment_params(args),
         flush=args.flush,
     )
+    web.set_web_planned_segments(plan_result.segments)
     _log.info(
         "plan complete: %d segment(s) to process, %d skipped (unchanged), %d pending (held for flush)",
         len(plan_result.segments),
@@ -412,10 +471,13 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         preset=args.x264_preset,
     )
 
+    segments_dir = os.path.join(os.path.dirname(args.db), "uploaded_segments")
+    os.makedirs(segments_dir, exist_ok=True)
+
     total_segments = len(plan_result.segments)
     for index, segment in enumerate(plan_result.segments, start=1):
         segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
-        out_path = os.path.join(os.path.dirname(args.db), f".{segment.segment_id[:12]}.mp4")
+        out_path = os.path.join(segments_dir, f"{segment.title}.mp4")
 
         # Already on YouTube (e.g. after a lost db or restart): record locally and skip.
         existing_video = remote_index.get(segment.segment_id) or remote_index.get(segment.segment_id[:16])
@@ -462,11 +524,19 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         def transcode_fn(files, _out_path=out_path):
             def progress(done: int, total: int, item) -> None:
                 reporter.status(f"    transcode {done}/{total}: {item.rel_path} ({item.type})")
+                web.update_web_transcode(
+                    segment_id=segment.segment_id,
+                    title=segment.title,
+                    done=done,
+                    total=total,
+                    current_file=item.rel_path,
+                )
 
             return transcode_segment(files, _out_path, config, progress=progress)
 
         try:
             reporter.status(f"transcoding {segment.title} ...")
+            web.set_web_status("transcoding", f"正在转码 {segment.title}")
             if segment.is_rebuild:
                 reporter.status(
                     f"rebuilding {segment.title} (replaces {segment.replaces_segment_id[:12]} ...) ..."
@@ -492,9 +562,12 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                     title=segment.title,
                 )
                 _log.info("rebuild committed: new video id %s", video_id)
+                rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
+                web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
             else:
                 _, chapters = transcode_fn(segment_files)
                 reporter.status(f"uploading {segment.title} ...")
+                web.set_web_status("uploading", f"正在上传 {segment.title}")
                 description = chapters_text(chapters)
                 video_id = uploader.upload(
                     out_path,
@@ -502,13 +575,14 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                     description,
                     privacy=args.privacy,
                 )
+                saved_out_path = out_path if getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path) else None
                 db.upsert_segment(
                     segment.segment_id,
                     {
                         "file_ids": segment.file_ids,
                         "range": [segment.start_ts, segment.end_ts],
                         "duration_seconds": segment.duration_seconds,
-                        "output_path": out_path,
+                        "output_path": saved_out_path,
                         "youtube_video_id": video_id,
                         "previous_video_ids": [],
                         "status": SEGMENT_STATUS_SEALED,
@@ -519,6 +593,8 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                     },
                 )
                 _log.info("sealed segment %s -> video id %s", segment.segment_id, video_id)
+                rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
+                web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
         except QuotaExceededError as exc:
             reporter.status(
                 f"YouTube quota exhausted; deferring remaining "
@@ -534,17 +610,11 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
             db.save()
             return _EXIT_QUOTA
 
-        # Clean up the local transcode output now that it's uploaded.
-        try:
-            os.remove(out_path)
-            _log.debug("removed local transcode output %s", out_path)
-        except OSError as exc:
-            _log.debug("could not remove %s: %s", out_path, exc)
-
         db.save()
         _log.debug("database saved to %s", db.path)
 
     db.save()
+    web.set_web_status("watching" if args.watch else "done", "常驻监听中" if args.watch else "已完成")
     _log.info(
         "pipeline done: %d segment(s) processed, %d pending",
         len(plan_result.segments),
@@ -717,9 +787,20 @@ def main(argv: list[str] | None = None) -> int:
         return _run_login(args)
 
     if getattr(args, "web_port", 0) > 0 and not args.dry_run:
-        from .web import WebServer
+        from .web import WebServer, set_web_context
 
-        web_server = WebServer(port=args.web_port, log_file=log_file)
+        set_web_context(
+            media_dir=args.input,
+            db_path=args.db,
+            keep_segments=getattr(args, "keep_segments", 0),
+        )
+        web_server = WebServer(
+            port=args.web_port,
+            log_file=log_file,
+            media_dir=args.input,
+            db_path=args.db,
+            keep_segments=getattr(args, "keep_segments", 0),
+        )
         web_server.start()
 
     if args.watch and not args.dry_run:

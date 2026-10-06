@@ -176,3 +176,121 @@ def test_wait_for_auth_timeout():
         web.wait_for_auth(timeout=0.05)
     web.clear_web_oauth_session()
 
+
+def test_web_server_dashboard_and_logs_endpoints(tmp_path):
+    log_file = tmp_path / "test.log"
+    log_file.write_text("INFO dashboard test line\n", encoding="utf-8")
+    server = web.WebServer(host="127.0.0.1", port=0, log_file=str(log_file))
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        # /log
+        with urllib.request.urlopen(f"{base_url}/log") as res:
+            assert res.status == 200
+            html = res.read().decode("utf-8")
+            assert "运行控制台与仪表盘" in html
+            assert "时间线分段列表" in html
+            assert "实时运行日志" in html
+
+        # /logs
+        with urllib.request.urlopen(f"{base_url}/logs") as res:
+            assert res.status == 200
+
+        # /api/dashboard
+        web.update_web_scanner(is_scanning=True, count=42, current="test.jpg")
+        web.update_web_transcode(segment_id="seg1", title="Segment 1", done=5, total=10, current_file="a.jpg")
+        with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["scanner"]["is_scanning"] is True
+            assert data["scanner"]["count"] == 42
+            assert data["transcode"]["title"] == "Segment 1"
+            assert "stats" in data
+            assert "segments" in data
+    finally:
+        web.update_web_scanner(is_scanning=False, count=0)
+        web.finish_web_segment("seg1")
+        server.stop()
+
+
+def test_web_server_media_api_and_streaming(tmp_path):
+    import os
+    from PIL import Image
+    from tubetape.db import Database
+
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    img_path = media_dir / "photo.jpg"
+    img = Image.new("RGB", (100, 100), color="red")
+    img.save(img_path, "JPEG")
+
+    video_path = media_dir / "video.mp4"
+    video_bytes = b"fake video content header and body chunk 1234567890" * 100
+    video_path.write_bytes(video_bytes)
+
+    db_path = tmp_path / "db.json"
+    db = Database(path=str(db_path))
+    db.upsert_file("img_id", {
+        "path": "photo.jpg",
+        "name": "photo.jpg",
+        "type": "image",
+        "captured_at_utc": "2024-05-01T12:00:00Z",
+        "resolution": "100x100",
+        "size_bytes": os.path.getsize(img_path),
+    })
+    db.upsert_file("vid_id", {
+        "path": "video.mp4",
+        "name": "video.mp4",
+        "type": "video",
+        "captured_at_utc": "2024-05-02T15:00:00Z",
+        "duration_seconds": 12.0,
+        "size_bytes": len(video_bytes),
+    })
+    db.save()
+
+    web.set_web_context(media_dir=str(media_dir), db=db, db_path=str(db_path), keep_segments=3)
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        # /api/media/summary
+        with urllib.request.urlopen(f"{base_url}/api/media/summary") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["total"] == 2
+            assert len(data["date_groups"]) > 0
+
+        # /api/media/items
+        with urllib.request.urlopen(f"{base_url}/api/media/items?offset=0&limit=10") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["total"] == 2
+            assert len(data["items"]) == 2
+            assert data["items"][0]["id"] == "img_id"
+
+        # /api/media/view?id=img_id
+        with urllib.request.urlopen(f"{base_url}/api/media/view?id=img_id") as res:
+            assert res.status == 200
+            assert res.headers.get("Content-Type") == "image/jpeg"
+            content = res.read()
+            assert len(content) > 0
+
+        # /api/media/stream?id=vid_id (Range request)
+        req = urllib.request.Request(f"{base_url}/api/media/stream?id=vid_id")
+        req.add_header("Range", "bytes=10-49")
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 206
+            assert res.headers.get("Content-Range") == f"bytes 10-49/{len(video_bytes)}"
+            assert res.headers.get("Content-Length") == "40"
+            chunk = res.read()
+            assert chunk == video_bytes[10:50]
+    finally:
+        server.stop()
+
+
