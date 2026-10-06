@@ -60,7 +60,7 @@ services:
       - "30"
       # 本地保留构建视频数量：0 表示上传后即删，3 表示保留最新的 3 个视频在 uploaded_segments/ 目录下
       - --keep-segments
-      - "0"
+      - "6"
       # 下面两行按需保留：只处理相机照片 + 手机视频，丢弃截图/网络传输副本
       #- --only-camera-photos
       #- --only-phone-videos
