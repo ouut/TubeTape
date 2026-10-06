@@ -37,7 +37,7 @@ services:
       - TZ=Asia/Shanghai
     volumes:
       # 照片/视频目录：只读挂载进容器 /data，请将冒号前的路径修改为你的宿主机实际路径
-      - /path/to/your/photos:/data:ro
+      - /home/cc/projects/u:/data:ro
       # 数据库 + 哈希缓存 + 日志 + 凭据(client_secret.json/token.json) + uploaded_segments 本地视频
       - ./:/db
     command:
