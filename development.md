@@ -11,19 +11,20 @@
 - [3. 数据库模型与存储规范 (db.py)](#3-数据库模型与存储规范-dbpy)
 - [4. 核心流水线实现与算法拆解](#4-核心流水线实现与算法拆解)
   - [4.1 媒体扫描与快速采样哈希 (scanner.py)](#41-媒体扫描与快速采样哈希-scannerpy)
-  - [4.2 时间线贪心分片与防边界碰撞 (planner.py)](#42-时间线贪心分片与防边界碰撞-plannerpy)
+  - [4.2 时间线贪心分片与容量强约束 (planner.py)](#42-时间线贪心分片与容量强约束-plannerpy)
   - [4.3 增量重建机制 (rebuild.py)](#43-增量重建机制-rebuildpy)
   - [4.4 高保真视频转码引擎 (transcoder.py)](#44-高保真视频转码引擎-transcoderpy)
   - [4.5 视频章节与时间戳生成 (chapters.py)](#45-视频章节与时间戳生成-chapterspy)
   - [4.6 云端对账与防截断短 ID 容灾 (reconcile.py)](#46-云端对账与防截断短-id-容灾-reconcilepy)
   - [4.7 YouTube 分块上传与配额自愈 (uploader.py)](#47-youtube-分块上传与配额自愈-uploaderpy)
   - [4.8 认证流与 Token 自愈 (auth.py)](#48-认证流与-token-自愈-authpy)
-  - [4.9 本地分片轮转管理 (cli.py - rotate_uploaded_segments)](#49-本地分片轮转管理-clipy---rotate_uploaded_segments)
+  - [4.9 核心协同调度器 (coordinator.py)](#49-核心协同调度器-coordinatorpy)
   - [4.10 动态文件系统监控 (watcher.py)](#410-动态文件系统监控-watcherpy)
   - [4.11 Web 交互系统与流媒体引擎 (web.py)](#411-web-交互系统与流媒体引擎-webpy)
+  - [4.12 命令行入口与管线编排 (cli.py)](#412-命令行入口与管线编排-clipy)
 - [5. 数据生命周期与状态流转](#5-数据生命周期与状态流转)
 - [6. 测试体系与质量保障](#6-测试体系与质量保障)
-- [7. 构建、打包与跨平台规范](#7-构建打包与跨平台规范)
+- [7. 构建、打包与容器化规范](#7-构建打包与容器化规范)
 
 ---
 
@@ -43,6 +44,8 @@ TubeTape 的设计旨在解决家庭媒体海量数据长期保存与安全备�
    Token 失效自动后台刷新；网络断流 10MB 分块平滑续传；YouTube 配额耗尽自动退避；扫描过程中阶段性原子保存，避免长任务中断丢失状态。
 6. **Docker 平稳停机防孤儿视频 (Clean Graceful Shutdown)**：
    捕获 `SIGTERM`/`SIGINT` 信号安全退出，停机阶段不强行开启新转码，避免 Docker 10 秒超时 `SIGKILL` 产生未录入数据库的孤儿视频。
+7. **零外部框架依赖 (Zero Framework Overhead)**：
+   Web 服务基于 Python 原生 `http.server.ThreadingHTTPServer`，不引入大型异步 Web 框架，确保在 NAS 等低配硬件上极低常驻内存占用与零网络端口死锁。
 
 ---
 
@@ -50,44 +53,51 @@ TubeTape 的设计旨在解决家庭媒体海量数据长期保存与安全备�
 
 ```mermaid
 graph TD
-    subgraph CLI & Control Layer
-        CLI["tubetape.cli<br/>(CLI入口 / 管道编排 / 本地轮转)"]
+    subgraph CLI & Entry Layer
+        CLI["tubetape.cli<br/>(CLI入口 / 参数解析 / 信号捕获)"]
         UI["tubetape.ui<br/>(终端控制台 Reporter)"]
         WATCH["tubetape.watcher<br/>(Watchdog 文件系统监听)"]
     end
 
+    subgraph Coordination & Scheduling Layer
+        COORD["tubetape.coordinator<br/>(任务互斥锁 task_lock / 异步任务调度 / 动态配置管理)"]
+    end
+
     subgraph Core Processing Pipeline
-        SCAN["tubetape.scanner<br/>(元数据提取 / 采样哈希 / 缓存)"]
-        PLAN["tubetape.planner<br/>(贪心装箱 / 稳定哈希 / 边界防碰)"]
+        SCAN["tubetape.scanner<br/>(元数据提取 / 采样哈希 / 增量持久化 / from_record)"]
+        PLAN["tubetape.planner<br/>(贪心装箱 / 跨度排序 / 容量强约束 / 稳定哈希)"]
         REBUILD["tubetape.rebuild<br/>(历史分片插入 / 增量重建)"]
-        TRANS["tubetape.transcoder<br/>(FFmpeg 管道 / HEIC转码 / Ken Burns)"]
-        CHAPT["tubetape.chapters<br/>(时间戳描述生成)"]
+        TRANS["tubetape.transcoder<br/>(FFmpeg 管道 / HEIC解码 / Ken Burns / 章节)"]
+        CHAPT["tubetape.chapters<br/>(精确时间戳章节描述生成)"]
     end
 
     subgraph Cloud & Storage Layer
-        AUTH["tubetape.auth<br/>(OAuthSession / Token自愈)"]
-        RECON["tubetape.reconcile<br/>(云端标题对账)"]
-        UPL["tubetape.uploader<br/>(10MB分块流 / 配额退避)"]
-        DB["tubetape.db<br/>(原子 JSON 数据库)"]
+        AUTH["tubetape.auth<br/>(OAuthSession / Token自动刷新)"]
+        RECON["tubetape.reconcile<br/>(云端标题短ID对账)"]
+        UPL["tubetape.uploader<br/>(10MB分块断点续传 / 配额感知 / 视频删除)"]
+        DB["tubetape.db<br/>(原子 JSON 数据库 / 事务替换)"]
     end
 
-    subgraph Presentation & Streaming
-        WEB["tubetape.web<br/>(Daemon Thread WebServer)"]
-        GALLERY["/ : 抖音同款全屏画廊<br/>(虚拟DOM / 手势缩放 / Range流)"]
-        DASH["/log : 仪表盘 & 实时日志<br/>(Dashboard卡片 / 分段表 / 过滤)"]
+    subgraph Presentation & Web Layer
+        WEB["tubetape.web<br/>(ThreadingHTTPServer)"]
+        GALLERY["/ : 抖音同款全屏画廊<br/>(触屏手势 / 双击平移 / Range 206流媒体)"]
+        DASH["/log : 运维控制台 & 实时日志<br/>(状态监控 / 🔄全量扫描 / 🔨重建 / ☁️上传 / 🗑️删视频 / ⚙️参数配置)"]
     end
 
     CLI --> DB
-    CLI --> SCAN
-    CLI --> PLAN
-    CLI --> REBUILD
-    CLI --> TRANS
-    CLI --> UPL
+    CLI --> COORD
     CLI --> WATCH
     CLI --> WEB
+    COORD --> SCAN
+    COORD --> PLAN
+    COORD --> REBUILD
+    COORD --> TRANS
+    COORD --> UPL
+    COORD --> DB
     UPL --> AUTH
     UPL --> RECON
     TRANS --> CHAPT
+    WEB --> COORD
     WEB --> DB
     WEB --> GALLERY
     WEB --> DASH
@@ -95,20 +105,21 @@ graph TD
 
 ### 核心模块职责映射表
 
-| 模块路径 | 职责定位 | 关键类与函数 |
+| 模块路径 | 职责定位 | 关键类与核心函数 |
 |---|---|---|
-| `tubetape.db` | 原子文件数据库 | `Database`、`DatabaseError`、`SCHEMA_VERSION` |
-| `tubetape.scanner` | 媒体扫描、格式探测与采样哈希 | `scan()`、`sample_hash()`、`ScannedFile`、`probe_video()` |
-| `tubetape.planner` | 时间线分片规划与稳定指纹计算 | `plan_segments()`、`segment_id()`、`Segment`、`Plan` |
-| `tubetape.rebuild` | 增量分片插入与替换计划 | `rebuild_segment()` |
-| `tubetape.transcoder` | ffmpeg 管道装配、转码执行与进度 | `transcode_segment()`、`TranscodeConfig`、`bounding_box_canvas()` |
+| `tubetape.db` | 原子单文件持久化数据库 | `Database`、`DatabaseError`、`SCHEMA_VERSION` |
+| `tubetape.scanner` | 媒体扫描、格式探测、采样哈希与恢复 | `scan()`、`sample_hash()`、`ScannedFile`、`probe_video()`、`ScannedFile.from_record()` |
+| `tubetape.planner` | 时间线分片规划、容量约束与稳定指纹 | `plan()`、`compute_segment_id()`、`Segment`、`Plan`、`greedy_pack()` |
+| `tubetape.rebuild` | 增量分片插入与两阶段重建替换 | `rebuild_segment()`、`Rebuilder` |
+| `tubetape.transcoder` | ffmpeg 管道装配、转码执行与进度回调 | `transcode_segment()`、`TranscodeConfig`、`compute_canvas()` |
 | `tubetape.chapters` | 章节与精准跳转时间戳生成 | `chapters_text()` |
 | `tubetape.auth` | Google OAuth 交互、Token 自动刷新 | `ensure_credentials()`、`OAuthSession`、`headless_oauth_flow()` |
 | `tubetape.reconcile` | 云端频道对账与容灾自愈 | `fetch_remote_index()` |
-| `tubetape.uploader` | YouTube 分块上传与配额感知 | `YouTubeUploader`、`QuotaExceededError` |
-| `tubetape.watcher` | 文件系统动态监听与静默去抖 | `MediaWatcher` |
-| `tubetape.web` | 画廊、仪表盘、日志流与 HTTP 206 流媒体 | `WebServer`、`_RequestHandler`、`_TIMELINE_VIEWER_HTML` |
-| `tubetape.cli` | 命令行参数解析、生命周期编排与轮转 | `main()`、`run_pipeline()`、`rotate_uploaded_segments()` |
+| `tubetape.uploader` | YouTube 分块上传、配额感知与视频删除 | `YouTubeUploader`、`QuotaExceededError`、`delete_video()` |
+| `tubetape.coordinator` | 全局异步任务调度、互斥锁与动态配置管理 | `AppCoordinator`、`rotate_uploaded_segments()`、`find_local_segment_file()` |
+| `tubetape.watcher` | 文件系统动态监听与静默去抖 | `MediaWatcher`、`MtimeScanner` |
+| `tubetape.web` | 画廊、仪表盘、REST API 与 Range 206 串流 | `WebServer`、`_RequestHandler`、`set_app_coordinator()` |
+| `tubetape.cli` | 命令行参数解析、生命周期编排与停机 | `main()`、`run_pipeline()`、`build_parser()` |
 
 ---
 
@@ -124,8 +135,8 @@ try:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(payload)
         handle.flush()
-        os.fsync(handle.fileno())  # 确保落入物理介质
-    os.replace(tmp_path, target)   # POSIX 原子重命名
+        os.fsync(handle.fileno())  # 确保物理落盘
+    os.replace(tmp_path, target)   # POSIX 原生原子重命名
 except BaseException:
     os.unlink(tmp_path)
     raise
@@ -193,30 +204,32 @@ except BaseException:
 - 热扫描 2,500+ 个文件的耗时仅需约 0.2 秒。
 - 扫描期间每 1,000 个文件或每 30 秒阶段性保存一次数据库，杜绝中途强退导致已扫描数据丢失。
 
-#### 拍摄时间探测优先级
-1. **EXIF 拍摄时间**：读取 `DateTimeOriginal`、`CreateDate` 等。
-2. **ffprobe 容器元数据**：读取 QuickTime / MP4 `creation_time`。
-3. **文件名正则兜底 (parse_filename_time)**：匹配形如 `IMG_20240501_120000`、`VID_2024-05-01` 等模式。
-4. **文件 mtime 兜底**：最终使用文件系统修改时间。
+#### 从数据库恢复扫描对象 (`ScannedFile.from_record`)
+为支持 `--no-scan` 极速冷启动，`ScannedFile` 提供了 `from_record(file_id, record, input_dir)` 工厂方法：
+- 直接从 `db.json` 中的 `files` 字段反序列化出完整的 `ScannedFile` 领域模型，包含绝对路径重组、拍摄时间恢复、分类标记恢复与时长恢复。
+- 使系统在启动时完全跳过磁盘 `os.walk`，实现毫秒级启动并直接进入规划与监控状态。
 
 ---
 
-### 4.2 时间线贪心分片与防边界碰撞 (planner.py)
+### 4.2 时间线贪心分片与容量强约束 (planner.py)
 
 #### 确定性排序规则
 所有文件按 `(captured_epoch, file_id)` 元组严格升序排序。无拍摄时间的素材统一置于时间线末尾，`file_id` 作为次级排序键保证严格确定性。
 
 #### 稳定分片 ID (Segment ID) 计算
-分片 ID 不依赖执行时间或随机数，仅由分片内文件与转码参数严格决定：
+分片 ID 不依赖执行时间或随机数，仅由分片内文件哈希与转码配置参数严格决定：
 $$\text{segment\_id} = \text{SHA256}\left(\sum_{f \in \text{sorted(file\_ids)}} f + \sum_{p \in \text{params}} p\right)$$
 任何素材的增加、删除或转码参数变动，必然导致计算出全新的 `segment_id`，从而自动触发增量转码与云端更新。
 
-#### 边界碰撞防争抢设计
-当两个素材具有相同的秒级时间戳（例如连拍照片），规划器在将已有分片时间范围作为不可变边界时，预先建立 `file_id -> existing_segment_id` 倒排索引：
-- 严格遵循原归属优先原则，杜绝由于秒级跨界导致的同秒照片在相邻分片间来回“反复横跳”争抢。
-
-#### 尾部暂存机制 (Pending Queue)
-若未规划素材累计时长不足 `--segment-duration`，且未指定 `--flush`，这部分文件将作为 `Pending` 保留，等待后续新照片合流后再行封口。
+#### 8 小时长视频根本原因与容量强约束防护
+在早期版本中，当大量素材跨越不同历史区间重建时，候选区间的选择逻辑若缺乏跨度约束，可能导致贪心装箱误将后续数千张跨越数年的素材全部塞入同一个分片，产生如 8 小时 32 分钟的异常长视频。
+为此，管线在 `planner.py` 中实现了三重保护体系：
+1. **剩余容量严格钳位 (`remaining_capacity`)**：
+   在分片扩充与合并过程中，严格实时计算 `remaining_capacity = max(0.0, target_duration - current_duration)`。任何素材一旦超出该分片的目标容量，立即强制截断，绝不允许无休止累加。
+2. **窄跨度区间优先匹配**：
+   多候选区间匹配时，按 `cand.range_end - cand.range_start` 严格升序排序，优先收敛到最局部的紧凑分片，防止跨度数年的泛化分片贪婪吞噬后续素材。
+3. **溢出切分 (`greedy_pack`)**：
+   若某历史分片合并后总时长超出 `segment_duration`，自动将其交由 `greedy_pack` 重新分割成若干合规的标准时长分片，彻底杜绝单视频时长超标。
 
 ---
 
@@ -247,9 +260,6 @@ $$\text{segment\_id} = \text{SHA256}\left(\sum_{f \in \text{sorted(file\_ids)}} 
 ```
 zoompan=z='min(zoom+0.0015,1.25)':d=180:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=3840x2160:fps=60
 ```
-
-#### ffmpeg 管道与进度监听
-通过子进程标准错误（stderr）解析帧进度，并将 `(done_count, total_count, current_file)` 实时推送至 Web 状态机。
 
 ---
 
@@ -296,6 +306,9 @@ while response is None:
 - 若错误码为 403 且包含 `quotaExceeded`，抛出内部 `QuotaExceededError`。
 - 上层流水线自动保存数据库，设置休眠退避（默认 1 小时），返回退出码 `_EXIT_QUOTA = 2`。
 
+#### 云端视频删除 (`delete_video`)
+调用 YouTube API `youtube.videos().delete(id=video_id).execute()` 实现云端物理删除，支持静默重试与 404 已删除幂等容错。
+
 ---
 
 ### 4.8 认证流与 Token 自愈 (auth.py)
@@ -309,20 +322,35 @@ while response is None:
 
 ---
 
-### 4.9 本地分片轮转管理 (cli.py - rotate_uploaded_segments)
+### 4.9 核心协同调度器 (coordinator.py)
 
-启动参数 `--keep-segments`（默认 0）控制构建后 MP4 在本地的留存策略：
-```python
-def rotate_uploaded_segments(directory: str, keep_count: int) -> list[str]:
-    # 扫描非隐藏 .mp4 文件
-    mp4_files = [...]
-    # 按修改时间倒序（最新的在前）
-    mp4_files.sort(key=lambda x: x[1], reverse=True)
-    to_delete = mp4_files[max(0, keep_count):]
-    for path, _ in to_delete:
-        os.remove(path)
-```
-- 保存在 `uploaded_segments/{segment.title}.mp4`，文件为公开非隐藏，方便用户直接通过宿主机挂载目录访问。
+`AppCoordinator` 是整个运行时的指挥枢纽，负责后台异步任务编排、互斥执行锁、动态配置热更新及本地视频轮转：
+
+#### 1. 全局任务互斥锁 (`task_lock`)
+为防止用户在 Web 界面同时点击“全量扫描”与“重新构建”导致 ffmpeg 资源争抢与数据库并发脏写，`coordinator` 实现了 `task_lock = threading.Lock()`。
+所有异步操作统一通过互斥锁申请；若有任务正在执行，后续操作直接返回 400 提示友好错误。
+
+#### 2. 核心异步动作调度
+- **`trigger_scan()`**：启动后台守护线程，执行磁盘扫描 -> 规划 -> 转码 -> 轮转全流程。
+- **`rebuild_segment(segment_id)`**：针对指定分片提取素材，原地调用 ffmpeg 重新压制，并在非 `--no-upload` 模式下直接上传。
+- **`upload_segment(segment_id)`**：检查 `uploaded_segments/` 目录下是否存在该分片已有的 MP4，若存在则跳过转码直接执行断点续传。
+- **`delete_youtube_video(segment_id)`**：调用 YouTube API 删除云端视频，并同步重置本地数据库状态为待处理。
+
+#### 3. 动态配置管理与持久化 (`config.json`)
+- 支持在运行时动态热更新参数。
+- 维护 `FINGERPRINT_PARAMS` 集合：
+  ```python
+  FINGERPRINT_PARAMS = frozenset([
+      "segment_duration", "image_duration", "crf",
+      "max_resolution", "canvas_mode", "fps",
+      "x264_preset", "ken_burns",
+  ])
+  ```
+- 修改配置时自动比对受影响字段，若涉及指纹字段则向 Web 界面返回风险提示。配置变更立即原子落盘至 `<db_dir>/config.json`，下一次程序启动时自动优先载入。
+
+#### 4. 本地分片轮转管理 (`rotate_uploaded_segments`)
+- 扫描 `<db_dir>/uploaded_segments/` 目录中的所有非隐藏 `.mp4` 文件。
+- 按文件修改时间 `st_mtime` 倒序排列，保留最新的 $N$ 个文件，超出的旧文件自动执行安全清理。
 
 ---
 
@@ -342,7 +370,13 @@ def rotate_uploaded_segments(directory: str, keep_count: int) -> list[str]:
 - `GET /`：全屏时间线画廊 HTML。
 - `GET /log` 与 `GET /logs`：仪表盘与实时日志控制台 HTML。
 - `GET /api/status`：核心运行状态与当前任务 JSON。
-- `GET /api/dashboard`：包含扫描统计、分段列表、构建进度、本地保留视频统计的综合大屏接口。
+- `GET /api/dashboard`：包含扫描统计、分段列表、构建进度、本地保留视频统计及分段可用动作的综合大屏接口。
+- `GET /api/config`：获取当前运行配置及指纹参数清单。
+- `POST /api/config`：动态更新运行参数并保存至 `config.json`。
+- `POST /api/scan/start`：异步触发全量扫描任务。
+- `POST /api/segment/rebuild`：异步触发指定分片重新构建。
+- `POST /api/segment/upload`：异步触发指定分片本地视频直传。
+- `POST /api/segment/delete_youtube`：调用 API 删除云端对应视频。
 - `GET /api/media/summary`：时间线年月分布统计（支持侧边栏 Scrubber）。
 - `GET /api/media/items`：按时间线分页拉取媒体元数据。
 - `GET /api/media/view?id=...`：高清图片展示接口（支持 HEIC 转码缓存与路径穿越防护）。
@@ -376,21 +410,32 @@ if not abs_path.startswith(os.path.abspath(media_dir)):
 
 ---
 
+### 4.12 命令行入口与管线编排 (cli.py)
+
+- **配置加载层叠优先级**：
+  CLI 命令行参数 > `config.json` 运行时持久化配置 > 代码内置默认参数。
+- **无凭证纯本地模式兼容**：
+  若设置 `--no-upload`，管线完全跳过 Google OAuth 凭据加载与云端对账，直接执行本地转码并退出或进入文件监控。
+- **平稳停机机制**：
+  捕获 `SIGTERM` 与 `SIGINT`，设置内部退出事件，当前正在转码或上传的块平稳结束后安全退出，保证数据库完整。
+
+---
+
 ## 5. 数据生命周期与状态流转
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle : 系统启动
-    Idle --> Scanning : 触发扫描
+    Idle --> Scanning : 触发扫描 (启动或点击扫描按钮)
     Scanning --> Planning : 扫描完成 (生成 ScannedFile)
     Planning --> Transcoding : 规划完成 (生成 Segment)
     Transcoding --> Uploading : ffmpeg 转码生成 MP4
     Uploading --> Sealed : 上传 YouTube 成功
     Uploading --> QuotaBackoff : 遇到配额限制 (403)
     QuotaBackoff --> Uploading : 退避休眠结束
-    Sealed --> Rotating : 触发 --keep-segments 检查
+    Sealed --> Rotating : 触发 --keep-segments 轮转
     Rotating --> Watching : 移除非保留分片，常驻监控
-    Watching --> Scanning : 检测到新照片 (经 Quiet Period)
+    Watching --> Scanning : 检测到新文件 (经 Quiet Period 去抖)
 ```
 
 ---
@@ -398,22 +443,27 @@ stateDiagram-v2
 ## 6. 测试体系与质量保障
 
 TubeTape 配备了完整的自动化测试套件（基于 `pytest`），对外部依赖进行了严格隔离：
-- **测试用例总数**：249 项。
+- **测试用例总数**：256 项自动化测试全部通过。
 - **覆盖范围**：
-  - `test_cli.py`：参数解析后置校验、流程编排、退出码、本地分片轮转逻辑。
-  - `test_scanner.py`：格式探测、EXIF/ffprobe 解析、文件名正则兜底、快速采样哈希正确性、哈希缓存。
-  - `test_planner.py`：贪心装箱、稳定分片 ID、同秒边界处理、Pending 队列。
+  - `test_cli.py`：参数解析后置校验、流程编排、退出码、本地分片轮转逻辑、`--no-scan` 与 `--no-upload` 模式。
+  - `test_scanner.py`：格式探测、EXIF/ffprobe 解析、文件名正则兜底、快速采样哈希正确性、哈希缓存、`from_record` 恢复。
+  - `test_planner.py`：贪心装箱、稳定分片 ID、同秒边界处理、Pending 队列、长视频容量钳位与切分。
   - `test_rebuild.py`：增量分片插入与两阶段提交。
-  - `test_transcoder.py`：画布几何计算、Ken Burns 滤镜、ffmpeg 指令拼装。
+  - `test_transcoder.py`：画布几何计算、Ken Burns 滤镜、ffmpeg 指令拼装、磁盘空间检测。
   - `test_uploader.py`：分块流式上传、配额错误捕获、播放列表写入。
   - `test_auth.py`：无头授权、Token 自动刷新、过期自愈。
   - `test_reconcile.py`：云端标题短 ID 匹配与索引恢复。
   - `test_watcher.py`：Watchdog 事件派发与去抖。
-  - `test_web.py`：画廊展示、Dashboard 统计、HEIC 动态转码、视频 Range 206 流式传输、OAuth 回调拦截。
+  - `test_web.py`：画廊展示、Dashboard 统计、HEIC 动态转码、视频 Range 206 流式传输、OAuth 回调拦截、参数配置 API、分段操作调度 API。
+
+执行全量测试套件：
+```bash
+pytest -v
+```
 
 ---
 
-## 7. 构建、打包与跨平台规范
+## 7. 构建、打包与容器化规范
 
 ### Docker 容器化设计
 - **基础镜像**：`python:3.11-slim`。
@@ -421,9 +471,7 @@ TubeTape 配备了完整的自动化测试套件（基于 `pytest`），对外�
 - **Python 依赖隔离**：通过 `pyproject.toml` 标准机制安装，不夹带测试套件。
 - **运行入口**：`ENTRYPOINT ["tubetape"]`，支持 CLI 参数透明透传。
 
-### 本地编译打包 (PyInstaller)
-项目包含 `tubetape.spec`，支持通过 PyInstaller 构建免 Python 环境的单文件可执行包：
+构建与本地运行镜像：
 ```bash
-pyinstaller tubetape.spec
+docker build -t tubetape:latest .
 ```
-构建产物输出于 `dist/tubetape`。
