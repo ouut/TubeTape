@@ -597,6 +597,35 @@ class ScannedFile:
             "mtime_ns": self.mtime_ns,
         }
 
+    @classmethod
+    def from_record(cls, file_id: str, record: dict, input_dir: str = ".") -> ScannedFile:
+        rel_path = record.get("path") or ""
+        abs_path = os.path.abspath(os.path.join(input_dir, rel_path)) if input_dir else rel_path
+        cap_utc = record.get("captured_at_utc")
+        cap_epoch = record.get("captured_epoch")
+        if cap_epoch is None and cap_utc:
+            dt = parse_iso_utc(cap_utc)
+            if dt:
+                cap_epoch = dt.timestamp()
+        return cls(
+            file_id=file_id,
+            abs_path=abs_path,
+            rel_path=rel_path,
+            name=record.get("name") or os.path.basename(rel_path),
+            type=record.get("type", "image"),
+            size_bytes=int(record.get("size_bytes", 0)),
+            captured_at_utc=cap_utc,
+            captured_epoch=cap_epoch,
+            resolution=record.get("resolution"),
+            duration_seconds=float(record.get("duration_seconds") or 0.0) if record.get("duration_seconds") is not None else None,
+            location=record.get("location"),
+            missing_meta=bool(record.get("missing_meta", False)),
+            time_source=record.get("time_source", "metadata"),
+            source=record.get("source", "unknown"),
+            mtime_ns=record.get("mtime_ns"),
+        )
+
+
 
 @dataclass
 class ScanResult:

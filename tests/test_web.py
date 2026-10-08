@@ -294,3 +294,165 @@ def test_web_server_media_api_and_streaming(tmp_path):
         server.stop()
 
 
+class _FakeUploader:
+    def __init__(self):
+        self.deleted_videos = []
+        self.uploaded_videos = []
+
+    def upload(self, media_path, title, description, privacy="private", **kwargs):
+        vid = f"yt_{title[:8]}"
+        self.uploaded_videos.append(vid)
+        return vid
+
+    def verify(self, video_id):
+        pass
+
+    def delete_video(self, video_id):
+        self.deleted_videos.append(video_id)
+
+
+def test_web_server_config_and_coordinator_actions(tmp_path):
+    from tubetape.coordinator import AppCoordinator
+    from tubetape.cli import parse_args
+    from tubetape.db import Database
+
+    db_path = tmp_path / "db.json"
+    db = Database(path=str(db_path))
+    db.upsert_segment("seg1", {
+        "title": "20240101 - 20240102 [seg1]",
+        "file_ids": ["f1"],
+        "range": ["2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"],
+        "duration_seconds": 60.0,
+        "youtube_video_id": "yt_existing_123",
+        "previous_video_ids": [],
+        "status": "sealed",
+    })
+    db.upsert_file("f1", {
+        "path": "img.png",
+        "name": "img.png",
+        "type": "image",
+        "captured_at_utc": "2024-01-01T00:00:00Z",
+        "duration_seconds": 3.0,
+        "size_bytes": 10,
+    })
+    db.save()
+
+    (tmp_path / "img.png").write_bytes(b"dummy_png")
+
+    args = parse_args(["--input", str(tmp_path), "--db", str(db_path)])
+    fake_uploader = _FakeUploader()
+    coord = AppCoordinator(args, db=db, uploader=fake_uploader)
+
+    web.set_app_coordinator(coord)
+    web.set_web_context(media_dir=str(tmp_path), db=db, db_path=str(db_path), keep_segments=2)
+
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        # 1. GET /api/config
+        with urllib.request.urlopen(f"{base_url}/api/config") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert "config" in data
+            assert data["config"]["crf"] == 16
+            assert "segment_duration" in data["fingerprint_params"]
+
+        # 2. POST /api/config
+        update_data = json.dumps({"crf": 22, "keep_segments": 5, "no_upload": True}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/api/config",
+            data=update_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert data["config"]["crf"] == 22
+            assert data["config"]["keep_segments"] == 5
+            assert data["config"]["no_upload"] is True
+
+        assert coord.args.crf == 22
+        assert coord.args.keep_segments == 5
+        assert coord.args.no_upload is True
+        # Verify saved to config.json
+        assert (tmp_path / "config.json").exists()
+
+        # 3. POST /api/config with invalid value fails
+        bad_req = urllib.request.Request(
+            f"{base_url}/api/config",
+            data=json.dumps({"crf": 999}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(bad_req)
+        assert exc_info.value.code == 400
+
+        # 4. POST /api/segment/delete_youtube
+        del_req = urllib.request.Request(
+            f"{base_url}/api/segment/delete_youtube?id=seg1",
+            data=b"",
+            method="POST",
+        )
+        with urllib.request.urlopen(del_req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+
+        assert "yt_existing_123" in fake_uploader.deleted_videos
+        assert db.get_segment("seg1")["youtube_video_id"] is None
+        assert "yt_existing_123" in db.get_segment("seg1")["previous_video_ids"]
+
+        # 5. POST /api/segment/upload when file is missing -> fails
+        up_req = urllib.request.Request(
+            f"{base_url}/api/segment/upload?id=seg1",
+            data=b"",
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(up_req)
+        assert exc_info.value.code == 400
+
+        # Create segment file in uploaded_segments/ and retry upload
+        seg_dir = tmp_path / "uploaded_segments"
+        seg_dir.mkdir(exist_ok=True)
+        seg_file = seg_dir / "20240101 - 20240102 [seg1].mp4"
+        seg_file.write_bytes(b"dummy_video_bytes")
+
+        up_req2 = urllib.request.Request(
+            f"{base_url}/api/segment/upload?id=seg1",
+            data=b"",
+            method="POST",
+        )
+        with urllib.request.urlopen(up_req2) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+
+        # 6. GET /api/dashboard verifies has_local_file and stats
+        with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
+            assert res.status == 200
+            d = json.loads(res.read().decode("utf-8"))
+            assert d["stats"]["no_upload"] is True
+            assert d["segments"][0]["has_local_file"] is True
+
+        # 7. POST /api/scan/start
+        req_scan = urllib.request.Request(f"{base_url}/api/scan/start", data=b"", method="POST")
+        with urllib.request.urlopen(req_scan) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+
+    finally:
+        web.set_app_coordinator(None)
+        server.stop()
+
+
+
+

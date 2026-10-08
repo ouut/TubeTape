@@ -46,15 +46,27 @@ _server_state = {
         "current_file": None,
     },
     "planned_segments": [],
+    "coordinator": None,
     "_file_cache": None,
     "_file_cache_db_len": -1,
     "_date_groups_cache": None,
 }
 
 
+def set_app_coordinator(coordinator) -> None:
+    """Set active AppCoordinator instance."""
+    _server_state["coordinator"] = coordinator
+
+
+def get_app_coordinator():
+    """Get active AppCoordinator instance if registered."""
+    return _server_state.get("coordinator")
+
+
 def is_running() -> bool:
     """Return True if WebServer is currently running."""
     return _server_state["is_running"]
+
 
 
 def get_web_port() -> int:
@@ -1460,6 +1472,154 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
     .log-line-warn { color: #fcd34d; font-weight: 600; }
     .log-line-error { color: #f87171; font-weight: 700; }
     .log-line-debug { color: #71717a; }
+
+    .btn-top {
+      background: #27272e;
+      border: 1px solid var(--border);
+      color: #fff;
+      padding: 6px 13px;
+      border-radius: 6px;
+      font-size: 0.83rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-top:hover { background: #353540; }
+    .btn-scan {
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      color: #34d399;
+    }
+    .btn-scan:hover { background: rgba(16, 185, 129, 0.28); }
+    .btn-action {
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.76rem;
+      font-weight: 500;
+      border: 1px solid var(--border);
+      background: #27272e;
+      color: #e1e1e6;
+      cursor: pointer;
+      transition: all 0.15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .btn-action:hover:not(:disabled) {
+      background: #363640;
+      border-color: #555;
+    }
+    .btn-action:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+    .btn-action-rebuild { color: #93c5fd; }
+    .btn-action-upload { color: #86efac; }
+    .btn-action-delete { color: #fca5a5; }
+    .btn-action-delete:hover:not(:disabled) { background: rgba(239, 68, 68, 0.2); border-color: #ef4444; }
+
+    /* Modal */
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(4px);
+      z-index: 1000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .modal-card {
+      background: #18181c;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      max-width: 680px;
+      width: 100%;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+    }
+    .modal-header {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .modal-header h3 { font-size: 1.05rem; font-weight: 700; color: #fff; }
+    .modal-body {
+      padding: 16px 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .modal-footer {
+      padding: 12px 20px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 12px;
+      background: #141417;
+      border-radius: 0 0 10px 10px;
+    }
+    .form-group-title {
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: #93c5fd;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .form-item {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .form-label {
+      font-size: 0.78rem;
+      color: #a1a1aa;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .form-label .tag-warn {
+      color: #f59e0b;
+      font-size: 0.7rem;
+    }
+    .form-control {
+      background: #0f0f12;
+      border: 1px solid #33333a;
+      color: #fff;
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 0.83rem;
+      outline: none;
+    }
+    .form-control:focus { border-color: #3b82f6; }
+    .warn-box {
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      color: #fcd34d;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      line-height: 1.45;
+      display: none;
+    }
   </style>
 </head>
 <body>
@@ -1469,6 +1629,8 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
       <div>运行控制台与仪表盘</div>
     </div>
     <div class="header-right">
+      <button id="scan-btn" class="btn-top btn-scan" onclick="startScan()">🔄 开始全量扫描</button>
+      <button class="btn-top" onclick="openConfigModal()">⚙️ 参数配置</button>
       <a href="/" class="btn-gallery">📱 打开全屏画廊 (/)</a>
       <div class="status-badge">
         <div class="status-dot"></div>
@@ -1565,10 +1727,11 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
               <th>时长</th>
               <th>构建状态 / 进度</th>
               <th>YouTube 视频</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody id="segments-table-body">
-            <tr><td colspan="5" style="text-align: center; color: #888;">暂无分段信息</td></tr>
+            <tr><td colspan="6" style="text-align: center; color: #888;">暂无分段信息</td></tr>
           </tbody>
         </table>
       </div>
@@ -1597,6 +1760,138 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="log-box" class="log-box">正在连接日志流...\n</div>
     </div>
   </main>
+
+  <!-- Config Modal -->
+  <div id="config-modal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>⚙️ 系统运行参数配置</h3>
+        <button class="btn-action" style="padding: 4px 10px;" onclick="closeConfigModal()">✕ 关闭</button>
+      </div>
+      <div class="modal-body">
+        <div id="config-warn-box" class="warn-box">
+          ⚠️ <strong>高危警示：检测到修改了影响分片指纹（Segment ID）的核心参数！</strong><br>
+          修改这些参数会导致后续扫描规划时，所有已有分片的指纹不匹配，系统会认为视频规格已过时，从而可能触发历史视频的全部重新转码与重新上传（替换原视频）。请谨慎修改！
+        </div>
+
+        <div>
+          <div class="form-group-title"><span>🎞️</span> 核心分段与转码参数 <span class="tag-warn" style="font-size:0.75rem;">(⚠️ 影响 Segment ID 指纹)</span></div>
+          <div class="form-grid">
+            <div class="form-item">
+              <label class="form-label">分段最大时长 (例如 20m, 1h, 1200):</label>
+              <input class="form-control" id="cfg-segment_duration" type="text" oninput="checkConfigChanges()" />
+            </div>
+            <div class="form-item">
+              <label class="form-label">照片播放时长 (秒):</label>
+              <input class="form-control" id="cfg-image_duration" type="number" step="0.5" min="0.5" oninput="checkConfigChanges()" />
+            </div>
+            <div class="form-item">
+              <label class="form-label">CRF 转码画质 (0-51, 越小画质越高):</label>
+              <input class="form-control" id="cfg-crf" type="number" min="0" max="51" oninput="checkConfigChanges()" />
+            </div>
+            <div class="form-item">
+              <label class="form-label">最大分辨率 (如 7680x4320, 1920x1080):</label>
+              <input class="form-control" id="cfg-max_resolution" type="text" oninput="checkConfigChanges()" />
+            </div>
+            <div class="form-item">
+              <label class="form-label">输出帧率 FPS (如 30, 60):</label>
+              <input class="form-control" id="cfg-fps" type="number" min="1" max="120" oninput="checkConfigChanges()" />
+            </div>
+            <div class="form-item">
+              <label class="form-label">画布模式 (Canvas Mode):</label>
+              <select class="form-control" id="cfg-canvas_mode" onchange="checkConfigChanges()">
+                <option value="max">max (包围盒不缩放)</option>
+                <option value="first">first (首文件分辨率)</option>
+              </select>
+            </div>
+            <div class="form-item">
+              <label class="form-label">x264 编码预设 (Preset):</label>
+              <select class="form-control" id="cfg-x264_preset" onchange="checkConfigChanges()">
+                <option value="ultrafast">ultrafast</option>
+                <option value="superfast">superfast</option>
+                <option value="veryfast">veryfast</option>
+                <option value="faster">faster</option>
+                <option value="fast">fast</option>
+                <option value="medium">medium</option>
+                <option value="slow">slow</option>
+                <option value="slower">slower</option>
+                <option value="veryslow">veryslow</option>
+              </select>
+            </div>
+            <div class="form-item" style="justify-content: center;">
+              <label class="form-label">
+                <input type="checkbox" id="cfg-ken_burns" onchange="checkConfigChanges()" style="margin-right: 6px;" />
+                启用 Ken Burns (照片平移缩放运镜)
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="form-group-title"><span>☁️</span> 上传与本地保留策略</div>
+          <div class="form-grid">
+            <div class="form-item">
+              <label class="form-label">本地磁盘保留视频数量 (0 为构建上传后即删):</label>
+              <input class="form-control" id="cfg-keep_segments" type="number" min="0" />
+            </div>
+            <div class="form-item" style="justify-content: center;">
+              <label class="form-label">
+                <input type="checkbox" id="cfg-no_upload" style="margin-right: 6px;" />
+                仅本地构建，不上传到 YouTube (--no-upload)
+              </label>
+            </div>
+            <div class="form-item" style="justify-content: center;">
+              <label class="form-label">
+                <input type="checkbox" id="cfg-no_scan" style="margin-right: 6px;" />
+                启动时跳过扫描，直接读取数据库 (--no-scan)
+              </label>
+            </div>
+            <div class="form-item">
+              <label class="form-label">YouTube 隐私设置:</label>
+              <select class="form-control" id="cfg-privacy">
+                <option value="private">private (私享)</option>
+                <option value="unlisted">unlisted (不公开列出)</option>
+              </select>
+            </div>
+            <div class="form-item" style="grid-column: 1 / -1;">
+              <label class="form-label">YouTube 播放列表 ID (可选):</label>
+              <input class="form-control" id="cfg-playlist" type="text" placeholder="留空则不加入播放列表" />
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="form-group-title"><span>🔍</span> 文件过滤与 Watch 监听设置</div>
+          <div class="form-grid">
+            <div class="form-item">
+              <label class="form-label">Watch 静默期 (如 10m):</label>
+              <input class="form-control" id="cfg-quiet_period" type="text" />
+            </div>
+            <div class="form-item">
+              <label class="form-label">Watch 轮询周期 (如 30s):</label>
+              <input class="form-control" id="cfg-poll_interval" type="text" />
+            </div>
+            <div class="form-item" style="justify-content: center;">
+              <label class="form-label">
+                <input type="checkbox" id="cfg-only_camera_photos" style="margin-right: 6px;" />
+                仅处理相机照片 (过滤截图/下载)
+              </label>
+            </div>
+            <div class="form-item" style="justify-content: center;">
+              <label class="form-label">
+                <input type="checkbox" id="cfg-only_phone_videos" style="margin-right: 6px;" />
+                仅处理手机拍摄视频
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-action" style="padding: 6px 16px;" onclick="closeConfigModal()">取消</button>
+        <button class="auth-btn-primary" style="padding: 6px 18px; border: none; cursor: pointer;" onclick="saveConfig()">保存并应用配置</button>
+      </div>
+    </div>
+  </div>
 
   <script>
     let autoScroll = true;
@@ -1728,7 +2023,7 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
           const tbody = document.getElementById('segments-table-body');
           document.getElementById('segments-count-text').textContent = `共 ${d.segments.length} 个分段`;
           if (d.segments.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #888;">暂无分段信息</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #888;">暂无分段信息</td></tr>';
           } else {
             tbody.innerHTML = d.segments.map(seg => {
               let statusHtml = '';
@@ -1748,6 +2043,8 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
                 statusHtml = '<span class="badge badge-pending">⏳ 等待构建</span>';
               } else if (seg.status === 'failed') {
                 statusHtml = '<span class="badge badge-failed">❌ 构建失败</span>';
+              } else if (seg.status === 'sealed' && !seg.youtube_video_id) {
+                statusHtml = '<span class="badge badge-uploaded" style="color: #60a5fa; border-color: rgba(96,165,250,0.3); background: rgba(96,165,250,0.15);">📦 本地就绪</span>';
               } else {
                 statusHtml = `<span class="badge badge-pending">${escapeHtml(seg.status)}</span>`;
               }
@@ -1757,6 +2054,14 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
                 ytHtml = `<a href="https://youtu.be/${seg.youtube_video_id}" target="_blank" class="yt-link">▶️ 查看视频 (${seg.youtube_video_id})</a>`;
               }
 
+              let actionsHtml = `
+                <div style="display: flex; gap: 6px; align-items: center;">
+                  <button class="btn-action btn-action-rebuild" onclick="rebuildSegment('${seg.segment_id}')" title="强制重新转码构建该分片">🔨 重建</button>
+                  <button class="btn-action btn-action-upload" ${seg.has_local_file ? '' : 'disabled title="本地 uploaded_segments/ 中未找到视频文件，需先重新构建"'} onclick="uploadSegment('${seg.segment_id}')">☁️ 上传</button>
+                  <button class="btn-action btn-action-delete" ${seg.youtube_video_id ? '' : 'disabled title="未上传到 YouTube"'} onclick="deleteYoutubeVideo('${seg.segment_id}', '${seg.youtube_video_id || ''}')">🗑️ 删视频</button>
+                </div>
+              `;
+
               return `
                 <tr>
                   <td><strong>${escapeHtml(seg.title)}</strong></td>
@@ -1764,10 +2069,12 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
                   <td>${seg.duration_text}</td>
                   <td>${statusHtml}</td>
                   <td>${ytHtml}</td>
+                  <td>${actionsHtml}</td>
                 </tr>
               `;
             }).join('');
           }
+
         }
       } catch (e) {}
     }
@@ -1795,7 +2102,192 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
         }
       } catch (e) {}
 
-      setTimeout(pollLogs, 1500);
+    let initialConfig = null;
+    let fingerprintParams = [];
+
+    async function openConfigModal() {
+      try {
+        const res = await fetch('/api/config');
+        if (!res.ok) throw new Error('无法读取配置');
+        const data = await res.json();
+        initialConfig = data.config || {};
+        fingerprintParams = data.fingerprint_params || [];
+
+        document.getElementById('cfg-segment_duration').value = initialConfig.segment_duration + 's';
+        document.getElementById('cfg-image_duration').value = initialConfig.image_duration;
+        document.getElementById('cfg-crf').value = initialConfig.crf;
+        document.getElementById('cfg-max_resolution').value = initialConfig.max_resolution;
+        document.getElementById('cfg-fps').value = initialConfig.fps;
+        document.getElementById('cfg-canvas_mode').value = initialConfig.canvas_mode;
+        document.getElementById('cfg-x264_preset').value = initialConfig.x264_preset;
+        document.getElementById('cfg-ken_burns').checked = !!initialConfig.ken_burns;
+
+        document.getElementById('cfg-keep_segments').value = initialConfig.keep_segments;
+        document.getElementById('cfg-no_upload').checked = !!initialConfig.no_upload;
+        document.getElementById('cfg-no_scan').checked = !!initialConfig.no_scan;
+        document.getElementById('cfg-privacy').value = initialConfig.privacy || 'private';
+        document.getElementById('cfg-playlist').value = initialConfig.playlist || '';
+
+        document.getElementById('cfg-quiet_period').value = initialConfig.quiet_period + 's';
+        document.getElementById('cfg-poll_interval').value = initialConfig.poll_interval + 's';
+        document.getElementById('cfg-only_camera_photos').checked = !!initialConfig.only_camera_photos;
+        document.getElementById('cfg-only_phone_videos').checked = !!initialConfig.only_phone_videos;
+
+        checkConfigChanges();
+        document.getElementById('config-modal').style.display = 'flex';
+      } catch (err) {
+        alert('打开配置失败: ' + err.message);
+      }
+    }
+
+    function closeConfigModal() {
+      document.getElementById('config-modal').style.display = 'none';
+    }
+
+    function checkConfigChanges() {
+      if (!initialConfig) return false;
+      let changed = false;
+      const currentFp = {
+        image_duration: parseFloat(document.getElementById('cfg-image_duration').value),
+        crf: parseInt(document.getElementById('cfg-crf').value, 10),
+        max_resolution: document.getElementById('cfg-max_resolution').value.trim(),
+        fps: parseInt(document.getElementById('cfg-fps').value, 10),
+        canvas_mode: document.getElementById('cfg-canvas_mode').value,
+        x264_preset: document.getElementById('cfg-x264_preset').value,
+        ken_burns: document.getElementById('cfg-ken_burns').checked,
+      };
+
+      if (currentFp.image_duration !== initialConfig.image_duration ||
+          currentFp.crf !== initialConfig.crf ||
+          currentFp.max_resolution !== initialConfig.max_resolution ||
+          currentFp.fps !== initialConfig.fps ||
+          currentFp.canvas_mode !== initialConfig.canvas_mode ||
+          currentFp.x264_preset !== initialConfig.x264_preset ||
+          currentFp.ken_burns !== initialConfig.ken_burns) {
+        changed = true;
+      }
+      const warnBox = document.getElementById('config-warn-box');
+      if (warnBox) warnBox.style.display = changed ? 'block' : 'none';
+      return changed;
+    }
+
+    async function saveConfig() {
+      const hasFpChanges = checkConfigChanges();
+      if (hasFpChanges) {
+        const ok = confirm(
+          "⚠️ 高危警告：检测到您修改了影响 Segment ID（分片指纹）的核心转码参数！\\n\\n" +
+          "修改这些参数会导致所有既有分片指纹与新参数不符，后续可能触发所有历史视频重新转码并重新上传到 YouTube。\\n\\n" +
+          "是否确认保存并应用新配置？"
+        );
+        if (!ok) return;
+      }
+
+      const payload = {
+        segment_duration: document.getElementById('cfg-segment_duration').value.trim(),
+        image_duration: parseFloat(document.getElementById('cfg-image_duration').value),
+        crf: parseInt(document.getElementById('cfg-crf').value, 10),
+        max_resolution: document.getElementById('cfg-max_resolution').value.trim(),
+        fps: parseInt(document.getElementById('cfg-fps').value, 10),
+        canvas_mode: document.getElementById('cfg-canvas_mode').value,
+        x264_preset: document.getElementById('cfg-x264_preset').value,
+        ken_burns: document.getElementById('cfg-ken_burns').checked,
+        keep_segments: parseInt(document.getElementById('cfg-keep_segments').value, 10),
+        no_upload: document.getElementById('cfg-no_upload').checked,
+        no_scan: document.getElementById('cfg-no_scan').checked,
+        privacy: document.getElementById('cfg-privacy').value,
+        playlist: document.getElementById('cfg-playlist').value.trim(),
+        quiet_period: document.getElementById('cfg-quiet_period').value.trim(),
+        poll_interval: document.getElementById('cfg-poll_interval').value.trim(),
+        only_camera_photos: document.getElementById('cfg-only_camera_photos').checked,
+        only_phone_videos: document.getElementById('cfg-only_phone_videos').checked,
+      };
+
+      try {
+        const res = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          alert('✅ 配置已更新并成功保存至 config.json！');
+          closeConfigModal();
+          pollDashboard();
+        } else {
+          alert('❌ 保存配置失败: ' + (d.error || '未知错误'));
+        }
+      } catch (err) {
+        alert('❌ 保存配置网络异常: ' + err.message);
+      }
+    }
+
+    async function startScan() {
+      const btn = document.getElementById('scan-btn');
+      btn.disabled = true;
+      btn.textContent = '🔄 正在请求扫描...';
+      try {
+        const res = await fetch('/api/scan/start', { method: 'POST' });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          alert('✅ ' + (d.message || '全量扫描已启动'));
+          pollDashboard();
+        } else {
+          alert('❌ 触发扫描失败: ' + (d.error || '未知错误'));
+        }
+      } catch (err) {
+        alert('❌ 请求失败: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🔄 开始全量扫描';
+      }
+    }
+
+    async function rebuildSegment(id) {
+      if (!confirm(`确定要重新构建分段 [${id.slice(0, 12)}] 吗？`)) return;
+      try {
+        const res = await fetch(`/api/segment/rebuild?id=${encodeURIComponent(id)}`, { method: 'POST' });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          alert('✅ ' + (d.message || '分段重建已启动'));
+          pollDashboard();
+        } else {
+          alert('❌ 重建失败: ' + (d.error || '未知错误'));
+        }
+      } catch (err) {
+        alert('❌ 请求失败: ' + err.message);
+      }
+    }
+
+    async function uploadSegment(id) {
+      if (!confirm(`确定要上传本地视频文件到 YouTube 吗？`)) return;
+      try {
+        const res = await fetch(`/api/segment/upload?id=${encodeURIComponent(id)}`, { method: 'POST' });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          alert('✅ ' + (d.message || '视频上传已启动'));
+          pollDashboard();
+        } else {
+          alert('❌ 上传失败: ' + (d.error || '未知错误'));
+        }
+      } catch (err) {
+        alert('❌ 请求失败: ' + err.message);
+      }
+    }
+
+    async function deleteYoutubeVideo(id, videoId) {
+      if (!confirm(`⚠️ 警告：确定要从 YouTube 删除视频 [${videoId}] 吗？此操作不可撤销！`)) return;
+      try {
+        const res = await fetch(`/api/segment/delete_youtube?id=${encodeURIComponent(id)}`, { method: 'POST' });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          alert('✅ ' + (d.message || 'YouTube 视频已删除'));
+          pollDashboard();
+        } else {
+          alert('❌ 删除失败: ' + (d.error || '未知错误'));
+        }
+      } catch (err) {
+        alert('❌ 请求失败: ' + err.message);
+      }
     }
 
     setInterval(pollDashboard, 2000);
@@ -2033,25 +2525,94 @@ class _RequestHandler(BaseHTTPRequestHandler):
             _logger.warning("OAuth exchange failed: %s", exc)
             self._send_json(400, {"ok": False, "error": str(exc)})
 
+    def _read_json_body(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length <= 0:
+            return {}
+        try:
+            raw = self.rfile.read(content_length).decode("utf-8")
+            return json.loads(raw)
+        except Exception:
+            return {}
+
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        query = parse_qs(parsed.query)
 
         if path == "/api/auth/submit":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else ""
-            target = ""
-            if body:
-                try:
-                    data = json.loads(body)
-                    target = data.get("url") or data.get("code") or ""
-                except json.JSONDecodeError:
-                    target = body.strip()
+            data = self._read_json_body()
+            target = data.get("url") or data.get("code") or ""
             self._handle_auth_exchange(target)
+            return
+
+        if path == "/api/scan/start":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            ok, msg = coord.trigger_scan()
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg})
+            return
+
+        if path == "/api/segment/rebuild":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            data = self._read_json_body()
+            seg_id = query.get("id", [None])[0] or data.get("id") or data.get("segment_id")
+            if not seg_id:
+                self._send_json(400, {"ok": False, "error": "缺少参数: id"})
+                return
+            ok, msg = coord.rebuild_segment(seg_id)
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg})
+            return
+
+        if path == "/api/segment/upload":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            data = self._read_json_body()
+            seg_id = query.get("id", [None])[0] or data.get("id") or data.get("segment_id")
+            if not seg_id:
+                self._send_json(400, {"ok": False, "error": "缺少参数: id"})
+                return
+            ok, msg = coord.upload_segment(seg_id)
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg})
+            return
+
+        if path == "/api/segment/delete_youtube":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            data = self._read_json_body()
+            seg_id = query.get("id", [None])[0] or data.get("id") or data.get("segment_id")
+            if not seg_id:
+                self._send_json(400, {"ok": False, "error": "缺少参数: id"})
+                return
+            ok, msg = coord.delete_youtube_video(seg_id)
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg})
+            return
+
+        if path == "/api/config":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            data = self._read_json_body()
+            try:
+                res = coord.update_config(data)
+                self._send_json(200, {"ok": True, "config": res["config"]})
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
             return
 
         self.send_response(404)
         self.end_headers()
+
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -2156,6 +2717,39 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._handle_auth_exchange(target)
             return
 
+        # Route /api/config
+        if path == "/api/config":
+            coord = get_app_coordinator()
+            if coord:
+                self._send_json(200, coord.get_config())
+            else:
+                from .coordinator import FINGERPRINT_PARAMS
+                self._send_json(200, {
+                    "config": {
+                        "segment_duration": 3600.0,
+                        "keep_segments": _server_state.get("keep_segments", 0),
+                        "no_upload": False,
+                        "no_scan": False,
+                        "image_duration": 3.0,
+                        "crf": 16,
+                        "max_resolution": "7680x4320",
+                        "canvas_mode": "max",
+                        "fps": 60,
+                        "x264_preset": "slow",
+                        "ken_burns": False,
+                        "privacy": "private",
+                        "playlist": "",
+                        "only_camera_photos": False,
+                        "only_phone_videos": False,
+                        "quiet_period": 600.0,
+                        "poll_interval": 30.0,
+                        "mtime_interval": 3600.0,
+                        "quota_backoff": 3600.0,
+                    },
+                    "fingerprint_params": list(FINGERPRINT_PARAMS),
+                })
+            return
+
         # Route /api/logs
         if path == "/api/logs":
             log_file = _server_state.get("log_file")
@@ -2258,6 +2852,22 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 "current_file": cur_tc.get("current_file", ""),
             }
 
+        # Check has_local_file for each segment
+        coord = get_app_coordinator()
+        for sid, seg_info in segments_dict.items():
+            has_local = False
+            if coord:
+                has_local = coord.find_local_segment_file(sid, seg_info.get("title")) is not None
+            elif db_path:
+                segments_dir = os.path.join(os.path.dirname(db_path), "uploaded_segments")
+                if os.path.isdir(segments_dir):
+                    t = seg_info.get("title")
+                    cands = [os.path.join(segments_dir, f"{sid}.mp4")]
+                    if t:
+                        cands.append(os.path.join(segments_dir, f"{t}.mp4"))
+                    has_local = any(os.path.isfile(c) for c in cands)
+            seg_info["has_local_file"] = has_local
+
         # Sort segments chronologically
         segments_list = list(segments_dict.values())
         segments_list.sort(key=lambda x: (x["start_ts"] or "", x["title"]))
@@ -2279,9 +2889,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 "uploaded_segments": uploaded_count,
                 "disk_segments_count": disk_count,
                 "keep_segments": _server_state.get("keep_segments", 0),
+                "no_upload": bool(getattr(coord.args, "no_upload", False)) if coord else False,
             },
             "segments": segments_list,
         }
+
         self._send_json(200, payload)
 
     def _api_media_summary(self) -> None:

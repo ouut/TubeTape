@@ -14,11 +14,12 @@ import time
 from . import auth, durations
 from .chapters import chapters_text
 from .db import SEGMENT_STATUS_SEALED, Database
+from .coordinator import AppCoordinator
 from .log import get_logger, setup_logging
 from .planner import plan
 from .rebuild import Rebuilder
 from .reconcile import embed_segment_id, fetch_remote_index
-from .scanner import scan
+from .scanner import ScannedFile, ScanResult, scan
 from .transcoder import TranscodeConfig, transcode_segment
 from .ui import Reporter
 from .uploader import QuotaExceededError
@@ -212,7 +213,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="number of latest transcoded segment videos to keep in uploaded_segments/ directory (default: 0 = delete immediately after upload)",
     )
+    parser.add_argument(
+        "--no-scan",
+        "--skip-scan",
+        action="store_true",
+        default=False,
+        help="skip initial full scan on startup and start directly from database (default: False)",
+    )
+    parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        default=False,
+        help="transcode videos locally without uploading to YouTube (default: False)",
+    )
     return parser
+
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -347,10 +362,10 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
     )
     _log.info("database loaded: %d file(s), %d segment(s)", len(db.files), len(db.segments))
 
-    # If this is a real run (not dry-run), ensure YouTube uploader credentials
+    # If this is a real run (not dry-run and not no-upload), ensure YouTube uploader credentials
     # early so any OAuth authorization prompts or web waits happen up-front.
     uploader = None
-    if not args.dry_run:
+    if not args.dry_run and not getattr(args, "no_upload", False):
         uploader = _build_uploader(args, db)
         if uploader is None:
             reporter.status("no YouTube credentials; set TUBETAPE_TOKEN or token.json")
@@ -359,39 +374,56 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
             _log.info("database saved to %s", db.path)
             return _EXIT_ERROR
 
-    web.update_web_scanner(is_scanning=True, count=0)
-    web.set_web_status("scanning", f"正在扫描 {args.input} ...")
-    reporter.status(f"scanning {args.input} ...")
-    # During a real run, persist files as they are scanned (throttled) so a
-    # long scan survives interruption and the hash cache is useful next time.
-    # Dry-run stays read-only and passes no callback.
-    on_file = None if args.dry_run else _file_persister(db)
-    result = scan(
-        args.input,
-        db,
-        args.timezone,
-        args.image_duration,
-        only_camera_photos=args.only_camera_photos,
-        only_phone_videos=args.only_phone_videos,
-        on_file=on_file,
-    )
-    web.update_web_scanner(is_scanning=False, count=len(result.files))
-    _log.info(
-        "scan complete: %d media file(s) (%d new, %d already processed, %d deleted), "
-        "%d error(s), %d skipped",
-        len(result.files),
-        len(result.new_file_ids),
-        len(result.processed_file_ids),
-        len(result.deleted_file_ids),
-        len(result.errors),
-        len(result.skipped),
-    )
-    for error in result.errors:
-        reporter.status(f"  error: {error['path']}: {error['reason']}")
-        _log.warning("scan error: %s: %s", error["path"], error["reason"])
-    for item in result.skipped:
-        reporter.status(f"  skipped: {item['path']} ({item['reason']})")
-        _log.info("skipped: %s (%s)", item["path"], item["reason"])
+    coordinator = getattr(args, "_coordinator", None) or web.get_app_coordinator()
+    if coordinator:
+        coordinator.db = db
+        if uploader is not None:
+            coordinator.uploader = uploader
+
+    if getattr(args, "no_scan", False):
+        _log.info("skipping initial full scan (--no-scan); loading files from database")
+        reporter.status("skipping scan (--no-scan); loading files from database ...")
+        scanned_files = [
+            ScannedFile.from_record(fid, rec, args.input)
+            for fid, rec in db.files.items()
+        ]
+        result = ScanResult(files=scanned_files, processed_file_ids=[f.file_id for f in scanned_files])
+        web.update_web_scanner(is_scanning=False, count=len(result.files))
+    else:
+        web.update_web_scanner(is_scanning=True, count=0)
+        web.set_web_status("scanning", f"正在扫描 {args.input} ...")
+        reporter.status(f"scanning {args.input} ...")
+        # During a real run, persist files as they are scanned (throttled) so a
+        # long scan survives interruption and the hash cache is useful next time.
+        # Dry-run stays read-only and passes no callback.
+        on_file = None if args.dry_run else _file_persister(db)
+        result = scan(
+            args.input,
+            db,
+            args.timezone,
+            args.image_duration,
+            only_camera_photos=args.only_camera_photos,
+            only_phone_videos=args.only_phone_videos,
+            on_file=on_file,
+        )
+        web.update_web_scanner(is_scanning=False, count=len(result.files))
+        _log.info(
+            "scan complete: %d media file(s) (%d new, %d already processed, %d deleted), "
+            "%d error(s), %d skipped",
+            len(result.files),
+            len(result.new_file_ids),
+            len(result.processed_file_ids),
+            len(result.deleted_file_ids),
+            len(result.errors),
+            len(result.skipped),
+        )
+        for error in result.errors:
+            reporter.status(f"  error: {error['path']}: {error['reason']}")
+            _log.warning("scan error: %s: %s", error["path"], error["reason"])
+        for item in result.skipped:
+            reporter.status(f"  skipped: {item['path']} ({item['reason']})")
+            _log.info("skipped: %s (%s)", item["path"], item["reason"])
+
 
     reporter.status(
         f"planning: {len(result.files)} files "
@@ -455,7 +487,7 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
     # Reconcile against YouTube so a lost local database does not re-upload
     # everything: only list when there is actually something to upload.
     remote_index: dict[str, str] = {}
-    if plan_result.segments:
+    if plan_result.segments and uploader is not None:
         reporter.status("listing existing uploads on YouTube ...")
         remote_index = fetch_remote_index(uploader.service)
         if remote_index:
@@ -537,6 +569,7 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         try:
             reporter.status(f"transcoding {segment.title} ...")
             web.set_web_status("transcoding", f"正在转码 {segment.title}")
+            is_no_upload = getattr(args, "no_upload", False) or (uploader is None)
             if segment.is_rebuild:
                 reporter.status(
                     f"rebuilding {segment.title} (replaces {segment.replaces_segment_id[:12]} ...) ..."
@@ -546,35 +579,66 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                     segment.replaces_segment_id,
                     segment.segment_id,
                 )
-                rebuilder = Rebuilder(
-                    db,
-                    transcode_fn=transcode_fn,
-                    upload_fn=lambda out, title, desc: uploader.upload(
-                        out, title, desc, privacy=args.privacy
-                    ),
-                    verify_fn=uploader.verify,
-                    delete_fn=uploader.delete_video,
-                )
-                video_id = rebuilder.rebuild(
-                    segment.replaces_segment_id,
-                    segment,
-                    segment_files,
-                    title=segment.title,
-                )
-                _log.info("rebuild committed: new video id %s", video_id)
+                if not is_no_upload and uploader:
+                    rebuilder = Rebuilder(
+                        db,
+                        transcode_fn=transcode_fn,
+                        upload_fn=lambda out, title, desc: uploader.upload(
+                            out, title, desc, privacy=args.privacy
+                        ),
+                        verify_fn=uploader.verify,
+                        delete_fn=uploader.delete_video,
+                    )
+                    video_id = rebuilder.rebuild(
+                        segment.replaces_segment_id,
+                        segment,
+                        segment_files,
+                        title=segment.title,
+                    )
+                    _log.info("rebuild committed: new video id %s", video_id)
+                else:
+                    _, chapters = transcode_fn(segment_files)
+                    video_id = None
+                    saved_out_path = out_path if getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path) else None
+                    db.upsert_segment(
+                        segment.segment_id,
+                        {
+                            "file_ids": segment.file_ids,
+                            "range": [segment.start_ts, segment.end_ts],
+                            "duration_seconds": segment.duration_seconds,
+                            "output_path": saved_out_path,
+                            "youtube_video_id": None,
+                            "previous_video_ids": [],
+                            "status": SEGMENT_STATUS_SEALED,
+                            "chapters": chapters,
+                            "last_rebuilt_at": None,
+                            "attempts": 0,
+                            "error": None,
+                        },
+                    )
+                    if segment.replaces_segment_id:
+                        db.segments.pop(segment.replaces_segment_id, None)
+
                 rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
                 web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
             else:
                 _, chapters = transcode_fn(segment_files)
-                reporter.status(f"uploading {segment.title} ...")
-                web.set_web_status("uploading", f"正在上传 {segment.title}")
-                description = chapters_text(chapters)
-                video_id = uploader.upload(
-                    out_path,
-                    segment.title,
-                    description,
-                    privacy=args.privacy,
-                )
+                if not is_no_upload and uploader:
+                    reporter.status(f"uploading {segment.title} ...")
+                    web.set_web_status("uploading", f"正在上传 {segment.title}")
+                    description = chapters_text(chapters)
+                    video_id = uploader.upload(
+                        out_path,
+                        segment.title,
+                        description,
+                        privacy=args.privacy,
+                    )
+                    _log.info("sealed segment %s -> video id %s", segment.segment_id, video_id)
+                else:
+                    video_id = None
+                    reporter.status(f"transcoded {segment.title} (saved locally to {out_path})")
+                    _log.info("sealed segment %s locally (no-upload)", segment.segment_id)
+
                 saved_out_path = out_path if getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path) else None
                 db.upsert_segment(
                     segment.segment_id,
@@ -592,7 +656,6 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                         "error": None,
                     },
                 )
-                _log.info("sealed segment %s -> video id %s", segment.segment_id, video_id)
                 rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
                 web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
         except QuotaExceededError as exc:
@@ -786,9 +849,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.login:
         return _run_login(args)
 
-    if getattr(args, "web_port", 0) > 0 and not args.dry_run:
-        from .web import WebServer, set_web_context
+    coordinator = AppCoordinator(args)
+    coordinator.load_saved_config()
 
+    if getattr(args, "web_port", 0) > 0 and not args.dry_run:
+        from .web import WebServer, set_app_coordinator, set_web_context
+
+        set_app_coordinator(coordinator)
         set_web_context(
             media_dir=args.input,
             db_path=args.db,

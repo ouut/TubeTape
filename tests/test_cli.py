@@ -379,6 +379,92 @@ class TestKeepSegments:
         assert f2.exists()
         assert f3.exists()
 
+    def test_cli_flags_no_scan_and_no_upload(self):
+        args = _parse()
+        assert args.no_scan is False
+        assert args.no_upload is False
+
+        args2 = _parse("--no-scan", "--no-upload")
+        assert args2.no_scan is True
+        assert args2.no_upload is True
+
+        args3 = _parse("--skip-scan")
+        assert args3.no_scan is True
+
+    def test_run_pipeline_no_upload_mode(self, tmp_path, monkeypatch):
+        import json
+        from conftest import make_png
+        from tubetape import cli
+        from tubetape.db import Database
+
+        make_png(tmp_path / "img1.png", size=(10, 10))
+        db_path = tmp_path / "db.json"
+
+        # Mock transcoder to return a dummy file without needing ffmpeg
+        def fake_transcode(files, out_path, config, progress=None):
+            with open(out_path, "wb") as f:
+                f.write(b"dummy-mp4-content")
+            return out_path, [["0:00", "Start"]]
+
+        monkeypatch.setattr(cli, "transcode_segment", fake_transcode)
+
+        rc = cli.main(
+            [
+                "--no-upload",
+                "--no-watch",
+                "--flush",
+                "--keep-segments", "1",
+                "--input", str(tmp_path),
+                "--db", str(db_path),
+                "--segment-duration", "20s",
+            ]
+        )
+        assert rc == 0
+        db = Database.load(str(db_path))
+        assert len(db.segments) == 1
+        seg = list(db.segments.values())[0]
+        assert seg["youtube_video_id"] is None
+        assert seg["status"] == "sealed"
+        assert seg["output_path"] is not None
+        assert os.path.isfile(seg["output_path"])
+
+    def test_run_pipeline_no_scan_mode(self, tmp_path, monkeypatch):
+        from tubetape import cli
+        from tubetape.db import Database
+
+        db_path = tmp_path / "db.json"
+        db = Database(path=str(db_path))
+        db.upsert_file("f1", {
+            "path": "img1.png",
+            "name": "img1.png",
+            "type": "image",
+            "captured_at_utc": "2024-01-01T00:00:00Z",
+            "duration_seconds": 3.0,
+            "size_bytes": 100,
+        })
+        db.save()
+
+        scanned_called = []
+        def fake_scan(*args, **kwargs):
+            scanned_called.append(1)
+            raise AssertionError("scan should not be called when --no-scan is given")
+
+        monkeypatch.setattr(cli, "scan", fake_scan)
+
+        rc = cli.main(
+            [
+                "--no-scan",
+                "--dry-run",
+                "--no-watch",
+                "--flush",
+                "--input", str(tmp_path),
+                "--db", str(db_path),
+            ]
+        )
+        assert rc == 0
+        assert scanned_called == []
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
