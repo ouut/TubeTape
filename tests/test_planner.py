@@ -181,3 +181,57 @@ class TestPlanLaterRuns:
         # The files fall inside the existing range, and the recomputed ID matches.
         assert second.segments == []
         assert expected_id in second.skipped_segment_ids
+
+    def test_rebuild_capacity_clamping_and_overflow(self):
+        # Existing segment spans 100..500 with 1 file of 15s. Max duration is 20s.
+        sid, record = _existing_record(["a"], 100, 500)
+        # New files inside the range:
+        # b (5s) fits into existing segment (15 + 5 = 20s)
+        # c (10s) does not fit (would exceed 20s), so overflows into free_files
+        # d (10s) overflows into free_files
+        files = [sf("a", 100, 15), sf("b", 120, 5), sf("c", 130, 10), sf("d", 140, 10)]
+        result = plan(files, {sid: record}, segment_duration=20, flush=True)
+
+        # The rebuilt segment has a and b (total 20s)
+        rebuilt = [s for s in result.segments if s.replaces_segment_id == sid]
+        assert len(rebuilt) == 1
+        assert rebuilt[0].file_ids == ["a", "b"]
+        assert rebuilt[0].duration_seconds == 20.0
+
+        # c and d are packed into a new segment (10 + 10 = 20s)
+        new_segs = [s for s in result.segments if s.replaces_segment_id != sid]
+        assert len(new_segs) == 1
+        assert new_segs[0].file_ids == ["c", "d"]
+        assert new_segs[0].duration_seconds == 20.0
+
+    def test_rebuild_candidate_prefers_narrower_range(self):
+        # Segment 1 is wide: 100..1000
+        # Segment 2 is narrow: 200..300
+        sid_wide, rec_wide = _existing_record(["w"], 100, 1000)
+        sid_narrow, rec_narrow = _existing_record(["n"], 200, 300)
+
+        # New file at 250 (falls in both). Should prefer narrow segment.
+        files = [sf("w", 100, 5), sf("n", 200, 5), sf("item", 250, 5)]
+        result = plan(files, {sid_wide: rec_wide, sid_narrow: rec_narrow}, segment_duration=20)
+
+        # Narrow segment gets "item"
+        narrow_rebuild = [s for s in result.segments if s.replaces_segment_id == sid_narrow]
+        assert len(narrow_rebuild) == 1
+        assert "item" in narrow_rebuild[0].file_ids
+        assert sid_wide in result.skipped_segment_ids
+
+    def test_rebuild_splits_oversized_legacy_combined(self):
+        # Existing segment record had 5 files totaling 50s due to prior unconstrained bug
+        # When replanned with segment_duration=20, it must split into segments <= 20s
+        legacy_files = ["f1", "f2", "f3", "f4", "f5"]
+        sid, record = _existing_record(legacy_files, 100, 500)
+        files = [sf(f"f{i}", 100 + i * 10, 10) for i in range(1, 6)]
+        result = plan(files, {sid: record}, segment_duration=20, flush=True)
+
+        # Total duration = 50s. Split into groups of 20s (2 files), 20s (2 files), 10s (1 file)
+        assert len(result.segments) == 3
+        for s in result.segments:
+            assert s.duration_seconds <= 20.0
+        # Exactly one replaces sid
+        assert sum(1 for s in result.segments if s.replaces_segment_id == sid) == 1
+

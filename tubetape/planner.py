@@ -182,6 +182,16 @@ def plan(
         for fid in record.get("file_ids", []):
             existing_owner[fid] = sid
 
+    # Calculate current duration and remaining capacity for each existing segment
+    remaining_capacity: dict[str, float] = {}
+    for _, _, sid, record in ranges:
+        existing_dur = sum(
+            files_by_id[fid].duration_seconds or 0.0
+            for fid in record.get("file_ids", [])
+            if fid in files_by_id
+        )
+        remaining_capacity[sid] = max(0.0, segment_duration - existing_dur)
+
     # Assign each file to its existing segment, or to a matching range for new files.
     assigned: dict[str, list[str]] = {sid: [] for _, _, sid, _ in ranges}
     free_files: list[ScannedFile] = []
@@ -195,12 +205,24 @@ def plan(
         if item.captured_epoch is None:
             free_files.append(item)
             continue
-        placed = False
+
+        # For new files, find candidate ranges that enclose item.captured_epoch.
+        # Sort candidates by span (end - start) so tighter, more specific intervals take precedence.
+        item_dur = item.duration_seconds or 0.0
+        candidates = []
         for start, end, sid, _ in ranges:
             if start <= item.captured_epoch <= end:
+                candidates.append((end - start, sid))
+        candidates.sort(key=lambda x: x[0])
+
+        placed = False
+        for _, sid in candidates:
+            if item_dur <= remaining_capacity[sid]:
                 assigned[sid].append(item.file_id)
+                remaining_capacity[sid] -= item_dur
                 placed = True
                 break
+
         if not placed:
             free_files.append(item)
 
@@ -221,7 +243,16 @@ def plan(
             _logger.debug("segment %s has no remaining files; skipping rebuild", sid)
             continue
 
-        segment = _make_segment(combined, params, replaces_segment_id=sid)
+        combined_dur = sum(f.duration_seconds or 0.0 for f in combined)
+        # Ensure that no combined segment exceeds segment_duration unless a single file is oversized.
+        if len(combined) > 1 and combined_dur > segment_duration:
+            combined_groups = greedy_pack(combined, segment_duration)
+        else:
+            combined_groups = [combined]
+
+        # First group replaces the existing segment (if changed)
+        first_group = combined_groups[0]
+        segment = _make_segment(first_group, params, replaces_segment_id=sid)
         if segment.segment_id == sid:
             result.skipped_segment_ids.append(sid)
             _logger.debug("segment %s unchanged; skipping", sid)
@@ -237,6 +268,20 @@ def plan(
                 segment.title,
                 sid[:12],
             )
+
+        # Any extra groups (if repacked) become new segments
+        for extra_group in combined_groups[1:]:
+            extra_seg = _make_segment(extra_group, params)
+            if extra_seg.segment_id not in known_ids:
+                known_ids.add(extra_seg.segment_id)
+                result.segments.append(extra_seg)
+                _logger.info(
+                    "rebuild overflow segment planned: %s (%s) with %d file(s), %.1fs",
+                    extra_seg.segment_id[:12],
+                    extra_seg.title,
+                    len(extra_seg.file_ids),
+                    extra_seg.duration_seconds,
+                )
 
     # Pack free files into new segments.
     groups = greedy_pack(free_files, segment_duration)
