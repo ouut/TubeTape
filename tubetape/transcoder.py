@@ -218,15 +218,55 @@ def transcode_segment(
     out_base = os.path.splitext(os.path.basename(out_abs))[0]
     os.makedirs(out_dir, exist_ok=True)
 
+    # 1. Level 1: If the final segment video is ALREADY fully transcoded and assembled on disk,
+    # directly reuse it without doing any transcode or concat work!
+    if os.path.isfile(out_abs) and os.path.getsize(out_abs) > 1024:
+        _logger.info(
+            "target segment video already exists on disk: %s (%.1f MB), skipping transcode entirely",
+            out_abs,
+            os.path.getsize(out_abs) / (1024 * 1024),
+        )
+        if progress is not None and files:
+            try:
+                progress(len(files), len(files), files[-1], True)  # type: ignore[call-arg]
+            except TypeError:
+                progress(len(files), len(files), files[-1])
+        return out_path, chapters
+
+    # Check if a matching video exists under the same segment short_id [sid16]
+    if "[" in out_base and "]" in out_base and os.path.isdir(out_dir):
+        sid_tag = out_base[out_base.rfind("[") : out_base.rfind("]") + 1]
+        if len(sid_tag) > 8:
+            for entry in os.scandir(out_dir):
+                if entry.is_file() and entry.name.lower().endswith(".mp4") and not entry.name.startswith(".") and sid_tag in entry.name:
+                    if entry.stat().st_size > 1024:
+                        _logger.info(
+                            "target segment video found under alternate name %s (%.1f MB), reusing",
+                            entry.path,
+                            entry.stat().st_size / (1024 * 1024),
+                        )
+                        if progress is not None and files:
+                            try:
+                                progress(len(files), len(files), files[-1], True)  # type: ignore[call-arg]
+                            except TypeError:
+                                progress(len(files), len(files), files[-1])
+                        return entry.path, chapters
+
     staging_parent = os.path.abspath(work_dir) if work_dir else out_dir
     staging_dir = os.path.join(staging_parent, f".staging_{out_base}")
+    # If exact staging dir does not exist, look for any staging dir matching [sid16]
+    if not os.path.isdir(staging_dir) and "[" in out_base and "]" in out_base and os.path.isdir(staging_parent):
+        sid_tag = out_base[out_base.rfind("[") : out_base.rfind("]") + 1]
+        if len(sid_tag) > 8:
+            for entry in os.scandir(staging_parent):
+                if entry.is_dir() and entry.name.startswith(".staging_") and sid_tag in entry.name:
+                    staging_dir = entry.path
+                    _logger.info("reusing existing staging directory %s matching %s", staging_dir, sid_tag)
+                    break
     os.makedirs(staging_dir, exist_ok=True)
 
     clips: list[str] = []
     for index, item in enumerate(files):
-        if progress is not None:
-            progress(index + 1, len(files), item)
-
         clip_name = f"clip_{index:04d}_{item.file_id[:12]}.mp4"
         clip_path = os.path.join(staging_dir, clip_name)
         tmp_clip_path = os.path.join(staging_dir, f"clip_{index:04d}_{item.file_id[:12]}.tmp.mp4")
@@ -240,8 +280,19 @@ def transcode_segment(
                 item.rel_path,
                 clip_name,
             )
+            if progress is not None:
+                try:
+                    progress(index + 1, len(files), item, True)  # type: ignore[call-arg]
+                except TypeError:
+                    progress(index + 1, len(files), item)
             clips.append(clip_path)
             continue
+
+        if progress is not None:
+            try:
+                progress(index + 1, len(files), item, False)  # type: ignore[call-arg]
+            except TypeError:
+                progress(index + 1, len(files), item)
 
         if os.path.isfile(tmp_clip_path):
             try:

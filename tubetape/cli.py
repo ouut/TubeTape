@@ -634,14 +634,18 @@ def _run_pipeline_impl(
         )
 
         def transcode_fn(files, _out_path=out_path):
-            def progress(done: int, total: int, item) -> None:
-                reporter.status(f"    transcode {done}/{total}: {item.rel_path} ({item.type})")
+            def progress(done: int, total: int, item, is_resumed: bool = False) -> None:
+                if is_resumed:
+                    reporter.status(f"    [断点复用 {done}/{total}] {item.rel_path}")
+                else:
+                    reporter.status(f"    transcode {done}/{total}: {item.rel_path} ({item.type})")
                 web.update_web_transcode(
                     segment_id=segment.segment_id,
                     title=segment.title,
                     done=done,
                     total=total,
                     current_file=item.rel_path,
+                    resumed=is_resumed,
                 )
 
             return transcode_segment(files, _out_path, config, progress=progress)

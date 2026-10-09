@@ -47,6 +47,7 @@ _server_state = {
         "done": 0,
         "total": 0,
         "current_file": None,
+        "resumed": False,
     },
     "planned_segments": [],
     "coordinator": None,
@@ -139,6 +140,7 @@ def update_web_transcode(
     done: int,
     total: int,
     current_file: str,
+    resumed: bool = False,
 ) -> None:
     """Update transcode progress for real-time progress display in dashboard."""
     _server_state["transcode"] = {
@@ -147,6 +149,7 @@ def update_web_transcode(
         "done": done,
         "total": total,
         "current_file": current_file,
+        "resumed": resumed,
     }
 
 
@@ -441,6 +444,7 @@ def _collect_segments() -> dict[str, dict]:
             "done": cur_tc.get("done", 0),
             "total": cur_tc.get("total", 0),
             "current_file": cur_tc.get("current_file", ""),
+            "resumed": cur_tc.get("resumed", False),
         }
 
     return segments_dict
@@ -2356,8 +2360,12 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
           document.getElementById('metric-disk-segments').textContent = d.stats ? d.stats.disk_segments_count : 0;
           document.getElementById('metric-keep-limit').textContent = d.stats ? d.stats.keep_segments : 0;
 
-          document.getElementById('metric-task').textContent = d.status || '空闲';
-          document.getElementById('metric-task-sub').textContent = d.task || '-';
+          let taskDetail = d.task || '-';
+          if (d.transcode && d.transcode.total > 0 && d.status === 'transcoding') {
+            const resumeTag = d.transcode.resumed ? '[⚡断点复用] ' : '';
+            taskDetail = `${resumeTag}${d.transcode.title || ''} (${d.transcode.done}/${d.transcode.total}): ${d.transcode.current_file || ''}`;
+          }
+          document.getElementById('metric-task-sub').textContent = taskDetail;
 
           // Segments Table
           const tbody = document.getElementById('segments-table-body');
@@ -2372,9 +2380,10 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
               } else if (seg.status === 'building') {
                 const prog = seg.progress || { done: 0, total: 1, current_file: '' };
                 const pct = prog.total > 0 ? Math.round((prog.done / prog.total) * 100) : 0;
+                const resumeBadge = prog.resumed ? ' <span style="color:#10b981;font-weight:600;font-size:0.75rem;">[⚡断点复用]</span>' : '';
                 statusHtml = `
                   <div>
-                    <span class="badge badge-building">⚡ 正在构建 (${prog.done}/${prog.total})</span>
+                    <span class="badge badge-building">⚡ 正在构建 (${prog.done}/${prog.total})${resumeBadge}</span>
                     <div class="progress-bar-wrap"><div class="progress-bar-fill" style="width: ${pct}%"></div></div>
                     <div style="font-size: 0.72rem; color: #888; max-width: 180px; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(prog.current_file || '')}</div>
                   </div>

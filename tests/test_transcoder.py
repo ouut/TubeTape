@@ -263,4 +263,64 @@ class TestResumableTranscoding:
         assert out.stat().st_size > 1024
         assert not staging.exists()
 
+    def test_final_output_video_reused_without_retranscoding(self, tmp_path, monkeypatch):
+        make_png(tmp_path / "img1.png", size=(64, 48))
+        f1 = ScannedFile(
+            file_id="id1", abs_path=str(tmp_path / "img1.png"), rel_path="img1.png",
+            name="img1.png", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=0.0, duration_seconds=1.0, resolution="64x48",
+        )
+        out = tmp_path / "20240101 - 20240102 [abcdef1234567890].mp4"
+        out.write_bytes(b"dummy_mp4_content" * 100)  # > 1024 bytes
+
+        called_cmds = []
+        monkeypatch.setattr(transcoder, "run_ffmpeg", lambda cmd: called_cmds.append(cmd))
+
+        res_path, chapters = transcode_segment([f1], str(out), TranscodeConfig())
+        assert res_path == str(out)
+        assert len(called_cmds) == 0  # No ffmpeg calls at all!
+
+    def test_staging_dir_short_id_tag_matched(self, tmp_path, monkeypatch):
+        make_png(tmp_path / "img1.png", size=(64, 48))
+        make_png(tmp_path / "img2.png", size=(64, 48))
+        f1 = ScannedFile(
+            file_id="id1", abs_path=str(tmp_path / "img1.png"), rel_path="img1.png",
+            name="img1.png", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=0.0, duration_seconds=1.0, resolution="64x48",
+        )
+        f2 = ScannedFile(
+            file_id="id2", abs_path=str(tmp_path / "img2.png"), rel_path="img2.png",
+            name="img2.png", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=1.0, duration_seconds=1.0, resolution="64x48",
+        )
+
+        # Existing staging dir with different timestamp prefix but identical [abcdef1234567890]
+        old_staging = tmp_path / ".staging_OLD_TIMESTAMP [abcdef1234567890]"
+        old_staging.mkdir()
+        clip0 = old_staging / f"clip_0000_{f1.file_id[:12]}.mp4"
+        transcoder.run_ffmpeg(
+            transcoder.build_image_clip_command(
+                f1.abs_path, str(clip0), 64, 48, 1.0, TranscodeConfig()
+            )
+        )
+        assert clip0.exists() and clip0.stat().st_size > 1024
+
+        out = tmp_path / "NEW_TIMESTAMP [abcdef1234567890].mp4"
+        called_cmds = []
+        real_run = transcoder.run_ffmpeg
+
+        def tracking_run(cmd):
+            called_cmds.append(cmd)
+            real_run(cmd)
+
+        monkeypatch.setattr(transcoder, "run_ffmpeg", tracking_run)
+
+        res_path, chapters = transcode_segment([f1, f2], str(out), TranscodeConfig())
+        assert res_path == str(out)
+        assert out.exists()
+        # Clip 0 was reused from old_staging, only clip 1 + concat ran!
+        assert len(called_cmds) == 2
+        assert not any(str(clip0) in " ".join(c) for c in called_cmds)
+
+
 

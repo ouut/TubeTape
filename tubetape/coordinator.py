@@ -332,6 +332,13 @@ class AppCoordinator:
             return False, "数据库未初始化"
         srec = self.db.segments.get(segment_id)
         if not srec:
+            from . import web
+
+            collected = web._collect_segments()
+            if segment_id in collected:
+                srec = collected[segment_id]
+
+        if not srec:
             return False, f"未找到分段: {segment_id}"
 
         if not self.task_lock.acquire(blocking=False):
@@ -372,13 +379,14 @@ class AppCoordinator:
                 out_path = os.path.join(self.segments_dir, f"{title}.mp4")
 
                 def transcode_fn(flist, _out=out_path):
-                    def progress(done: int, total: int, item) -> None:
+                    def progress(done: int, total: int, item, is_resumed: bool = False) -> None:
                         web.update_web_transcode(
                             segment_id=segment_id,
                             title=title,
                             done=done,
                             total=total,
                             current_file=item.rel_path,
+                            resumed=is_resumed,
                         )
 
                     return transcode_segment(flist, _out, config, progress=progress)
