@@ -380,8 +380,13 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
         assert coord.args.crf == 22
         assert coord.args.keep_segments == 5
         assert coord.args.no_upload is True
-        # Verify saved to config.json
-        assert (tmp_path / "config.json").exists()
+        # Verify saved to tubetape.json database directly
+        from tubetape.db import Database
+        saved_db = Database.load(str(db_path))
+        assert saved_db.config["crf"] == 22
+        assert saved_db.config["keep_segments"] == 5
+        assert saved_db.config["no_upload"] is True
+        assert not (tmp_path / "config.json").exists()
 
         # 3. POST /api/config with invalid value fails
         bad_req = urllib.request.Request(

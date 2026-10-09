@@ -1,7 +1,7 @@
 """Central coordinator for TubeTape runtime operations.
 
 Manages pipeline runs, background tasks (scan, rebuild, upload, delete),
-and dynamic runtime configuration with persistence to config.json.
+and dynamic runtime configuration with persistence to tubetape.json.
 """
 
 from __future__ import annotations
@@ -78,11 +78,7 @@ class AppCoordinator:
         self.uploader = uploader
         self.task_lock = threading.Lock()
         self.current_task: str | None = None
-        self._config_file = (
-            os.path.join(os.path.dirname(args.db), "config.json")
-            if getattr(args, "db", None)
-            else None
-        )
+        self._db_path = getattr(args, "db", None)
         self.segments_dir = (
             os.path.join(os.path.dirname(args.db), "uploaded_segments")
             if getattr(args, "db", None)
@@ -91,32 +87,54 @@ class AppCoordinator:
         os.makedirs(self.segments_dir, exist_ok=True)
 
     def load_saved_config(self) -> dict:
-        """Load configuration overrides from config.json if present."""
-        if not self._config_file or not os.path.isfile(self._config_file):
-            return {}
-        try:
-            with open(self._config_file, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            self._apply_dict_to_args(saved)
-            _logger.info("loaded dynamic config overrides from %s", self._config_file)
-            return saved
-        except Exception as exc:
-            _logger.warning("could not load %s: %s", self._config_file, exc)
+        """Load configuration overrides from tubetape.json database."""
+        if self.db is None and self._db_path:
+            try:
+                self.db = Database.load(self._db_path)
+            except Exception as exc:
+                _logger.warning("could not load db from %s: %s", self._db_path, exc)
+                return {}
+
+        if not self.db:
             return {}
 
+        saved = self.db.config
+        if saved:
+            explicit = getattr(self.args, "_explicit_cli_args", set())
+            filtered_saved = {k: v for k, v in saved.items() if k not in explicit}
+            self._apply_dict_to_args(filtered_saved)
+            _logger.info("loaded dynamic config overrides from database %s", self.db.path)
+            return saved
+        return {}
+
     def save_config(self) -> None:
-        """Persist current configuration to config.json."""
-        if not self._config_file:
+        """Persist current configuration to tubetape.json database."""
+        if self.db is None and self._db_path:
+            try:
+                self.db = Database.load(self._db_path)
+            except Exception as exc:
+                _logger.warning("could not load db from %s: %s", self._db_path, exc)
+                return
+
+        if not self.db:
             return
+
         try:
             cfg = self.get_config()["config"]
-            tmp = self._config_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, self._config_file)
-            _logger.info("saved configuration to %s", self._config_file)
+            self.db.config = cfg
+            self.db.save()
+            # Clean up legacy config.json if present
+            if self._db_path:
+                legacy = os.path.join(os.path.dirname(os.path.abspath(self._db_path)), "config.json")
+                if os.path.isfile(legacy):
+                    try:
+                        os.remove(legacy)
+                        _logger.info("cleaned up legacy %s after merging into database", legacy)
+                    except OSError:
+                        pass
+            _logger.info("saved configuration to database %s", self.db.path)
         except Exception as exc:
-            _logger.warning("could not save configuration to %s: %s", self._config_file, exc)
+            _logger.warning("could not save configuration to %s: %s", getattr(self.db, "path", self._db_path), exc)
 
     def get_config(self) -> dict[str, Any]:
         """Return full configuration dict and fingerprint sensitive fields."""
@@ -131,7 +149,7 @@ class AppCoordinator:
                 "segment_duration": float(getattr(a, "segment_duration", 3600.0)),
                 "keep_segments": int(getattr(a, "keep_segments", 0)),
                 "no_upload": bool(getattr(a, "no_upload", False)),
-                "no_scan": bool(getattr(a, "no_scan", False)),
+                "force_scan": bool(getattr(a, "force_scan", False)),
                 "image_duration": float(getattr(a, "image_duration", 3.0)),
                 "crf": int(getattr(a, "crf", 16)),
                 "max_resolution": max_res_str,
@@ -145,7 +163,7 @@ class AppCoordinator:
                 "only_phone_videos": bool(getattr(a, "only_phone_videos", False)),
                 "quiet_period": float(getattr(a, "quiet_period", 600.0)),
                 "poll_interval": float(getattr(a, "poll_interval", 30.0)),
-                "mtime_interval": float(getattr(a, "mtime_interval", 3600.0)),
+                "mtime_interval": float(getattr(a, "mtime_interval", 600.0)),
                 "quota_backoff": float(getattr(a, "quota_backoff", 3600.0)),
             },
             "fingerprint_params": list(FINGERPRINT_PARAMS),
@@ -212,8 +230,10 @@ class AppCoordinator:
                 a.keep_segments = val
             elif k == "no_upload":
                 a.no_upload = bool(v)
+            elif k == "force_scan":
+                a.force_scan = bool(v)
             elif k == "no_scan":
-                a.no_scan = bool(v)
+                pass
             elif k == "privacy":
                 if v not in ("private", "unlisted"):
                     raise ValueError("privacy 必须是 'private' 或 'unlisted'")

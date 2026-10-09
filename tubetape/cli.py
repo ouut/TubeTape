@@ -168,9 +168,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mtime-interval",
         type=durations.parse_duration,
-        default="1h",
+        default="10m",
         help="in watch mode, interval for the directory-mtime safety-net scan "
-        "(catches events watchdog/inotify misses; default: 1h)",
+        "(catches events watchdog/inotify misses; default: 10m)",
     )
     parser.add_argument(
         "--quota-backoff",
@@ -214,11 +214,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="number of latest transcoded segment videos to keep in uploaded_segments/ directory (default: 0 = delete immediately after upload)",
     )
     parser.add_argument(
-        "--no-scan",
-        "--skip-scan",
+        "--force-scan",
         action="store_true",
         default=False,
-        help="skip initial full scan on startup and start directly from database (default: False)",
+        help="force full scan and rebuild metadata for all files on startup (default: False)",
     )
     parser.add_argument(
         "--no-upload",
@@ -253,6 +252,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--fps must be > 0")
     if args.keep_segments < 0:
         parser.error("--keep-segments must be >= 0")
+
+    suppress_parser = build_parser()
+    for action in suppress_parser._actions:
+        action.default = argparse.SUPPRESS
+    try:
+        raw_argv = argv if argv is not None else sys.argv[1:]
+        explicit_ns, _ = suppress_parser.parse_known_args(raw_argv)
+        args._explicit_cli_args = set(vars(explicit_ns).keys())
+    except Exception:
+        args._explicit_cli_args = set()
 
     return args
 
@@ -334,9 +343,13 @@ def run_pipeline(
     force_scan: bool = False,
 ) -> int:
     reporter = reporter or Reporter()
-    db = Database.load(args.db)
-
     from . import web
+
+    coordinator = getattr(args, "_coordinator", None) or web.get_app_coordinator()
+    if coordinator and coordinator.db is not None:
+        db = coordinator.db
+    else:
+        db = Database.load(args.db)
 
     web.set_web_context(
         media_dir=args.input,
@@ -384,33 +397,30 @@ def run_pipeline(
         if uploader is not None:
             coordinator.uploader = uploader
 
-    if getattr(args, "no_scan", False) and not force_scan:
-        _log.info("skipping initial full scan (--no-scan); loading files from database")
-        reporter.status("skipping scan (--no-scan); loading files from database ...")
-        scanned_files = [
-            ScannedFile.from_record(fid, rec, args.input)
-            for fid, rec in db.files.items()
-        ]
-        result = ScanResult(files=scanned_files, processed_file_ids=[f.file_id for f in scanned_files])
-        web.update_web_scanner(is_scanning=False, count=len(result.files))
+    is_force_scan = force_scan or getattr(args, "force_scan", False)
+    web.update_web_scanner(is_scanning=True, count=0)
+    web.set_web_status("scanning", f"正在检查/扫描媒体文件 {args.input} ...")
+    reporter.status(f"scanning {args.input} ...")
+
+    # During a real run, persist files as they are scanned (throttled) so a
+    # long scan survives interruption.
+    # Dry-run stays read-only and passes no callback.
+    on_file = None if args.dry_run else _file_persister(db)
+    result = scan(
+        args.input,
+        db,
+        args.timezone,
+        args.image_duration,
+        only_camera_photos=args.only_camera_photos,
+        only_phone_videos=args.only_phone_videos,
+        force_scan=is_force_scan,
+        on_file=on_file,
+    )
+    web.update_web_scanner(is_scanning=False, count=len(result.files))
+    if not is_force_scan and len(result.new_file_ids) == 0 and len(result.deleted_file_ids) == 0:
+        reporter.status(f"media files match database index ({len(result.files)} files); skipped scanning")
+        _log.info("media files match database index (%d files); full scan skipped", len(result.files))
     else:
-        web.update_web_scanner(is_scanning=True, count=0)
-        web.set_web_status("scanning", f"正在扫描 {args.input} ...")
-        reporter.status(f"scanning {args.input} ...")
-        # During a real run, persist files as they are scanned (throttled) so a
-        # long scan survives interruption and the hash cache is useful next time.
-        # Dry-run stays read-only and passes no callback.
-        on_file = None if args.dry_run else _file_persister(db)
-        result = scan(
-            args.input,
-            db,
-            args.timezone,
-            args.image_duration,
-            only_camera_photos=args.only_camera_photos,
-            only_phone_videos=args.only_phone_videos,
-            on_file=on_file,
-        )
-        web.update_web_scanner(is_scanning=False, count=len(result.files))
         _log.info(
             "scan complete: %d media file(s) (%d new, %d already processed, %d deleted), "
             "%d error(s), %d skipped",
@@ -712,6 +722,7 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
     code = run_pipeline(args, reporter)
     if code == _EXIT_ERROR:
         return code
+    args.force_scan = False  # subsequent watch runs use incremental scan
 
     reporter.status(
         f"watching for new files (watchdog + mtime every {args.mtime_interval:g}s, "
@@ -769,7 +780,7 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
                 quota_retry_at = 0.0
                 reporter.status("quota backoff elapsed; retrying ...")
                 _log.info("quota backoff elapsed; re-running pipeline")
-                status = run_pipeline(args, reporter, force_scan=True)
+                status = run_pipeline(args, reporter, force_scan=False)
                 mtime_scanner.scan()
                 last_mtime_scan = time.monotonic()
                 has_changes = False
@@ -781,7 +792,7 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
             if has_changes and now - last_change >= args.quiet_period:
                 reporter.status("quiet period elapsed; re-processing ...")
                 _log.info("quiet period (%.1fs) elapsed; re-running pipeline", args.quiet_period)
-                status = run_pipeline(args, reporter, force_scan=True)
+                status = run_pipeline(args, reporter, force_scan=False)
                 mtime_scanner.scan()
                 last_mtime_scan = time.monotonic()
                 has_changes = False
@@ -854,6 +865,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_login(args)
 
     coordinator = AppCoordinator(args)
+    setattr(args, "_coordinator", coordinator)
     coordinator.load_saved_config()
 
     if getattr(args, "web_port", 0) > 0 and not args.dry_run:
@@ -862,6 +874,7 @@ def main(argv: list[str] | None = None) -> int:
         set_app_coordinator(coordinator)
         set_web_context(
             media_dir=args.input,
+            db=coordinator.db,
             db_path=args.db,
             keep_segments=getattr(args, "keep_segments", 0),
         )

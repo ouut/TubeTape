@@ -198,16 +198,12 @@ except BaseException:
 3. 将三段切片与 8 字节大端整数文件尺寸拼接后计算 SHA-256。
 **效果**：首次全量冷扫描吞吐量提升约 10 倍；读取量从数百 GB 骤降至数 GB。
 
-#### 增量哈希缓存 (mtime + size Cache)
-扫描器内部维护 `(rel_path, size_bytes, mtime_ns)` 索引：
-- 只要文件尺寸与纳秒级修改时间未变，直接复用已持久化的元数据与哈希值。
-- 热扫描 2,500+ 个文件的耗时仅需约 0.2 秒。
+#### 路径集合智能比对与精准增量构建 (Path Set Check & Precise Incremental)
+扫描器采用路径集合比对与精准增量机制，彻底摒弃文件级 `(mtime + size)` 缓存：
+- **启动智能判断**：通过目录快速收集磁盘媒体路径集合 `disk_paths`，并与数据库已收录集合 `db_paths` 比对。若两者完全一致，跳过文件探测与哈希计算，直接从数据库秒级恢复所有文件对象进入 watch 监听。
+- **精准增量构建**：当检测到路径集合不一致时，通过差集 `disk_paths - db_paths` 精准识别新增媒体，仅对新增文件提取元数据与采样哈希；删除失效文件记录 `db_paths - disk_paths`；对存量未变动文件 `disk_paths & db_paths` 直接通过 `ScannedFile.from_record` 恢复，不重复读取磁盘。
+- **强制全量扫描 (`--force-scan`)**：支持 `--force-scan` 强制重新计算与构建全量文件的元数据。
 - 扫描期间每 1,000 个文件或每 30 秒阶段性保存一次数据库，杜绝中途强退导致已扫描数据丢失。
-
-#### 从数据库恢复扫描对象 (`ScannedFile.from_record`)
-为支持 `--no-scan` 极速冷启动，`ScannedFile` 提供了 `from_record(file_id, record, input_dir)` 工厂方法：
-- 直接从 `db.json` 中的 `files` 字段反序列化出完整的 `ScannedFile` 领域模型，包含绝对路径重组、拍摄时间恢复、分类标记恢复与时长恢复。
-- 使系统在启动时完全跳过磁盘 `os.walk`，实现毫秒级启动并直接进入规划与监控状态。
 
 ---
 
@@ -348,7 +344,7 @@ while response is None:
 - **`upload_segment(segment_id)`**：检查 `uploaded_segments/` 目录下是否存在该分片已有的 MP4，若存在则跳过转码直接执行断点续传。
 - **`delete_youtube_video(segment_id)`**：调用 YouTube API 删除云端视频，并同步重置本地数据库状态为待处理。
 
-#### 3. 动态配置管理与持久化 (`config.json`)
+#### 3. 动态配置管理与持久化 (`tubetape.json`)
 - 支持在运行时动态热更新参数。
 - 维护 `FINGERPRINT_PARAMS` 集合：
   ```python
@@ -358,7 +354,7 @@ while response is None:
       "x264_preset", "ken_burns",
   ])
   ```
-- 修改配置时自动比对受影响字段，若涉及指纹字段则向 Web 界面返回风险提示。配置变更立即原子落盘至 `<db_dir>/config.json`，下一次程序启动时自动优先载入。
+- 修改配置时自动比对受影响字段，若涉及指纹字段则向 Web 界面返回风险提示。配置变更立即物理强原子落盘至 `<db_dir>/tubetape.json` 的 `config` 键，下一次程序启动时自动优先载入。
 
 #### 4. 本地分片轮转管理 (`rotate_uploaded_segments`)
 - 扫描 `<db_dir>/uploaded_segments/` 目录中的所有非隐藏 `.mp4` 文件。
@@ -387,7 +383,7 @@ while response is None:
 - `GET /api/status`：核心运行状态与当前任务 JSON。
 - `GET /api/dashboard`：包含扫描统计、分段列表、构建进度、本地保留视频统计及分段可用动作的综合大屏接口。
 - `GET /api/config`：获取当前运行配置及指纹参数清单。
-- `POST /api/config`：动态更新运行参数并保存至 `config.json`。
+- `POST /api/config`：动态更新运行参数并保存至 `tubetape.json`。
 - `POST /api/scan/start`：异步触发全量扫描任务。
 - `POST /api/segment/rebuild`：异步触发指定分片重新构建。
 - `POST /api/segment/upload`：异步触发指定分片本地视频直传。
@@ -428,7 +424,7 @@ if not abs_path.startswith(os.path.abspath(media_dir)):
 ### 4.12 命令行入口与管线编排 (cli.py)
 
 - **配置加载层叠优先级**：
-  CLI 命令行参数 > `config.json` 运行时持久化配置 > 代码内置默认参数。
+  CLI 命令行参数 > `tubetape.json` 运行时持久化配置 > 代码内置默认参数。
 - **无凭证纯本地模式兼容**：
   若设置 `--no-upload`，管线完全跳过 Google OAuth 凭据加载与云端对账，直接执行本地转码并退出或进入文件监控。
 - **平稳停机机制**：

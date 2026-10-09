@@ -4,6 +4,12 @@ Schema (from prompt.md):
 
     {
       "version": 1,
+      "config": {
+        "segment_duration": 3600.0,
+        "keep_segments": 0,
+        "no_upload": false,
+        "force_scan": false
+      },
       "files": {
         "<file_id>": {
           "path": "relative path",
@@ -41,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from typing import Any
 
 from .log import get_logger
 
@@ -72,10 +79,12 @@ class Database:
         *,
         files: dict[str, dict] | None = None,
         segments: dict[str, dict] | None = None,
+        config: dict[str, Any] | None = None,
         version: int = SCHEMA_VERSION,
         path: str | None = None,
     ):
         self.version = version
+        self.config = config if config is not None else {}
         self.files = files if files is not None else {}
         self.segments = segments if segments is not None else {}
         self.path = path
@@ -87,7 +96,16 @@ class Database:
         """Load a database file, or return an empty database if it is missing."""
         if not os.path.exists(path):
             _logger.info("database %s does not exist; starting with an empty one", path)
-            return cls(path=os.path.abspath(path))
+            cfg_file = os.path.join(os.path.dirname(os.path.abspath(path)), "config.json")
+            legacy_config: dict[str, Any] = {}
+            if os.path.isfile(cfg_file):
+                try:
+                    with open(cfg_file, "r", encoding="utf-8") as handle:
+                        legacy_config = json.load(handle)
+                    _logger.info("migrated legacy config from %s into database", cfg_file)
+                except Exception as exc:
+                    _logger.warning("could not read legacy %s: %s", cfg_file, exc)
+            return cls(path=os.path.abspath(path), config=legacy_config)
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 raw = json.load(handle)
@@ -102,15 +120,31 @@ class Database:
             _logger.error("database %s must contain a JSON object", path)
             raise DatabaseError(f"database {path} must contain a JSON object")
 
+        config = raw.get("config")
+        if config is None or not isinstance(config, dict):
+            cfg_file = os.path.join(os.path.dirname(os.path.abspath(path)), "config.json")
+            if os.path.isfile(cfg_file):
+                try:
+                    with open(cfg_file, "r", encoding="utf-8") as handle:
+                        config = json.load(handle)
+                    _logger.info("migrated legacy config from %s into database", cfg_file)
+                except Exception as exc:
+                    _logger.warning("could not read legacy %s: %s", cfg_file, exc)
+                    config = {}
+            else:
+                config = {}
+
         _logger.info(
-            "database loaded: %s (%d file(s), %d segment(s))",
+            "database loaded: %s (%d file(s), %d segment(s), %d config key(s))",
             path,
             len(raw.get("files", {})),
             len(raw.get("segments", {})),
+            len(config),
         )
 
         return cls(
             version=raw.get("version", SCHEMA_VERSION),
+            config=config,
             files=raw.get("files", {}),
             segments=raw.get("segments", {}),
             path=os.path.abspath(path),
@@ -119,6 +153,7 @@ class Database:
     def to_dict(self) -> dict:
         return {
             "version": self.version,
+            "config": self.config,
             "files": self.files,
             "segments": self.segments,
         }

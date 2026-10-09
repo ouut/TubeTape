@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](pyproject.toml)
 [![Docker: chet2026/tubetape](https://img.shields.io/badge/Docker-chet2026%2Ftubetape-blue.svg)](https://hub.docker.com/r/chet2026/tubetape)
-[![Version: 1.2.0](https://img.shields.io/badge/Version-1.2.0-orange.svg)](pyproject.toml)
+[![Version: 1.3.0](https://img.shields.io/badge/Version-1.3.0-orange.svg)](pyproject.toml)
 
 ---
 
@@ -78,7 +78,7 @@
     - **🔨 重新构建**：对任意分段发起就地重新转码。
     - **☁️ 重新上传**：本地已有视频文件时一键直传 YouTube。
     - **🗑️ 删除云端视频**：一键调用 YouTube API 删除云端对应视频并重置数据库状态。
-    - **⚙️ 运行时参数动态配置**：弹窗直接修改运行参数，实时警示指纹参数变动风险，修改后自动落盘到 `config.json`。
+    - **⚙️ 运行时参数动态配置**：弹窗直接修改运行参数，实时警示指纹参数变动风险，修改后自动物理强原子落盘至数据库 `tubetape.json`。
   - **前端实时日志过滤**：支持日志色彩高亮（INFO 蓝、WARN 黄、ERROR 红、DEBUG 灰），下拉菜单自由配置显示最近条数（**默认 100 条**，可选 50、100、200、500、全部），支持自动滚动与一键清屏。
 - **💾 本地分片智能保留与轮转（`--keep-segments`）**：
   - 转码完成的 MP4 文件统一存放在配置目录的 `uploaded_segments/` 文件夹下（**非隐藏文件**，便于在宿主机或 NAS 文件管理器中直接拷贝提取）。
@@ -330,7 +330,7 @@ http://<NAS_IP>:8080/getbytime/{segment_id}/{minute}/{second}
 - **⚙️ 参数动态配置**：点击弹出全量参数编辑窗口。
   - 支持在页面直接调整分段时长、画质 CRF、预设 Preset、保留数量、监控间隔等。
   - **智能指纹变更警示**：当修改影响 `segment_id` 的核心参数时，面板顶部自动弹出醒目的橙色警告横幅，提示修改将导致已有分段重新规划与重新上传。
-  - 保存后自动持久化到 `./config.json`，下次启动依然生效。
+  - 保存后自动物理强原子持久化到 `./tubetape.json`，下次启动依然生效。
 
 #### 4. 实时日志控制
 - **色彩高亮**：INFO（天蓝）、WARN（金黄）、ERROR（赤红）、DEBUG（淡灰）。
@@ -547,10 +547,9 @@ tubetape \
 
 ```text
 /db/ (宿主机挂载目录)
-├── tubetape.json           # SQLite 级别可靠性的 JSON 状态数据库（原子写入，含所有素材与分段信息）
+├── tubetape.json           # SQLite 级别可靠性的 JSON 状态数据库（三级原子写入，统一包含运行时配置、所有素材与分段信息）
 ├── tubetape.json.bak       # 数据库自动回滚备份文件
 ├── tubetape.json.log       # 实时运行日志文件（供 /log 控制台读取）
-├── config.json             # Web 控制台动态修改的配置持久化文件（重启后优先载入）
 ├── client_secret.json      # 从 Google Cloud 下载的 OAuth 客户端密钥
 ├── token.json              # Web 授权成功后自动生成的持久化凭证（支持自动静默刷新）
 └── uploaded_segments/      # 本地构建生成的 MP4 视频目录（非隐藏目录）

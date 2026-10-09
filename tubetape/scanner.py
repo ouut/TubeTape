@@ -578,7 +578,7 @@ class ScannedFile:
     missing_meta: bool = False
     time_source: str = "metadata"  # metadata | filename | mtime
     source: str = "unknown"  # camera | other (camera photo / phone video vs the rest)
-    mtime_ns: int | None = None  # st_mtime_ns, used for the scan cache
+    mtime_ns: int | None = None  # retained for backward compatibility
 
     def to_record(self) -> dict:
         return {
@@ -594,7 +594,6 @@ class ScannedFile:
             "missing_meta": self.missing_meta,
             "time_source": self.time_source,
             "source": self.source,
-            "mtime_ns": self.mtime_ns,
         }
 
     @classmethod
@@ -640,38 +639,9 @@ class ScanResult:
 # ------------------------------------------------------------------- scanner
 
 
-def scan_files(
-    input_dir: str,
-    timezone,
-    image_duration: float = 3.0,
-    hash_chunk: int = HASH_CHUNK,
-    only_camera_photos: bool = False,
-    only_phone_videos: bool = False,
-    cache: dict[str, dict] | None = None,
-    on_file: Callable[[ScannedFile], None] | None = None,
-) -> tuple[list[ScannedFile], list[dict], list[dict]]:
-    """Recursively scan ``input_dir``, returning (scanned files, errors, skipped).
-
-    Unparseable/corrupt files go into ``errors``; files excluded by the
-    camera/phone filters go into ``skipped``.
-
-    ``cache`` maps ``rel_path`` to a previous database record. When a file's
-    size and mtime both match its cached record, the expensive content hash and
-    metadata probing (ffprobe/EXIF) are skipped and the cached values reused.
-
-    ``on_file``, when given, is called with each successfully-scanned file
-    (including cache hits) so the caller can persist progress incrementally.
-    """
+def collect_media_files(input_dir: str) -> list[tuple[str, str, str, str]]:
+    """Recursively collect (abs_path, rel_path, name, ftype) for all supported media files."""
     input_dir = os.path.abspath(input_dir)
-    scanned: list[ScannedFile] = []
-    errors: list[dict] = []
-    skipped: list[dict] = []
-
-    _logger.info("scanning directory: %s", input_dir)
-
-    # Phase 1: collect candidate media files. This is fast (only walks names),
-    # so we can report the total count up front and show per-file progress
-    # during the slow hashing/metadata phase below.
     candidates: list[tuple[str, str, str, str]] = []
     for root, dirs, names in os.walk(input_dir):
         # Skip hidden files/dirs: the transcode output is a dotfile written
@@ -690,126 +660,130 @@ def scan_files(
                 continue
             rel_path = os.path.relpath(abs_path, input_dir)
             candidates.append((abs_path, rel_path, name, ftype))
+    return candidates
+
+
+def scan_single_file(
+    abs_path: str,
+    rel_path: str,
+    name: str,
+    ftype: str,
+    timezone,
+    image_duration: float = 3.0,
+    hash_chunk: int = HASH_CHUNK,
+) -> ScannedFile:
+    """Read a single media file, compute its sampled SHA-256 hash, and extract metadata."""
+    st = os.stat(abs_path)
+    size = st.st_size
+    file_id = file_sha256(abs_path, hash_chunk)
+
+    if ftype == FILE_TYPE_IMAGE:
+        meta = _image_meta(abs_path, timezone)
+        duration = image_duration
+    else:
+        meta = _video_meta(abs_path)
+        duration = meta["duration_seconds"]
+
+    captured_at_utc = meta["captured_at_utc"]
+    captured_epoch = meta["captured_epoch"]
+    missing_meta = meta["missing_meta"]
+    time_source = "metadata"
+    if captured_at_utc is None:
+        filename_time = parse_filename_time(name, timezone)
+        if filename_time is not None:
+            captured_at_utc = format_iso_utc(filename_time)
+            captured_epoch = filename_time.timestamp()
+            time_source = "filename"
+        else:
+            captured_at_utc, captured_epoch = _mtime_utc(abs_path)
+            time_source = "mtime"
+        missing_meta = True
+
+    source = "camera" if meta["is_camera"] else "other"
+    return ScannedFile(
+        file_id=file_id,
+        abs_path=abs_path,
+        rel_path=rel_path,
+        name=name,
+        type=ftype,
+        size_bytes=size,
+        captured_at_utc=captured_at_utc,
+        captured_epoch=captured_epoch,
+        resolution=meta["resolution"],
+        duration_seconds=duration,
+        location=meta["location"],
+        missing_meta=missing_meta,
+        time_source=time_source,
+        source=source,
+    )
+
+
+def scan_files(
+    input_dir: str,
+    timezone,
+    image_duration: float = 3.0,
+    hash_chunk: int = HASH_CHUNK,
+    only_camera_photos: bool = False,
+    only_phone_videos: bool = False,
+    cache: dict[str, dict] | None = None,  # retained for backwards compatibility
+    on_file: Callable[[ScannedFile], None] | None = None,
+    candidates: list[tuple[str, str, str, str]] | None = None,
+) -> tuple[list[ScannedFile], list[dict], list[dict]]:
+    """Scan media files, extracting metadata and computing IDs.
+
+    Unparseable/corrupt files go into ``errors``; files excluded by the
+    camera/phone filters go into ``skipped``.
+
+    ``on_file``, when given, is called with each successfully-scanned file
+    so the caller can persist progress incrementally.
+    """
+    input_dir = os.path.abspath(input_dir)
+    scanned: list[ScannedFile] = []
+    errors: list[dict] = []
+    skipped: list[dict] = []
+
+    if candidates is None:
+        _logger.info("scanning directory: %s", input_dir)
+        candidates = collect_media_files(input_dir)
 
     total = len(candidates)
     _logger.info("found %d media file(s) to scan", total)
 
-    # Phase 2: hash + extract metadata for each candidate, one at a time, with
-    # a progress line *before* each file so a slow/large file is always named.
-    # Unchanged files (same size + mtime as a previous record) skip the hash
-    # and ffprobe/EXIF steps entirely via the record cache.
     for index, (abs_path, rel_path, name, ftype) in enumerate(candidates, start=1):
+        started = time.monotonic()
         try:
-            st = os.stat(abs_path)
-            size = st.st_size
-            mtime_ns = st.st_mtime_ns
-        except OSError as exc:
-            errors.append({"path": rel_path, "reason": str(exc), "ts": utc_now_iso()})
-            _logger.warning("failed to stat %s: %s", rel_path, exc)
-            continue
-
-        cached = (cache or {}).get(rel_path)
-        cache_hit = bool(
-            cached
-            and cached.get("sha256")
-            and cached.get("type") == ftype
-            and cached.get("size_bytes") == size
-            and cached.get("mtime_ns") == mtime_ns
-        )
-
-        _logger.info(
-            "scan [%d/%d] %s (%s, %.1f MB)%s",
-            index,
-            total,
-            rel_path,
-            ftype,
-            size / (1024 * 1024),
-            " [cache]" if cache_hit else "",
-        )
-
-        if cache_hit:
-            captured_at_utc = cached.get("captured_at_utc")
-            captured_epoch = None
-            if captured_at_utc:
-                dt = parse_iso_utc(captured_at_utc)
-                if dt is not None:
-                    captured_epoch = dt.timestamp()
-            item = ScannedFile(
-                file_id=cached["sha256"],
+            item = scan_single_file(
                 abs_path=abs_path,
                 rel_path=rel_path,
                 name=name,
-                type=ftype,
-                size_bytes=size,
-                captured_at_utc=captured_at_utc,
-                captured_epoch=captured_epoch,
-                resolution=cached.get("resolution"),
-                duration_seconds=cached.get("duration_seconds"),
-                location=cached.get("location"),
-                missing_meta=bool(cached.get("missing_meta", True)),
-                time_source=cached.get("time_source", "metadata"),
-                source=cached.get("source", "unknown"),
-                mtime_ns=mtime_ns,
+                ftype=ftype,
+                timezone=timezone,
+                image_duration=image_duration,
+                hash_chunk=hash_chunk,
             )
-        else:
-            started = time.monotonic()
-            try:
-                file_id = file_sha256(abs_path, hash_chunk)
-                if ftype == FILE_TYPE_IMAGE:
-                    meta = _image_meta(abs_path, timezone)
-                    duration = image_duration
-                else:
-                    meta = _video_meta(abs_path)
-                    duration = meta["duration_seconds"]
+            _logger.info(
+                "scan [%d/%d] %s (%s, %.1f MB)",
+                index,
+                total,
+                rel_path,
+                ftype,
+                item.size_bytes / (1024 * 1024),
+            )
+            _logger.debug(
+                "scanned %s in %.1fs: id=%s captured=%s source=%s time_source=%s",
+                rel_path,
+                time.monotonic() - started,
+                item.file_id[:12],
+                item.captured_at_utc,
+                item.source,
+                item.time_source,
+            )
+        except Exception as exc:  # noqa: BLE001 - skip unparseable files
+            errors.append({"path": rel_path, "reason": str(exc), "ts": utc_now_iso()})
+            _logger.warning("failed to scan %s: %s", rel_path, exc)
+            continue
 
-                captured_at_utc = meta["captured_at_utc"]
-                captured_epoch = meta["captured_epoch"]
-                missing_meta = meta["missing_meta"]
-                time_source = "metadata"
-                if captured_at_utc is None:
-                    filename_time = parse_filename_time(name, timezone)
-                    if filename_time is not None:
-                        captured_at_utc = format_iso_utc(filename_time)
-                        captured_epoch = filename_time.timestamp()
-                        time_source = "filename"
-                    else:
-                        captured_at_utc, captured_epoch = _mtime_utc(abs_path)
-                        time_source = "mtime"
-                    missing_meta = True
-
-                source = "camera" if meta["is_camera"] else "other"
-                item = ScannedFile(
-                    file_id=file_id,
-                    abs_path=abs_path,
-                    rel_path=rel_path,
-                    name=name,
-                    type=ftype,
-                    size_bytes=size,
-                    captured_at_utc=captured_at_utc,
-                    captured_epoch=captured_epoch,
-                    resolution=meta["resolution"],
-                    duration_seconds=duration,
-                    location=meta["location"],
-                    missing_meta=missing_meta,
-                    time_source=time_source,
-                    source=source,
-                    mtime_ns=mtime_ns,
-                )
-                _logger.debug(
-                    "scanned %s in %.1fs: id=%s captured=%s source=%s time_source=%s",
-                    rel_path,
-                    time.monotonic() - started,
-                    file_id[:12],
-                    captured_at_utc,
-                    source,
-                    time_source,
-                )
-            except Exception as exc:  # noqa: BLE001 - skip unparseable files
-                errors.append({"path": rel_path, "reason": str(exc), "ts": utc_now_iso()})
-                _logger.warning("failed to scan %s: %s", rel_path, exc)
-                continue
-
-        # Source filters apply to both cached and freshly-scanned files.
+        # Source filters apply to scanned files.
         if ftype == FILE_TYPE_IMAGE and only_camera_photos and item.source != "camera":
             skipped.append({"path": rel_path, "reason": "not a camera photo"})
             _logger.info("skipped %s (not a camera photo)", rel_path)
@@ -839,44 +813,126 @@ def scan(
     image_duration: float = 3.0,
     only_camera_photos: bool = False,
     only_phone_videos: bool = False,
+    force_scan: bool = False,
     on_file: Callable[[ScannedFile], None] | None = None,
 ) -> ScanResult:
-    """Scan and reconcile against the database (new / processed / deleted)."""
-    cache: dict[str, dict] = {}
-    existing_ids = set(db.files.keys())  # snapshot before any incremental upserts
-    for record in db.files.values():
-        path = record.get("path")
-        if path:
-            cache[path] = record
-    _logger.debug("built scan cache with %d cached path(s)", len(cache))
+    """Scan and reconcile against the database using path sets and precise incremental loading.
 
-    scanned, errors, skipped = scan_files(
+    - When force_scan=True: re-scans all media files on disk.
+    - When disk_paths == db_paths: skips scanning entirely and restores files from database.
+    - When disk_paths != db_paths: precisely scans only new files, removes deleted files,
+      and retains unchanged files directly from database without re-reading them.
+    """
+    input_dir = os.path.abspath(input_dir)
+    candidates = collect_media_files(input_dir)
+    disk_paths = {c[1] for c in candidates}
+    candidate_map = {c[1]: c for c in candidates}
+
+    # Map relative path -> file_id from db
+    db_path_to_id: dict[str, str] = {}
+    for fid, record in db.files.items():
+        p = record.get("path")
+        if p:
+            db_path_to_id[p] = fid
+
+    db_paths = set(db_path_to_id.keys())
+    existing_ids = set(db.files.keys())
+
+    # Case 1: Force full scan
+    if force_scan:
+        _logger.info("force-scan enabled: rescanning all %d media files", len(candidates))
+        scanned, errors, skipped = scan_files(
+            input_dir,
+            timezone,
+            image_duration,
+            only_camera_photos=only_camera_photos,
+            only_phone_videos=only_phone_videos,
+            on_file=on_file,
+            candidates=candidates,
+        )
+        scanned_ids = {f.file_id for f in scanned}
+        new_file_ids = [f.file_id for f in scanned if f.file_id not in existing_ids]
+        processed_file_ids = [f.file_id for f in scanned if f.file_id in existing_ids]
+        deleted_file_ids = sorted(existing_ids - scanned_ids)
+        return ScanResult(
+            files=scanned,
+            new_file_ids=new_file_ids,
+            processed_file_ids=processed_file_ids,
+            deleted_file_ids=deleted_file_ids,
+            errors=errors,
+            skipped=skipped,
+        )
+
+    # Helper function to filter retained records
+    def _restore_retained(paths: set[str]) -> tuple[list[ScannedFile], list[dict]]:
+        retained: list[ScannedFile] = []
+        filter_skipped: list[dict] = []
+        for rel_p in sorted(paths):
+            fid = db_path_to_id[rel_p]
+            rec = db.files[fid]
+            item = ScannedFile.from_record(fid, rec, input_dir)
+            if item.type == FILE_TYPE_IMAGE and only_camera_photos and item.source != "camera":
+                filter_skipped.append({"path": item.rel_path, "reason": "not a camera photo"})
+                continue
+            if item.type == FILE_TYPE_VIDEO and only_phone_videos and item.source != "camera":
+                filter_skipped.append({"path": item.rel_path, "reason": "not a phone video"})
+                continue
+            retained.append(item)
+        return retained, filter_skipped
+
+    # Case 2: Identical path sets -> skip scanning completely
+    if disk_paths == db_paths:
+        _logger.info("media file paths match database index (%d files); skipping scan", len(disk_paths))
+        retained_files, skipped = _restore_retained(disk_paths)
+        return ScanResult(
+            files=retained_files,
+            new_file_ids=[],
+            processed_file_ids=[f.file_id for f in retained_files],
+            deleted_file_ids=[],
+            errors=[],
+            skipped=skipped,
+        )
+
+    # Case 3: Precise incremental scan (方案 A)
+    added_paths = disk_paths - db_paths
+    deleted_paths = db_paths - disk_paths
+    retained_paths = disk_paths & db_paths
+
+    _logger.info(
+        "precise incremental scan: %d added, %d deleted, %d retained",
+        len(added_paths),
+        len(deleted_paths),
+        len(retained_paths),
+    )
+
+    retained_files, skipped = _restore_retained(retained_paths)
+
+    # Scan only the newly added candidate files
+    added_candidates = [candidate_map[p] for p in sorted(added_paths)]
+    newly_scanned, errors, added_skipped = scan_files(
         input_dir,
         timezone,
         image_duration,
         only_camera_photos=only_camera_photos,
         only_phone_videos=only_phone_videos,
-        cache=cache,
         on_file=on_file,
+        candidates=added_candidates,
     )
-    scanned_ids = {f.file_id for f in scanned}
+    skipped.extend(added_skipped)
 
-    new_file_ids = [f.file_id for f in scanned if f.file_id not in existing_ids]
-    processed_file_ids = [f.file_id for f in scanned if f.file_id in existing_ids]
-    deleted_file_ids = sorted(existing_ids - scanned_ids)
+    # Deleted files: IDs in existing_ids whose paths are not on disk
+    deleted_file_ids = sorted({fid for fid, rec in db.files.items() if rec.get("path") not in disk_paths})
 
-    _logger.info(
-        "reconciled against db: %d new, %d processed, %d deleted",
-        len(new_file_ids),
-        len(processed_file_ids),
-        len(deleted_file_ids),
-    )
+    all_files = retained_files + newly_scanned
+    new_file_ids = [f.file_id for f in newly_scanned]
+    processed_file_ids = [f.file_id for f in retained_files]
 
     return ScanResult(
-        files=scanned,
+        files=all_files,
         new_file_ids=new_file_ids,
         processed_file_ids=processed_file_ids,
         deleted_file_ids=deleted_file_ids,
         errors=errors,
         skipped=skipped,
     )
+

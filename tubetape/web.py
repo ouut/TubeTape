@@ -1958,11 +1958,11 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
             <div class="form-item" style="justify-content: center; flex-direction: column; align-items: flex-start;">
               <label class="form-label" style="cursor: pointer;">
-                <input type="checkbox" id="cfg-no_scan" style="margin-right: 6px;" />
-                启动时跳过扫描，直接读取数据库 (--no-scan)
+                <input type="checkbox" id="cfg-force_scan" style="margin-right: 6px;" />
+                启动时强制全量扫描构建元数据 (--force-scan)
               </label>
               <div style="font-size: 0.73rem; color: #a1a1aa; margin-top: 3px; line-height: 1.35;">
-                开启后，服务启动跳过耗时的磁盘全量遍历，秒级载入数据库；当有新文件写入或在仪表盘点击“开始全量扫描”时会自动触发扫描。
+                默认关闭（启动时自动比对元数据与文件路径集合，一致则跳过扫描；开启后每次启动强制全量扫描重建元数据）。
               </div>
             </div>
             <div class="form-item">
@@ -2271,7 +2271,7 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
 
         document.getElementById('cfg-keep_segments').value = initialConfig.keep_segments;
         document.getElementById('cfg-no_upload').checked = !!initialConfig.no_upload;
-        document.getElementById('cfg-no_scan').checked = !!initialConfig.no_scan;
+        document.getElementById('cfg-force_scan').checked = !!initialConfig.force_scan;
         document.getElementById('cfg-privacy').value = initialConfig.privacy || 'private';
         document.getElementById('cfg-playlist').value = initialConfig.playlist || '';
 
@@ -2340,7 +2340,7 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
         ken_burns: document.getElementById('cfg-ken_burns').checked,
         keep_segments: parseInt(document.getElementById('cfg-keep_segments').value, 10),
         no_upload: document.getElementById('cfg-no_upload').checked,
-        no_scan: document.getElementById('cfg-no_scan').checked,
+        force_scan: document.getElementById('cfg-force_scan').checked,
         privacy: document.getElementById('cfg-privacy').value,
         playlist: document.getElementById('cfg-playlist').value.trim(),
         quiet_period: document.getElementById('cfg-quiet_period').value.trim(),
@@ -2357,7 +2357,7 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
         });
         const d = await res.json();
         if (res.ok && d.ok) {
-          alert('✅ 配置已更新并成功保存至 config.json！');
+          alert('✅ 配置已更新并成功保存至数据库 (tubetape.json)！');
           closeConfigModal();
           pollDashboard();
         } else {
@@ -2876,7 +2876,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                         "segment_duration": 3600.0,
                         "keep_segments": _server_state.get("keep_segments", 0),
                         "no_upload": False,
-                        "no_scan": False,
+                        "force_scan": False,
                         "image_duration": 3.0,
                         "crf": 16,
                         "max_resolution": "7680x4320",
@@ -2890,7 +2890,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                         "only_phone_videos": False,
                         "quiet_period": 600.0,
                         "poll_interval": 30.0,
-                        "mtime_interval": 3600.0,
+                        "mtime_interval": 600.0,
                         "quota_backoff": 3600.0,
                     },
                     "fingerprint_params": list(FINGERPRINT_PARAMS),

@@ -80,6 +80,32 @@ class TestRoundTrip:
         Database(path=str(path)).save()
         assert os.path.exists(path)
 
+    def test_round_trip_preserves_config(self, tmp_path):
+        path = tmp_path / "tubetape.json"
+        db = Database(path=str(path), config={"crf": 18, "segment_duration": 1800.0})
+        db.save()
+
+        loaded = Database.load(str(path))
+        assert loaded.config == {"crf": 18, "segment_duration": 1800.0}
+        assert loaded.to_dict() == db.to_dict()
+
+    def test_migrates_legacy_config_json(self, tmp_path):
+        # When config.json exists but tubetape.json has no config key
+        legacy_file = tmp_path / "config.json"
+        legacy_file.write_text('{"crf": 20, "keep_segments": 3}', encoding="utf-8")
+
+        # Case A: tubetape.json does not exist yet
+        db_path = tmp_path / "tubetape.json"
+        loaded = Database.load(str(db_path))
+        assert loaded.config["crf"] == 20
+        assert loaded.config["keep_segments"] == 3
+
+        # Case B: tubetape.json exists without config
+        db_path.write_text('{"version": 1, "files": {}, "segments": {}}', encoding="utf-8")
+        loaded_b = Database.load(str(db_path))
+        assert loaded_b.config["crf"] == 20
+        assert loaded_b.config["keep_segments"] == 3
+
 
 class TestAtomicWrite:
     def test_no_temp_files_left_behind(self, tmp_path):

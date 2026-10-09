@@ -30,7 +30,7 @@ class TestDefaults:
         assert args.flush is False
         assert args.watch is True
         assert args.dry_run is False
-        assert args.mtime_interval == 3600.0
+        assert args.mtime_interval == 600.0
         assert args.quota_backoff == 3600.0
         assert args.timezone is not None
         assert args.web_port == 8080
@@ -379,17 +379,14 @@ class TestKeepSegments:
         assert f2.exists()
         assert f3.exists()
 
-    def test_cli_flags_no_scan_and_no_upload(self):
+    def test_cli_flags_force_scan_and_no_upload(self):
         args = _parse()
-        assert args.no_scan is False
+        assert args.force_scan is False
         assert args.no_upload is False
 
-        args2 = _parse("--no-scan", "--no-upload")
-        assert args2.no_scan is True
+        args2 = _parse("--force-scan", "--no-upload")
+        assert args2.force_scan is True
         assert args2.no_upload is True
-
-        args3 = _parse("--skip-scan")
-        assert args3.no_scan is True
 
     def test_run_pipeline_no_upload_mode(self, tmp_path, monkeypatch):
         import json
@@ -428,9 +425,48 @@ class TestKeepSegments:
         assert seg["output_path"] is not None
         assert os.path.isfile(seg["output_path"])
 
-    def test_run_pipeline_no_scan_mode(self, tmp_path, monkeypatch):
+    def test_run_pipeline_auto_skip_scan_when_paths_match(self, tmp_path, monkeypatch):
         from tubetape import cli
         from tubetape.db import Database
+        from tubetape import scanner
+
+        # Create the file on disk so disk_paths == {"img1.png"}
+        (tmp_path / "img1.png").write_bytes(b"dummy")
+
+        db_path = tmp_path / "db.json"
+        db = Database(path=str(db_path))
+        db.upsert_file("f1", {
+            "path": "img1.png",
+            "name": "img1.png",
+            "type": "image",
+            "captured_at_utc": "2024-01-01T00:00:00Z",
+            "duration_seconds": 3.0,
+            "size_bytes": 100,
+        })
+        db.save()
+
+        def fake_scan_files(*args, **kwargs):
+            raise AssertionError("scan_files should not be called when paths match")
+
+        monkeypatch.setattr(scanner, "scan_files", fake_scan_files)
+
+        rc = cli.main(
+            [
+                "--dry-run",
+                "--no-watch",
+                "--flush",
+                "--input", str(tmp_path),
+                "--db", str(db_path),
+            ]
+        )
+        assert rc == 0
+
+    def test_run_pipeline_force_scan_forces_scan_files(self, tmp_path, monkeypatch):
+        from tubetape import cli
+        from tubetape.db import Database
+        from tubetape import scanner
+
+        (tmp_path / "img1.png").write_bytes(b"dummy")
 
         db_path = tmp_path / "db.json"
         db = Database(path=str(db_path))
@@ -445,51 +481,99 @@ class TestKeepSegments:
         db.save()
 
         scanned_called = []
-        def fake_scan(*args, **kwargs):
+        orig_scan_files = scanner.scan_files
+
+        def fake_scan_files(*args, **kwargs):
             scanned_called.append(1)
-            raise AssertionError("scan should not be called when --no-scan is given")
+            return orig_scan_files(*args, **kwargs)
 
-        monkeypatch.setattr(cli, "scan", fake_scan)
-
-        rc = cli.main(
-            [
-                "--no-scan",
-                "--dry-run",
-                "--no-watch",
-                "--flush",
-                "--input", str(tmp_path),
-                "--db", str(db_path),
-            ]
-        )
-        assert rc == 0
-        assert scanned_called == []
-
-    def test_run_pipeline_force_scan_overrides_no_scan(self, tmp_path, monkeypatch):
-        from tubetape import cli
-        from tubetape.db import Database
-        from tubetape.scanner import ScanResult
-
-        db_path = tmp_path / "db.json"
-        db = Database(path=str(db_path))
-        db.save()
-
-        scanned_called = []
-        def fake_scan(*args, **kwargs):
-            scanned_called.append(1)
-            return ScanResult(files=[], processed_file_ids=[])
-
-        monkeypatch.setattr(cli, "scan", fake_scan)
+        monkeypatch.setattr(scanner, "scan_files", fake_scan_files)
 
         args = cli.parse_args([
-            "--no-scan",
+            "--force-scan",
             "--dry-run",
             "--no-watch",
             "--input", str(tmp_path),
             "--db", str(db_path),
         ])
-        rc = cli.run_pipeline(args, force_scan=True)
+        rc = cli.run_pipeline(args)
         assert rc == 0
         assert len(scanned_called) == 1
+
+    def test_run_pipeline_incremental_scan_on_new_file(self, tmp_path, monkeypatch):
+        from tubetape import cli
+        from tubetape.db import Database
+        from tubetape import scanner
+        from conftest import make_png
+
+        make_png(tmp_path / "img1.png", size=(10, 10))
+        make_png(tmp_path / "new_img.png", size=(10, 10))
+
+        db_path = tmp_path / "db.json"
+        db = Database(path=str(db_path))
+        db.upsert_file("f1", {
+            "path": "img1.png",
+            "name": "img1.png",
+            "type": "image",
+            "captured_at_utc": "2024-01-01T00:00:00Z",
+            "duration_seconds": 3.0,
+            "size_bytes": 100,
+        })
+        db.save()
+
+        scanned_paths = []
+        orig_scan_files = scanner.scan_files
+
+        def fake_scan_files(*args, **kwargs):
+            candidates = kwargs.get("candidates") or []
+            for c in candidates:
+                scanned_paths.append(c[1])
+            return orig_scan_files(*args, **kwargs)
+
+        monkeypatch.setattr(scanner, "scan_files", fake_scan_files)
+
+        rc = cli.main([
+            "--dry-run",
+            "--no-watch",
+            "--flush",
+            "--input", str(tmp_path),
+            "--db", str(db_path),
+        ])
+        assert rc == 0
+        # Only new_img.png should be scanned, img1.png is retained from DB
+        assert scanned_paths == ["new_img.png"]
+
+    def test_cli_and_db_config_precedence(self, tmp_path):
+        from tubetape.coordinator import AppCoordinator
+        from tubetape.db import Database
+
+        db_path = tmp_path / "tubetape.json"
+        db = Database(
+            path=str(db_path),
+            config={
+                "crf": 22,
+                "image_duration": 5.0,
+                "segment_duration": 1200.0,
+            },
+        )
+        db.save()
+
+        # Explicitly pass --crf 28 on CLI, but omit image-duration and segment-duration
+        args = parse_args([
+            "--input", str(tmp_path),
+            "--db", str(db_path),
+            "--crf", "28",
+        ])
+        coord = AppCoordinator(args, db=db)
+        coord.load_saved_config()
+
+        # 1. CLI explicit flag wins over DB config
+        assert coord.args.crf == 28
+        # 2. DB config overrides built-in code default
+        assert coord.args.image_duration == 5.0
+        assert coord.args.segment_duration == 1200.0
+        # 3. Non-configured parameters retain built-in code default
+        assert coord.args.fps == 60
 
 
 if __name__ == "__main__":
