@@ -420,6 +420,7 @@ def run_pipeline(
     if not is_force_scan and len(result.new_file_ids) == 0 and len(result.deleted_file_ids) == 0:
         reporter.status(f"media files match database index ({len(result.files)} files); skipped scanning")
         _log.info("media files match database index (%d files); full scan skipped", len(result.files))
+        web.set_web_status("watching" if args.watch else "idle", f"就绪 ({len(result.files)} 个文件与数据库索引完全一致，已跳过扫描)")
     else:
         _log.info(
             "scan complete: %d media file(s) (%d new, %d already processed, %d deleted), "
@@ -489,6 +490,17 @@ def run_pipeline(
         return 0
 
     # Real run: persist scanned files, then transcode and upload.
+    from .scanner import normalize_rel_path
+    if hasattr(db, "skipped_files"):
+        for item in result.skipped:
+            norm_p = normalize_rel_path(item.get("path", ""), args.input)
+            if norm_p:
+                db.skipped_files[norm_p] = item.get("reason", "skipped")
+        for err in result.errors:
+            norm_p = normalize_rel_path(err.get("path", ""), args.input)
+            if norm_p:
+                db.skipped_files[norm_p] = f"error: {err.get('reason', '')}"
+
     for item in result.files:
         db.upsert_file(item.file_id, item.to_record())
         _log.debug("indexed file %s: %s (%.1fs)", item.file_id[:12], item.rel_path, item.duration_seconds or 0.0)

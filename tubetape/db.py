@@ -80,6 +80,7 @@ class Database:
         files: dict[str, dict] | None = None,
         segments: dict[str, dict] | None = None,
         config: dict[str, Any] | None = None,
+        skipped_files: dict[str, str] | None = None,
         version: int = SCHEMA_VERSION,
         path: str | None = None,
     ):
@@ -87,6 +88,7 @@ class Database:
         self.config = config if config is not None else {}
         self.files = files if files is not None else {}
         self.segments = segments if segments is not None else {}
+        self.skipped_files = skipped_files if skipped_files is not None else {}
         self.path = path
 
     # ------------------------------------------------------------------ I/O
@@ -147,16 +149,20 @@ class Database:
             config=config,
             files=raw.get("files", {}),
             segments=raw.get("segments", {}),
+            skipped_files=raw.get("skipped_files", {}),
             path=os.path.abspath(path),
         )
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "version": self.version,
             "config": self.config,
             "files": self.files,
             "segments": self.segments,
         }
+        if self.skipped_files:
+            d["skipped_files"] = self.skipped_files
+        return d
 
     def save(self, path: str | None = None) -> None:
         """Atomically persist the database to ``path`` (or ``self.path``)."""
@@ -194,6 +200,17 @@ class Database:
 
     def upsert_file(self, file_id: str, record: dict) -> None:
         _logger.debug("upsert file %s (%s)", file_id[:12], record.get("path"))
+        if file_id in self.files:
+            existing = self.files[file_id]
+            new_path = record.get("path")
+            old_path = existing.get("path")
+            if new_path and old_path and new_path != old_path:
+                alts = set(existing.get("alt_paths", []))
+                alts.add(old_path)
+                alts.discard(new_path)
+                record["alt_paths"] = sorted(alts)
+            elif "alt_paths" in existing and "alt_paths" not in record:
+                record["alt_paths"] = existing["alt_paths"]
         self.files[file_id] = record
 
     def remove_file(self, file_id: str) -> None:

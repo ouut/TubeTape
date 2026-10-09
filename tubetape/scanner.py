@@ -639,6 +639,22 @@ class ScanResult:
 # ------------------------------------------------------------------- scanner
 
 
+def normalize_rel_path(path: str, input_dir: str = "") -> str:
+    """Normalize a relative media path across OS separators and leading markers."""
+    if not path:
+        return ""
+    p = path.replace("\\", "/").strip()
+    if input_dir and os.path.isabs(p):
+        try:
+            p = os.path.relpath(p, input_dir)
+        except ValueError:
+            pass
+    norm = os.path.normpath(p).replace("\\", "/")
+    if norm in (".", "/"):
+        return ""
+    return norm.lstrip("./")
+
+
 def collect_media_files(input_dir: str) -> list[tuple[str, str, str, str]]:
     """Recursively collect (abs_path, rel_path, name, ftype) for all supported media files."""
     input_dir = os.path.abspath(input_dir)
@@ -646,7 +662,11 @@ def collect_media_files(input_dir: str) -> list[tuple[str, str, str, str]]:
     for root, dirs, names in os.walk(input_dir):
         # Skip hidden files/dirs: the transcode output is a dotfile written
         # next to the db, and must not be re-scanned as media.
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        # Also skip NAS metadata dirs like Synology @eaDir.
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".") and d != "@eaDir" and not d.startswith("@")
+        ]
         for name in sorted(names):
             if name.startswith("."):
                 continue
@@ -658,7 +678,7 @@ def collect_media_files(input_dir: str) -> list[tuple[str, str, str, str]]:
                 ftype = FILE_TYPE_VIDEO
             else:
                 continue
-            rel_path = os.path.relpath(abs_path, input_dir)
+            rel_path = normalize_rel_path(os.path.relpath(abs_path, input_dir))
             candidates.append((abs_path, rel_path, name, ftype))
     return candidates
 
@@ -825,17 +845,29 @@ def scan(
     """
     input_dir = os.path.abspath(input_dir)
     candidates = collect_media_files(input_dir)
-    disk_paths = {c[1] for c in candidates}
-    candidate_map = {c[1]: c for c in candidates}
+    disk_paths = {normalize_rel_path(c[1], input_dir) for c in candidates}
+    candidate_map = {normalize_rel_path(c[1], input_dir): c for c in candidates}
 
-    # Map relative path -> file_id from db
+    # Map relative path -> file_id from db (including alt_paths for duplicate files)
     db_path_to_id: dict[str, str] = {}
     for fid, record in db.files.items():
         p = record.get("path")
         if p:
-            db_path_to_id[p] = fid
+            norm_p = normalize_rel_path(p, input_dir)
+            if norm_p:
+                db_path_to_id[norm_p] = fid
+        for alt_p in record.get("alt_paths", []):
+            if alt_p:
+                norm_alt = normalize_rel_path(alt_p, input_dir)
+                if norm_alt:
+                    db_path_to_id[norm_alt] = fid
 
-    db_paths = set(db_path_to_id.keys())
+    db_skipped_paths = {
+        normalize_rel_path(p, input_dir)
+        for p in getattr(db, "skipped_files", {}).keys()
+    }
+    db_skipped_paths.discard("")
+    db_paths = set(db_path_to_id.keys()) | db_skipped_paths
     existing_ids = set(db.files.keys())
 
     # Case 1: Force full scan
@@ -867,8 +899,16 @@ def scan(
     def _restore_retained(paths: set[str]) -> tuple[list[ScannedFile], list[dict]]:
         retained: list[ScannedFile] = []
         filter_skipped: list[dict] = []
+        seen_fids: set[str] = set()
         for rel_p in sorted(paths):
-            fid = db_path_to_id[rel_p]
+            fid = db_path_to_id.get(rel_p)
+            if not fid or fid not in db.files:
+                # May be a known skipped file or corrupt file
+                continue
+            if fid in seen_fids:
+                # Duplicate file already restored under another path
+                continue
+            seen_fids.add(fid)
             rec = db.files[fid]
             item = ScannedFile.from_record(fid, rec, input_dir)
             if item.type == FILE_TYPE_IMAGE and only_camera_photos and item.source != "camera":
@@ -908,7 +948,7 @@ def scan(
     retained_files, skipped = _restore_retained(retained_paths)
 
     # Scan only the newly added candidate files
-    added_candidates = [candidate_map[p] for p in sorted(added_paths)]
+    added_candidates = [candidate_map[p] for p in sorted(added_paths) if p in candidate_map]
     newly_scanned, errors, added_skipped = scan_files(
         input_dir,
         timezone,
@@ -920,8 +960,18 @@ def scan(
     )
     skipped.extend(added_skipped)
 
-    # Deleted files: IDs in existing_ids whose paths are not on disk
-    deleted_file_ids = sorted({fid for fid, rec in db.files.items() if rec.get("path") not in disk_paths})
+    # Clean up deleted paths from db.skipped_files if present
+    if hasattr(db, "skipped_files"):
+        for dp in deleted_paths:
+            db.skipped_files.pop(dp, None)
+
+    # Deleted files: IDs in existing_ids where none of their paths (path or alt_paths) remain on disk
+    deleted_file_ids = []
+    for fid, rec in db.files.items():
+        all_fid_paths = [rec.get("path")] + list(rec.get("alt_paths", []))
+        if not any(normalize_rel_path(p, input_dir) in disk_paths for p in all_fid_paths if p):
+            deleted_file_ids.append(fid)
+    deleted_file_ids.sort()
 
     all_files = retained_files + newly_scanned
     new_file_ids = [f.file_id for f in newly_scanned]

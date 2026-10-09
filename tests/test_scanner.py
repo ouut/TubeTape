@@ -332,3 +332,53 @@ class TestScanReconcile:
         assert sorted(result.new_file_ids) == [scanner.file_sha256(str(tmp_path / "new.png"))]
         assert result.processed_file_ids == [existing_id]
         assert result.deleted_file_ids == ["gone-id"]
+
+    def test_duplicate_files_prevent_rescan(self, tmp_path):
+        # Two files with identical content (duplicate files on disk)
+        make_png(tmp_path / "orig.png", size=(10, 10))
+        make_png(tmp_path / "copy.png", size=(10, 10))
+        file_id = scanner.file_sha256(str(tmp_path / "orig.png"))
+
+        db = Database()
+        db.upsert_file(file_id, {"path": "orig.png", "type": "image", "alt_paths": ["copy.png"]})
+
+        # Scan should identify identical path set and skip scanning
+        res = scanner.scan(str(tmp_path), db, SHANGHAI)
+        assert len(res.new_file_ids) == 0
+        assert len(res.deleted_file_ids) == 0
+        assert len(res.files) == 1
+        assert res.files[0].file_id == file_id
+
+    def test_skipped_files_prevent_rescan(self, tmp_path):
+        # File skipped because it's not a camera photo
+        make_png(tmp_path / "screenshot.png", size=(10, 10))
+        db = Database()
+        db.skipped_files["screenshot.png"] = "not a camera photo"
+
+        res = scanner.scan(str(tmp_path), db, SHANGHAI, only_camera_photos=True)
+        assert len(res.new_file_ids) == 0
+        assert len(res.deleted_file_ids) == 0
+
+    def test_normalized_paths_match(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        make_png(tmp_path / "sub" / "img.png", size=(10, 10))
+        fid = scanner.file_sha256(str(tmp_path / "sub" / "img.png"))
+
+        db = Database()
+        # Path stored with leading ./ or backslashes
+        db.upsert_file(fid, {"path": ".\\sub\\img.png", "type": "image"})
+
+        res = scanner.scan(str(tmp_path), db, SHANGHAI)
+        assert len(res.new_file_ids) == 0
+        assert len(res.deleted_file_ids) == 0
+
+    def test_nas_eadir_ignored(self, tmp_path):
+        make_png(tmp_path / "normal.png", size=(10, 10))
+        eadir = tmp_path / "@eaDir"
+        eadir.mkdir()
+        make_png(eadir / "thumb.png", size=(5, 5))
+
+        candidates = scanner.collect_media_files(str(tmp_path))
+        names = [c[2] for c in candidates]
+        assert "normal.png" in names
+        assert "thumb.png" not in names

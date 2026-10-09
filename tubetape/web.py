@@ -389,8 +389,16 @@ def _collect_segments() -> dict[str, dict]:
             media_dir = _server_state.get("media_dir") or "."
             scanned_files = [ScannedFile.from_record(fid, rec, media_dir) for fid, rec in db.files.items()]
             coord = get_app_coordinator()
-            seg_dur = float(getattr(getattr(coord, "args", None), "segment_duration", 900.0) if coord else 900.0)
-            plan_res = plan(scanned_files, getattr(db, "segments", {}), seg_dur, flush=True)
+            seg_dur = None
+            if coord and getattr(coord, "args", None):
+                seg_dur = getattr(coord.args, "segment_duration", None)
+            if seg_dur is None and db and getattr(db, "config", None):
+                seg_dur = db.config.get("segment_duration")
+            if seg_dur is None:
+                seg_dur = 3600.0
+            seg_dur = float(seg_dur)
+            params = coord.segment_params() if coord else ()
+            plan_res = plan(scanned_files, getattr(db, "segments", {}), seg_dur, params=params, flush=True)
             for seg in plan_res.segments:
                 sid = seg.segment_id
                 if sid not in segments_dict:
