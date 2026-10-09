@@ -598,6 +598,14 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
       <span>TubeTape</span>
       <div>画廊</div>
     </div>
+    <div class="header-segment" style="display:flex;align-items:center;gap:6px;">
+      <button id="prev-seg-btn" class="btn-header" onclick="stepSegment(-1)" title="切换至上一分片">◀</button>
+      <select id="segment-select" class="btn-header" style="max-width:320px;cursor:pointer;background:rgba(20,20,26,0.9);outline:none;font-weight:600;" onchange="onSegmentSelect(this.value)">
+        <option value="">载入分片中...</option>
+      </select>
+      <button id="next-seg-btn" class="btn-header" onclick="stepSegment(1)" title="切换至下一分片">▶</button>
+      <a id="yt-seg-link" href="#" target="_blank" class="btn-header" style="display:none;background:rgba(220,38,38,0.85);border-color:#ef4444;" title="在 YouTube 上播放此分片视频">▶️ YouTube</a>
+    </div>
     <div class="header-links">
       <button id="sound-btn" class="btn-header" onclick="toggleMute()">🔇 静音</button>
       <button id="zoom-btn" class="btn-header" onclick="toggleZoomCurr()">🔍 放大</button>
@@ -614,6 +622,9 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
       <span id="info-filename">-</span>
       <span id="info-extra">-</span>
       <span id="info-counter" class="info-counter">-</span>
+    </div>
+    <div id="info-path-box" style="margin-top:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.75rem;color:#93c5fd;opacity:0.9;word-break:break-all;user-select:text;-webkit-user-select:text;">
+      📁 <span id="info-filepath">-</span>
     </div>
   </div>
 
@@ -642,6 +653,11 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
     let isZoomed = false;
     let isTransitioning = false;
 
+    // Segment state
+    let segmentsList = [];
+    let currentSegIndex = -1;
+    let currentSegId = null;
+
     // Zoom/Pan state for current image
     let currentScale = 1;
     let panX = 0, panY = 0;
@@ -661,8 +677,28 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
     const soundBtn = document.getElementById('sound-btn');
     const videoProgressContainer = document.getElementById('video-progress-container');
     const videoProgressBar = document.getElementById('video-progress-bar');
+    const segmentSelect = document.getElementById('segment-select');
+    const prevSegBtn = document.getElementById('prev-seg-btn');
+    const nextSegBtn = document.getElementById('next-seg-btn');
+    const ytSegLink = document.getElementById('yt-seg-link');
 
     async function init() {
+      try {
+        const segRes = await fetch('/api/segments');
+        if (segRes.ok) {
+          const segData = await segRes.json();
+          if (segData.segments && segData.segments.length > 0) {
+            segmentsList = segData.segments;
+            renderSegmentOptions();
+            const savedSeg = localStorage.getItem('tubetape_active_seg');
+            const targetSeg = segmentsList.find(s => s.id === savedSeg) || segmentsList[segmentsList.length - 1];
+            await selectSegment(targetSeg.id);
+            return;
+          }
+        }
+      } catch (e) {}
+
+      // Fallback if no segments yet: global summary
       try {
         const res = await fetch('/api/media/summary');
         if (res.ok) {
@@ -686,6 +722,68 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
       }
     }
 
+    function renderSegmentOptions() {
+      segmentSelect.innerHTML = '';
+      segmentsList.forEach((s) => {
+        const opt = document.createElement('option');
+        opt.value = s.id;
+        const ytTag = s.youtube_video_id ? ' ✅' : '';
+        opt.textContent = `${s.title} (${s.file_count}项 · ${formatSec(s.duration_seconds)})${ytTag}`;
+        segmentSelect.appendChild(opt);
+      });
+    }
+
+    async function selectSegment(segId) {
+      currentSegId = segId;
+      localStorage.setItem('tubetape_active_seg', segId);
+      currentSegIndex = segmentsList.findIndex(s => s.id === segId);
+      segmentSelect.value = segId;
+
+      prevSegBtn.disabled = (currentSegIndex <= 0);
+      nextSegBtn.disabled = (currentSegIndex >= segmentsList.length - 1);
+
+      const curSeg = segmentsList[currentSegIndex];
+      if (curSeg && curSeg.youtube_video_id) {
+        ytSegLink.href = 'https://youtu.be/' + curSeg.youtube_video_id;
+        ytSegLink.style.display = 'inline-flex';
+      } else {
+        ytSegLink.style.display = 'none';
+      }
+
+      boxCurr.innerHTML = '<div class="loading-spinner"></div>';
+      try {
+        const res = await fetch('/api/segment/items?id=' + encodeURIComponent(segId));
+        if (res.ok) {
+          const data = await res.json();
+          itemsCache = {};
+          (data.items || []).forEach((item, idx) => {
+            item.index = idx;
+            itemsCache[idx] = item;
+          });
+          totalItems = (data.items || []).length;
+          currentIndex = 0;
+          if (totalItems > 0) {
+            showSlide(0);
+          } else {
+            boxCurr.innerHTML = '<div class="empty-state"><div class="empty-title">该分片暂无素材</div></div>';
+          }
+        }
+      } catch (e) {
+        boxCurr.innerHTML = '<div class="empty-state"><div class="empty-title">载入分片失败</div></div>';
+      }
+    }
+
+    function onSegmentSelect(segId) {
+      if (segId) selectSegment(segId);
+    }
+
+    function stepSegment(delta) {
+      const targetIdx = currentSegIndex + delta;
+      if (targetIdx >= 0 && targetIdx < segmentsList.length) {
+        selectSegment(segmentsList[targetIdx].id);
+      }
+    }
+
     function renderEmpty() {
       boxCurr.innerHTML = `
         <div class="empty-state">
@@ -700,6 +798,7 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
     }
 
     async function prefetchRange(start, count) {
+      if (currentSegId) return; // Segment mode loads all items upfront
       const needed = [];
       for (let i = start; i < start + count && i < totalItems; i++) {
         if (!itemsCache[i]) needed.push(i);
@@ -806,6 +905,11 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
       if (item.size > 0) extra.push(formatSize(item.size));
       document.getElementById('info-extra').textContent = extra.join(' · ');
       document.getElementById('info-counter').textContent = `${currentIndex + 1} / ${totalItems}`;
+
+      const pathElem = document.getElementById('info-filepath');
+      if (pathElem) {
+        pathElem.textContent = item.abs_path || item.path || '-';
+      }
     }
 
     function updateScrubberPosition() {
@@ -815,7 +919,13 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
     }
 
     function goNext() {
-      if (isTransitioning || currentIndex >= totalItems - 1) return;
+      if (isTransitioning) return;
+      if (currentIndex >= totalItems - 1) {
+        if (currentSegIndex >= 0 && currentSegIndex < segmentsList.length - 1) {
+          stepSegment(1);
+        }
+        return;
+      }
       isTransitioning = true;
 
       // Animate curr up to -100%, next up to 0%
@@ -844,7 +954,13 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
     }
 
     function goPrev() {
-      if (isTransitioning || currentIndex <= 0) return;
+      if (isTransitioning) return;
+      if (currentIndex <= 0) {
+        if (currentSegIndex > 0) {
+          stepSegment(-1);
+        }
+        return;
+      }
       isTransitioning = true;
 
       // Animate curr down to 100%, prev down to 0%
@@ -2780,8 +2896,332 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        # Route /getbytime/{segment_id}/{minute}/{second}
+        if path.startswith("/getbytime/"):
+            parts = [p for p in path.strip("/").split("/") if p]
+            if len(parts) >= 4 and parts[0] == "getbytime":
+                self._handle_getbytime(parts[1], parts[2], parts[3], query)
+                return
+
+        # Route /api/segments
+        if path == "/api/segments":
+            self._api_segments()
+            return
+
+        # Route /api/segment/items
+        if path == "/api/segment/items":
+            self._api_segment_items(query)
+            return
+
         self.send_response(404)
         self.end_headers()
+
+    def _api_segments(self) -> None:
+        db = get_db()
+        if not db or not db.segments:
+            self._send_json(200, {"segments": []})
+            return
+
+        segs = []
+        for sid, srec in db.segments.items():
+            segs.append({
+                "id": sid,
+                "title": srec.get("title") or sid,
+                "file_count": len(srec.get("file_ids", [])),
+                "duration_seconds": float(srec.get("duration_seconds") or 0.0),
+                "status": srec.get("status") or "sealed",
+                "range": srec.get("range") or [],
+                "youtube_video_id": srec.get("youtube_video_id"),
+            })
+
+        def seg_sort_key(s):
+            rng = s.get("range") or []
+            return rng[0] if (rng and rng[0]) else s["title"]
+
+        segs.sort(key=seg_sort_key)
+        self._send_json(200, {"segments": segs})
+
+    def _api_segment_items(self, query: dict) -> None:
+        db = get_db()
+        seg_id = query.get("id", [None])[0]
+        if not db or not seg_id:
+            self._send_json(400, {"ok": False, "error": "缺少分片 ID 或数据库未就绪"})
+            return
+
+        srec = db.segments.get(seg_id)
+        if not srec:
+            for s, r in db.segments.items():
+                if s.startswith(seg_id) or (len(seg_id) >= 8 and s[:len(seg_id)].lower() == seg_id.lower()):
+                    srec = r
+                    seg_id = s
+                    break
+
+        if not srec:
+            self._send_json(404, {"ok": False, "error": "未找到指定分片"})
+            return
+
+        file_ids = srec.get("file_ids", [])
+        media_dir = _server_state.get("media_dir") or "."
+        items = []
+        for fid in file_ids:
+            f = db.files.get(fid)
+            if not f:
+                continue
+            rel_path = f.get("path") or ""
+            abs_path = os.path.abspath(os.path.join(media_dir, rel_path))
+            items.append({
+                "id": fid,
+                "name": f.get("name") or os.path.basename(rel_path),
+                "path": rel_path,
+                "abs_path": abs_path,
+                "type": f.get("type", "image"),
+                "captured_at": f.get("captured_at_utc") or "",
+                "resolution": f.get("resolution") or "",
+                "duration": float(f.get("duration_seconds") or 0.0),
+                "size": int(f.get("size_bytes") or 0),
+            })
+
+        self._send_json(200, {
+            "ok": True,
+            "segment_id": seg_id,
+            "title": srec.get("title") or seg_id,
+            "duration_seconds": float(srec.get("duration_seconds") or 0.0),
+            "status": srec.get("status") or "sealed",
+            "youtube_video_id": srec.get("youtube_video_id"),
+            "items": items,
+        })
+
+    def _handle_getbytime(self, seg_id: str, min_str: str, sec_str: str, query: dict) -> None:
+        db = get_db()
+        if not db or not db.segments:
+            self._send_html(404, "<h2 style='color:#fff;background:#000;padding:40px;font-family:sans-serif;'>数据库未就绪或未找到任何分片</h2>")
+            return
+
+        try:
+            minute = int(min_str)
+            second = int(sec_str)
+            target_sec = minute * 60 + second
+        except (ValueError, TypeError):
+            self._send_html(400, "<h2 style='color:#fff;background:#000;padding:40px;font-family:sans-serif;'>时间参数无效: 分钟与秒必须为整数</h2>")
+            return
+
+        target_sid = None
+        seg_record = None
+        if seg_id in db.segments:
+            target_sid = seg_id
+            seg_record = db.segments[seg_id]
+        else:
+            for s, rec in db.segments.items():
+                if s.startswith(seg_id) or (len(seg_id) >= 8 and s[:len(seg_id)].lower() == seg_id.lower()):
+                    target_sid = s
+                    seg_record = rec
+                    break
+
+        if not seg_record or not target_sid:
+            self._send_html(404, f"<h2 style='color:#fff;background:#000;padding:40px;font-family:sans-serif;'>未找到对应分片: {seg_id}</h2>")
+            return
+
+        file_ids = seg_record.get("file_ids", [])
+        if not file_ids:
+            self._send_html(404, f"<h2 style='color:#fff;background:#000;padding:40px;font-family:sans-serif;'>分片 {target_sid[:16]} 内无文件记录</h2>")
+            return
+
+        media_dir = _server_state.get("media_dir") or "."
+        current_offset = 0.0
+        hit_file_id = None
+        hit_file_rec = None
+        hit_item_start = 0.0
+        hit_item_end = 0.0
+        hit_item_index = 0
+
+        for idx, fid in enumerate(file_ids):
+            frec = db.files.get(fid, {})
+            duration = float(frec.get("duration_seconds") or 3.0)
+            item_start = current_offset
+            item_end = current_offset + duration
+            if item_start <= target_sec < item_end:
+                hit_file_id = fid
+                hit_file_rec = frec
+                hit_item_start = item_start
+                hit_item_end = item_end
+                hit_item_index = idx + 1
+                break
+            current_offset += duration
+
+        total_duration = current_offset
+        if not hit_file_rec:
+            total_m = int(total_duration // 60)
+            total_s = int(total_duration % 60)
+            self._send_html(
+                404,
+                f"<div style='background:#111;color:#fff;padding:40px;font-family:sans-serif;line-height:1.6;'>"
+                f"<h2>⏱️ 超出分片总时长</h2>"
+                f"<p>分片标题: <b>{seg_record.get('title', target_sid)}</b></p>"
+                f"<p>查询时间: <b>{minute}分{second}秒</b> (第 {target_sec} 秒)</p>"
+                f"<p>该分片总时长仅为: <b>{total_m}分{total_s:02d}秒</b> (共 {total_duration:.1f} 秒)</p>"
+                f"<p><a href='/' style='color:#3b82f6;'>返回时间线画廊</a></p>"
+                f"</div>"
+            )
+            return
+
+        rel_path = hit_file_rec.get("path") or ""
+        abs_path = os.path.abspath(os.path.join(media_dir, rel_path))
+        ftype = hit_file_rec.get("type", "image")
+        is_video = (ftype == "video")
+        captured_at = hit_file_rec.get("captured_at_utc") or "未知"
+        resolution = hit_file_rec.get("resolution") or "未知"
+        item_dur = float(hit_file_rec.get("duration_seconds") or 3.0)
+
+        # Raw redirect
+        if query.get("raw", ["0"])[0] == "1":
+            target_url = f"/api/media/stream?id={hit_file_id}" if is_video else f"/api/media/view?id={hit_file_id}"
+            self.send_response(302)
+            self.send_header("Location", target_url)
+            self.end_headers()
+            return
+
+        # JSON response
+        accept_header = self.headers.get("Accept", "")
+        if query.get("format", [""])[0] == "json" or "application/json" in accept_header:
+            self._send_json(200, {
+                "ok": True,
+                "segment_id": target_sid,
+                "segment_title": seg_record.get("title", target_sid),
+                "file_id": hit_file_id,
+                "path": rel_path,
+                "abs_path": abs_path,
+                "type": ftype,
+                "captured_at": captured_at,
+                "resolution": resolution,
+                "duration_seconds": item_dur,
+                "time_offset_start": hit_item_start,
+                "time_offset_end": hit_item_end,
+                "item_index": hit_item_index,
+                "total_items": len(file_ids),
+                "view_url": f"/api/media/view?id={hit_file_id}",
+                "stream_url": f"/api/media/stream?id={hit_file_id}",
+            })
+            return
+
+        seg_title = seg_record.get("title", target_sid)
+        media_html = ""
+        if is_video:
+            media_html = f"""
+            <video controls autoplay playsinline style="max-width:100%;max-height:68vh;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,0.8);background:#000;">
+                <source src="/api/media/stream?id={hit_file_id}" type="video/mp4">
+                您的浏览器不支持视频播放
+            </video>
+            """
+        else:
+            media_html = f"""
+            <img src="/api/media/view?id={hit_file_id}" alt="{rel_path}" style="max-width:100%;max-height:68vh;object-fit:contain;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,0.8);">
+            """
+
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{minute:02d}:{second:02d} - {os.path.basename(rel_path)} | TubeTape</title>
+  <style>
+    body {{
+      margin: 0; padding: 0; background: #0c0d10; color: #f3f4f6;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }}
+    .container {{
+      max-width: 1000px; margin: 0 auto; padding: 24px 16px;
+    }}
+    .header {{
+      display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;
+    }}
+    .header h1 {{ margin: 0; font-size: 1.25rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px; }}
+    .header a {{
+      color: #93c5fd; text-decoration: none; font-size: 0.9rem; background: rgba(59,130,246,0.15);
+      padding: 6px 14px; border-radius: 6px; border: 1px solid rgba(59,130,246,0.3); transition: all 0.2s;
+    }}
+    .header a:hover {{ background: rgba(59,130,246,0.3); }}
+    .path-card {{
+      background: #181920; border: 1px solid #2d303e; border-radius: 10px; padding: 18px 20px;
+      margin-bottom: 22px; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    }}
+    .path-title {{
+      font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: #9ca3af; margin-bottom: 8px;
+      display: flex; align-items: center; justify-content: space-between;
+    }}
+    .path-value {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.95rem; color: #60a5fa; word-break: break-all; background: #0f1015;
+      padding: 10px 14px; border-radius: 6px; border: 1px solid #232634; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    }}
+    .copy-btn {{
+      background: #2563eb; color: #fff; border: none; padding: 5px 12px; border-radius: 4px;
+      cursor: pointer; font-size: 0.8rem; font-weight: 600; white-space: nowrap; transition: background 0.2s;
+    }}
+    .copy-btn:hover {{ background: #1d4ed8; }}
+    .meta-tags {{
+      display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; font-size: 0.82rem; color: #d1d5db;
+    }}
+    .tag {{
+      background: rgba(255,255,255,0.06); padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.1);
+    }}
+    .tag b {{ color: #fff; }}
+    .media-container {{
+      display: flex; justify-content: center; align-items: center; margin: 24px 0; min-height: 400px;
+    }}
+    .actions {{
+      display: flex; justify-content: center; gap: 14px; margin-top: 20px;
+    }}
+    .action-btn {{
+      background: #222530; color: #fff; border: 1px solid #374151; padding: 10px 20px;
+      border-radius: 8px; text-decoration: none; font-size: 0.9rem; font-weight: 500;
+      display: inline-flex; align-items: center; gap: 8px; transition: all 0.2s;
+    }}
+    .action-btn:hover {{ background: #374151; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🎬 TubeTape 素材定位 <span>{minute:02d}:{second:02d}</span></h1>
+      <a href="/">← 返回时间线画廊</a>
+    </div>
+
+    <div class="path-card">
+      <div class="path-title">
+        <span>📁 真实磁盘物理路径 (Real File Path)</span>
+        <span>分片: {seg_title}</span>
+      </div>
+      <div class="path-value">
+        <span id="filePathText">{abs_path}</span>
+        <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('filePathText').innerText); this.innerText='已复制!'; setTimeout(()=>this.innerText='复制路径', 2000);">复制路径</button>
+      </div>
+
+      <div class="meta-tags">
+        <span class="tag">类型: <b>{"视频 (Video)" if is_video else "照片 (Photo)"}</b></span>
+        <span class="tag">拍摄时间: <b>{captured_at}</b></span>
+        <span class="tag">分辨率: <b>{resolution}</b></span>
+        <span class="tag">素材时长: <b>{item_dur:.1f} 秒</b></span>
+        <span class="tag">在分片中的位置: <b>第 {hit_item_index} / {len(file_ids)} 个素材 ({int(hit_item_start//60)}:{int(hit_item_start%60):02d} ~ {int(hit_item_end//60)}:{int(hit_item_end%60):02d})</b></span>
+      </div>
+    </div>
+
+    <div class="media-container">
+      {media_html}
+    </div>
+
+    <div class="actions">
+      <a href="/api/media/{'stream' if is_video else 'view'}?id={hit_file_id}" target="_blank" class="action-btn">
+        🔍 在新标签页查看原始{"视频" if is_video else "原图"}
+      </a>
+      <a href="/" class="action-btn">
+        📱 进入全屏抖音画廊
+      </a>
+    </div>
+  </div>
+</body>
+</html>
+"""
+        self._send_html(200, html)
 
     def _api_dashboard(self) -> None:
         db = get_db()

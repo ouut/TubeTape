@@ -13,7 +13,7 @@ import threading
 from typing import Any
 
 from . import durations
-from .chapters import chapters_text
+from .chapters import build_segment_description, chapters_text
 from .db import SEGMENT_STATUS_FAILED, SEGMENT_STATUS_SEALED, Database
 from .planner import ScannedFile, plan
 from .rebuild import Rebuilder
@@ -373,7 +373,7 @@ class AppCoordinator:
                 if uploader:
                     web.set_web_status("uploading", f"正在上传 {title}")
                     old_vid = srec.get("youtube_video_id")
-                    desc = chapters_text(chapters)
+                    desc = build_segment_description(files, total_duration=srec.get("duration_seconds"))
                     new_video_id = uploader.upload(out_path, title, desc, privacy=self.args.privacy)
                     uploader.verify(new_video_id)
                     if old_vid:
@@ -443,8 +443,12 @@ class AppCoordinator:
             try:
                 _logger.info("manual upload triggered for segment %s (%s)", segment_id, title)
                 web.set_web_status("uploading", f"正在上传 {title}")
-                chapters = srec.get("chapters", [])
-                desc = chapters_text(chapters)
+                file_ids = srec.get("file_ids", [])
+                files = [
+                    ScannedFile.from_record(fid, self.db.files[fid], self.args.input)
+                    for fid in file_ids if fid in self.db.files
+                ]
+                desc = build_segment_description(files, total_duration=srec.get("duration_seconds"))
                 video_id = uploader.upload(local_path, title, desc, privacy=self.args.privacy)
                 uploader.verify(video_id)
 

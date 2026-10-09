@@ -12,7 +12,7 @@ import sys
 import time
 
 from . import auth, durations
-from .chapters import chapters_text
+from .chapters import build_segment_description, chapters_text
 from .db import SEGMENT_STATUS_SEALED, Database
 from .coordinator import AppCoordinator
 from .log import get_logger, setup_logging
@@ -626,7 +626,7 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
                 if not is_no_upload and uploader:
                     reporter.status(f"uploading {segment.title} ...")
                     web.set_web_status("uploading", f"正在上传 {segment.title}")
-                    description = chapters_text(chapters)
+                    description = build_segment_description(segment_files, total_duration=segment.duration_seconds)
                     video_id = uploader.upload(
                         out_path,
                         segment.title,

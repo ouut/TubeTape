@@ -211,25 +211,26 @@ except BaseException:
 
 ---
 
-### 4.2 时间线贪心分片与容量强约束 (planner.py)
+### 4.2 时间线贪心分片与不可变追加规划 (planner.py)
 
 #### 确定性排序规则
-所有文件按 `(captured_epoch, file_id)` 元组严格升序排序。无拍摄时间的素材统一置于时间线末尾，`file_id` 作为次级排序键保证严格确定性。
+所有素材按如下复合键严格升序排列：
+1. **无拍摄时间素材排在最前**：对于缺少 EXIF/视频元数据且无法推导日期的素材，统一置于时间线最前端，并以 `file_id`（采样哈希）字典序作为次级排序键，确保绝对确定性。
+2. **有拍摄时间素材按拍摄时间升序**：以 UTC 秒数 `captured_epoch` 排序，同秒素材以 `file_id` 打破平局。
 
-#### 稳定分片 ID (Segment ID) 计算
-分片 ID 不依赖执行时间或随机数，仅由分片内文件哈希与转码配置参数严格决定：
-$$\text{segment\_id} = \text{SHA256}\left(\sum_{f \in \text{sorted(file\_ids)}} f + \sum_{p \in \text{params}} p\right)$$
-任何素材的增加、删除或转码参数变动，必然导致计算出全新的 `segment_id`，从而自动触发增量转码与云端更新。
+#### 稳定分片 ID (Segment ID) 与标题规范
+- 分片 ID 不依赖执行时间或随机数，仅由分片内文件哈希与转码配置参数严格决定：
+  $$\text{segment\_id} = \text{SHA256}\left(\sum_{f \in \text{sorted(file\_ids)}} f + \sum_{p \in \text{params}} p\right)$$
+- **标题命名规范**：
+  - 含有拍摄时间的常规分片：`{start_ts} - {end_ts} [{short_id}]`（如 `20140513-062834 - 20141001-015345 [8ebbe961761892c9]`）。
+  - 若分片内所有素材均缺失拍摄时间，紧凑命名为 `19700101_000000-19700101_000000_[{short_id}]`（短横线与下划线无空格紧凑排列）。
 
-#### 8 小时长视频根本原因与容量强约束防护
-在早期版本中，当大量素材跨越不同历史区间重建时，候选区间的选择逻辑若缺乏跨度约束，可能导致贪心装箱误将后续数千张跨越数年的素材全部塞入同一个分片，产生如 8 小时 32 分钟的异常长视频。
-为此，管线在 `planner.py` 中实现了三重保护体系：
-1. **剩余容量严格钳位 (`remaining_capacity`)**：
-   在分片扩充与合并过程中，严格实时计算 `remaining_capacity = max(0.0, target_duration - current_duration)`。任何素材一旦超出该分片的目标容量，立即强制截断，绝不允许无休止累加。
-2. **窄跨度区间优先匹配**：
-   多候选区间匹配时，按 `cand.range_end - cand.range_start` 严格升序排序，优先收敛到最局部的紧凑分片，防止跨度数年的泛化分片贪婪吞噬后续素材。
-3. **溢出切分 (`greedy_pack`)**：
-   若某历史分片合并后总时长超出 `segment_duration`，自动将其交由 `greedy_pack` 重新分割成若干合规的标准时长分片，彻底杜绝单视频时长超标。
+#### 不可变追加规划体系 (Append-Only Immutable Planning)
+为彻底杜绝增量扫描时老分片被动重新规划、级联重建与 YouTube 上传配额雪崩，TubeTape 确立了**历史分片永久不可变**的核心准则：
+1. **已封板分片免扰**：已存在于数据库中的已封板（`sealed`）分片，其素材列表与分片定义永不被增量扫描修改或拆分。
+2. **前沿文件动态入队**：仅当新增素材的拍摄时间 $\ge$ 历史已封板分片的最大时间戳时，才视为时间线最前沿的新鲜增量，追加至末尾的 `pending` 待封板分片；当达到目标时长或用户执行 `--flush` 时，予以封板。
+3. **历史回填与无日期素材独立成片**：若用户导入了更早年份的历史素材（拍摄时间 $<$ 历史最大时间戳）或无拍摄时间素材，系统绝不打散历史分片，而是将其归集为全新的独立分片并立即封板，形成自洽的新视频。
+4. **单文件超长防护**：若单个素材时长本身超过 `segment_duration`，算法将其单独独立成片，允许单片时长自然超出设定阈值，保障素材完整性。
 
 ---
 
@@ -263,15 +264,23 @@ zoompan=z='min(zoom+0.0015,1.25)':d=180:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)
 
 ---
 
-### 4.5 视频章节与时间戳生成 (chapters.py)
+### 4.5 视频统计简介与时间戳生成 (chapters.py)
 
-TubeTape 在视频简介中输出符合 YouTube 播放器点击跳转识别规范的纯时间戳文本：
-```
-0:00 20240501-120000
-0:03 20240501-120003
-0:15 20240501-120015
-```
-不使用冗余的格式字符，每一个对应照片/视频均可在播放器时间轴上形成可交互章节。
+TubeTape 在 YouTube 视频简介中输出纯净统计与纯时长列表（通过 `build_segment_description` 构造），彻底摒弃冗余文件名与污染标记：
+1. **聚合统计概要**：
+   ```text
+   Photos: 210 | Videos: 4 | Total Duration: 12:57
+   ```
+2. **纯视频时长清单（按构建顺序）**：
+   ```text
+   1. 01:23
+   2. 00:45
+   3. 02:10
+   4. 00:30
+   ```
+   仅展示按顺序播放的各个子视频纯时长（`1. M:SS`），不包含任何本地文件名，保护隐私且界面清爽极简。
+3. **播放器章节兼容 (`chapters_text`)**：
+   内部同时维护从 `0:00` 开始的单调递增时间戳映射，可直接为第三方播放器或 YouTube 播放器渲染精确的时间戳跳转。
 
 ---
 
@@ -282,7 +291,10 @@ TubeTape 在视频简介中输出符合 YouTube 播放器点击跳转识别规�
 ```
 {start_ts} - {end_ts} [{short_id}]
 ```
-其中 `short_id = segment_id[:16]`。
+其中 `short_id = segment_id[:16]`。对于全无时间戳的素材分段，使用紧凑无空格格式：
+```
+19700101_000000-19700101_000000_[{short_id}]
+```
 - **背景**：YouTube Data API 会自动清洗并截断过长的视频简介，导致存放在简介末尾的 Marker 丢失。
 - **机制**：标题尾部的短 ID 永不被截断。`fetch_remote_index` 通过 `channels.list` 与 `playlistItems.list` 仅拉取标题文本，即可在本地库缺失时自动恢复映射并跳过已传分片。
 
@@ -367,8 +379,11 @@ while response is None:
 `web.py` 在独立守护线程中运行 `ThreadingHTTPServer`，提供完整的单页应用与流媒体支持。
 
 #### 1. 路由与 API 拓扑
-- `GET /`：全屏时间线画廊 HTML。
+- `GET /`：全屏时间线画廊 HTML（分段优先导航，支持顶部下拉切分段、首尾平滑穿梭与真实绝对路径复制）。
 - `GET /log` 与 `GET /logs`：仪表盘与实时日志控制台 HTML。
+- `GET /getbytime/{segment_id}/{minute}/{second}`：精确时间戳媒体直达查看器（展示匹配素材、宿主机真实物理路径、一键复制与流媒体播放；支持 `?raw=1` 重定向与 `?format=json` 元数据响应）。
+- `GET /api/segments`：获取所有规划分段的摘要列表（分段 ID、起止跨度、素材数、时长、状态、YouTube 视频 ID 与本地路径）。
+- `GET /api/segment/items?id=...`：获取指定分段内的所有媒体明细（含物理绝对路径 `abs_path`、相对路径、类型、拍摄时间、时长与分辨率）。
 - `GET /api/status`：核心运行状态与当前任务 JSON。
 - `GET /api/dashboard`：包含扫描统计、分段列表、构建进度、本地保留视频统计及分段可用动作的综合大屏接口。
 - `GET /api/config`：获取当前运行配置及指纹参数清单。
@@ -443,18 +458,19 @@ stateDiagram-v2
 ## 6. 测试体系与质量保障
 
 TubeTape 配备了完整的自动化测试套件（基于 `pytest`），对外部依赖进行了严格隔离：
-- **测试用例总数**：256 项自动化测试全部通过。
+- **测试用例总数**：254 项自动化测试全部通过。
 - **覆盖范围**：
   - `test_cli.py`：参数解析后置校验、流程编排、退出码、本地分片轮转逻辑、`--no-scan` 与 `--no-upload` 模式。
   - `test_scanner.py`：格式探测、EXIF/ffprobe 解析、文件名正则兜底、快速采样哈希正确性、哈希缓存、`from_record` 恢复。
-  - `test_planner.py`：贪心装箱、稳定分片 ID、同秒边界处理、Pending 队列、长视频容量钳位与切分。
+  - `test_planner.py`：贪心装箱、稳定分片 ID、无时间戳排序与紧凑命名、同秒边界处理、Pending 队列、不可变追加规划。
+  - `test_chapters.py`：视频统计概要与纯时长列表生成、播放器可交互章节映射。
   - `test_rebuild.py`：增量分片插入与两阶段提交。
   - `test_transcoder.py`：画布几何计算、Ken Burns 滤镜、ffmpeg 指令拼装、磁盘空间检测。
   - `test_uploader.py`：分块流式上传、配额错误捕获、播放列表写入。
   - `test_auth.py`：无头授权、Token 自动刷新、过期自愈。
   - `test_reconcile.py`：云端标题短 ID 匹配与索引恢复。
   - `test_watcher.py`：Watchdog 事件派发与去抖。
-  - `test_web.py`：画廊展示、Dashboard 统计、HEIC 动态转码、视频 Range 206 流式传输、OAuth 回调拦截、参数配置 API、分段操作调度 API。
+  - `test_web.py`：画廊展示、分段下拉切换与首尾过渡、Dashboard 统计、HEIC 动态转码、视频 Range 206 流式传输、OAuth 回调拦截、参数配置 API、分段操作调度 API、`/api/segments`、`/api/segment/items`、`/getbytime/...`。
 
 执行全量测试套件：
 ```bash

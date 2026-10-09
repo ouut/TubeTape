@@ -128,14 +128,16 @@ def _existing_record(file_ids, start_epoch, end_epoch, sid=None):
 
 
 class TestPlanLaterRuns:
-    def test_file_inside_range_triggers_rebuild(self):
+    def test_file_inside_range_creates_historical_segment_not_rebuild(self):
+        # Under append-only rules, historical files do not modify existing segments;
+        # they form an independent historical patch segment.
         sid, record = _existing_record(["a"], 100, 150)
         files = [sf("a", 100, 10), sf("new", 120, 10)]
         result = plan(files, {sid: record}, segment_duration=20)
         assert len(result.segments) == 1
-        assert result.segments[0].is_rebuild is True
-        assert result.segments[0].replaces_segment_id == sid
-        assert result.segments[0].file_ids == ["a", "new"]
+        assert result.segments[0].is_rebuild is False
+        assert result.segments[0].file_ids == ["new"]
+        assert sid in result.skipped_segment_ids
 
     def test_unchanged_segment_skipped(self):
         sid, record = _existing_record(["a"], 100, 150)
@@ -153,85 +155,61 @@ class TestPlanLaterRuns:
         assert result.segments[0].file_ids == ["outside"]
         assert result.segments[0].is_rebuild is False
 
-    def test_deleted_file_drops_from_segment(self):
-        # "gone" was in the segment but no longer exists on disk.
-        sid, record = _existing_record(["a", "gone"], 100, 150)
-        files = [sf("a", 100, 10)]
-        result = plan(files, {sid: record}, segment_duration=20)
-        assert len(result.segments) == 1
-        assert result.segments[0].file_ids == ["a"]
-        assert result.segments[0].is_rebuild is True
-
-    def test_params_change_triggers_rebuild(self):
-        sid = segment_id(["a"], ("old",))
-        record = {"file_ids": ["a"], "range": [iso(100), iso(150)]}
-        files = [sf("a", 100, 10)]
-        result = plan(files, {sid: record}, segment_duration=20, params=("new",))
-        assert len(result.segments) == 1
-        assert result.segments[0].is_rebuild is True
-
     def test_dedup_identical_new_segment(self):
         files = [sf("a", 100, 10), sf("b", 101, 10)]
-        # Pre-compute what the packed segment ID would be.
         expected_id = segment_id(["a", "b"], ())
-        # First plan produces it; second plan (same files) must skip it.
         first = plan(files, {}, segment_duration=20, flush=True)
         assert first.segments[0].segment_id == expected_id
         second = plan(files, {expected_id: {"file_ids": ["a", "b"], "range": [iso(100), iso(101)]}}, segment_duration=20, flush=True)
-        # The files fall inside the existing range, and the recomputed ID matches.
         assert second.segments == []
         assert expected_id in second.skipped_segment_ids
 
-    def test_rebuild_capacity_clamping_and_overflow(self):
-        # Existing segment spans 100..500 with 1 file of 15s. Max duration is 20s.
-        sid, record = _existing_record(["a"], 100, 500)
-        # New files inside the range:
-        # b (5s) fits into existing segment (15 + 5 = 20s)
-        # c (10s) does not fit (would exceed 20s), so overflows into free_files
-        # d (10s) overflows into free_files
-        files = [sf("a", 100, 15), sf("b", 120, 5), sf("c", 130, 10), sf("d", 140, 10)]
-        result = plan(files, {sid: record}, segment_duration=20, flush=True)
+    def test_undated_files_sort_first_and_compact_title(self):
+        # Undated files have captured_epoch=None and captured_at_utc=None
+        undated1 = ScannedFile(
+            file_id="u1", abs_path="/x/u1", rel_path="u1", name="u1", type="image",
+            size_bytes=100, captured_at_utc=None, captured_epoch=None, duration_seconds=3.0,
+        )
+        undated2 = ScannedFile(
+            file_id="u2", abs_path="/x/u2", rel_path="u2", name="u2", type="image",
+            size_bytes=100, captured_at_utc=None, captured_epoch=None, duration_seconds=3.0,
+        )
+        dated = sf("d1", 1000, 10.0)
 
-        # The rebuilt segment has a and b (total 20s)
-        rebuilt = [s for s in result.segments if s.replaces_segment_id == sid]
-        assert len(rebuilt) == 1
-        assert rebuilt[0].file_ids == ["a", "b"]
-        assert rebuilt[0].duration_seconds == 20.0
+        # First run: undated sort first
+        result = plan([dated, undated2, undated1], {}, segment_duration=10.0, flush=True)
+        # undated1 + undated2 = 6s (< 10s), dated = 10s -> 2 segments
+        assert len(result.segments) == 2
+        # First segment is undated
+        seg0 = result.segments[0]
+        assert seg0.file_ids == ["u1", "u2"]
+        assert seg0.title.startswith("19700101_000000-19700101_000000_[")
+        assert seg0.start_ts == "1970-01-01T00:00:00Z"
 
-        # c and d are packed into a new segment (10 + 10 = 20s)
-        new_segs = [s for s in result.segments if s.replaces_segment_id != sid]
-        assert len(new_segs) == 1
-        assert new_segs[0].file_ids == ["c", "d"]
-        assert new_segs[0].duration_seconds == 20.0
+        # Second segment is dated
+        seg1 = result.segments[1]
+        assert seg1.file_ids == ["d1"]
 
-    def test_rebuild_candidate_prefers_narrower_range(self):
-        # Segment 1 is wide: 100..1000
-        # Segment 2 is narrow: 200..300
-        sid_wide, rec_wide = _existing_record(["w"], 100, 1000)
-        sid_narrow, rec_narrow = _existing_record(["n"], 200, 300)
+    def test_multiple_historical_files_respect_capacity(self):
+        # Existing segment spans 100..200
+        sid, record = _existing_record(["a"], 100, 200)
+        # Add 4 historical files totaling 40s with segment_duration=20
+        h_files = [
+            sf("h1", 110, 10),
+            sf("h2", 120, 10),
+            sf("h3", 130, 10),
+            sf("h4", 140, 10),
+        ]
+        files = [sf("a", 100, 10)] + h_files
+        result = plan(files, {sid: record}, segment_duration=20)
 
-        # New file at 250 (falls in both). Should prefer narrow segment.
-        files = [sf("w", 100, 5), sf("n", 200, 5), sf("item", 250, 5)]
-        result = plan(files, {sid_wide: rec_wide, sid_narrow: rec_narrow}, segment_duration=20)
+        # Existing segment is untouched
+        assert sid in result.skipped_segment_ids
+        # History files are split into two 20s segments
+        assert len(result.segments) == 2
+        assert result.segments[0].duration_seconds == 20.0
+        assert result.segments[1].duration_seconds == 20.0
+        assert result.segments[0].file_ids == ["h1", "h2"]
+        assert result.segments[1].file_ids == ["h3", "h4"]
 
-        # Narrow segment gets "item"
-        narrow_rebuild = [s for s in result.segments if s.replaces_segment_id == sid_narrow]
-        assert len(narrow_rebuild) == 1
-        assert "item" in narrow_rebuild[0].file_ids
-        assert sid_wide in result.skipped_segment_ids
-
-    def test_rebuild_splits_oversized_legacy_combined(self):
-        # Existing segment record had 5 files totaling 50s due to prior unconstrained bug
-        # When replanned with segment_duration=20, it must split into segments <= 20s
-        legacy_files = ["f1", "f2", "f3", "f4", "f5"]
-        sid, record = _existing_record(legacy_files, 100, 500)
-        files = [sf(f"f{i}", 100 + i * 10, 10) for i in range(1, 6)]
-        result = plan(files, {sid: record}, segment_duration=20, flush=True)
-
-        # Total duration = 50s. Split into groups of 20s (2 files), 20s (2 files), 10s (1 file)
-        assert len(result.segments) == 3
-        for s in result.segments:
-            assert s.duration_seconds <= 20.0
-        # Exactly one replaces sid
-        assert sum(1 for s in result.segments if s.replaces_segment_id == sid) == 1
 

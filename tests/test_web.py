@@ -449,9 +449,47 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
             data = json.loads(res.read().decode("utf-8"))
             assert data["ok"] is True
 
+        # 8. GET /api/segments
+        with urllib.request.urlopen(f"{base_url}/api/segments") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert len(data["segments"]) == 1
+            assert data["segments"][0]["id"] == "seg1"
+
+        # 9. GET /api/segment/items?id=seg1
+        with urllib.request.urlopen(f"{base_url}/api/segment/items?id=seg1") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert len(data["items"]) == 1
+            assert data["items"][0]["id"] == "f1"
+            assert "img.png" in data["items"][0]["abs_path"]
+
+        # 10. GET /getbytime/seg1/0/1 (HTML with real file path)
+        with urllib.request.urlopen(f"{base_url}/getbytime/seg1/0/1") as res:
+            assert res.status == 200
+            html = res.read().decode("utf-8")
+            assert "真实磁盘物理路径" in html
+            assert "img.png" in html
+
+        # 11. GET /getbytime/seg1/0/1?format=json
+        with urllib.request.urlopen(f"{base_url}/getbytime/seg1/0/1?format=json") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert data["file_id"] == "f1"
+            assert data["path"] == "img.png"
+            assert "img.png" in data["abs_path"]
+
+        # 12. GET /getbytime/seg1/10/0 (Out of bounds)
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(f"{base_url}/getbytime/seg1/10/0")
+        assert exc_info.value.code == 404
+
     finally:
         web.set_app_coordinator(None)
         server.stop()
+
 
 
 

@@ -42,9 +42,10 @@ def segment_id(file_ids: list[str], params: tuple) -> str:
 
 
 def _sort_key(f: ScannedFile):
-    # Missing capture time sorts last; tie-break on file_id for determinism.
-    epoch = f.captured_epoch if f.captured_epoch is not None else float("inf")
-    return (epoch, f.file_id)
+    # Missing capture time sorts first, tie-break on file_id for determinism.
+    has_epoch = 1 if f.captured_epoch is not None else 0
+    epoch = f.captured_epoch if f.captured_epoch is not None else 0.0
+    return (has_epoch, epoch, f.file_id)
 
 
 @dataclass
@@ -78,20 +79,28 @@ def _make_segment(
         raise ValueError("cannot build a segment from no files")
     ordered = sorted(files, key=_sort_key)
     epochs = [f.captured_epoch for f in ordered if f.captured_epoch is not None]
-    if not epochs:
-        raise ValueError("segment files have no capture time")
-
-    start = min(epochs)
-    end = max(epochs)
     sid = segment_id([f.file_id for f in ordered], params)
     short_id = sid[:16]
+
+    if not epochs:
+        # All files in this segment are undated: 19700101_000000-19700101_000000_[{short_id}]
+        start_ts = "1970-01-01T00:00:00Z"
+        end_ts = "1970-01-01T00:00:00Z"
+        title = f"19700101_000000-19700101_000000_[{short_id}]"
+    else:
+        start = min(epochs)
+        end = max(epochs)
+        start_ts = format_iso_utc(datetime.fromtimestamp(start, tz=timezone.utc))
+        end_ts = format_iso_utc(datetime.fromtimestamp(end, tz=timezone.utc))
+        title = f"{display_ts(start)} - {display_ts(end)} [{short_id}]"
+
     return Segment(
         file_ids=[f.file_id for f in ordered],
-        start_ts=format_iso_utc(datetime.fromtimestamp(start, tz=timezone.utc)),
-        end_ts=format_iso_utc(datetime.fromtimestamp(end, tz=timezone.utc)),
+        start_ts=start_ts,
+        end_ts=end_ts,
         duration_seconds=sum(f.duration_seconds or 0.0 for f in ordered),
         segment_id=sid,
-        title=f"{display_ts(start)} - {display_ts(end)} [{short_id}]",
+        title=title,
         replaces_segment_id=replaces_segment_id,
     )
 
@@ -148,165 +157,122 @@ def plan(
 ) -> Plan:
     """Compute the segment plan.
 
-    ``existing_segments`` maps ``segment_id -> record`` (with ``file_ids`` and
-    ``range``). Files inside an existing range are merged into that segment;
-    files outside all ranges are packed into new segments.
+    Existing segments are strictly IMMUTABLE: files already belonging to an
+    existing segment stay in that segment, and existing segments are never modified,
+    rebuilt, or split.
+
+    New files:
+    - Files with captured_epoch >= max_sealed_epoch (or all files if no sealed segments exist)
+      are 'tail' files: greedily packed up to segment_duration, with the trailing partial group
+      held as pending (unless flush=True).
+    - Other files (historical files with captured_epoch < max_sealed_epoch, or undated files)
+      are packed into new independent segments and sealed immediately.
     """
-    files_by_id = {f.file_id: f for f in files}
+    result = Plan()
     known_ids = set(existing_segments.keys())
+    existing_file_ids: set[str] = set()
+    max_sealed_epoch: float | None = None
+
     _logger.info(
         "planning %d file(s) against %d existing segment(s)",
         len(files),
         len(existing_segments),
     )
 
-    # Parse existing ranges into epoch bounds, sorted and stable.
-    ranges: list[tuple[float, float, str, dict]] = []
     for sid, record in existing_segments.items():
-        rng = record.get("range")
-        if not isinstance(rng, list) or len(rng) != 2:
-            continue
-        start_dt = parse_iso_utc(rng[0])
-        end_dt = parse_iso_utc(rng[1])
-        if start_dt is None or end_dt is None:
-            continue
-        ranges.append((start_dt.timestamp(), end_dt.timestamp(), sid, record))
-    ranges.sort(key=lambda r: (r[0], r[1], r[2]))
-    _logger.debug("parsed %d existing segment time range(s)", len(ranges))
-
-    # Build a reverse lookup of files already belonging to existing segments.
-    # Files already in a segment remain with that segment and cannot be stolen
-    # by an adjacent segment with the same boundary timestamp.
-    existing_owner: dict[str, str] = {}
-    for sid, record in existing_segments.items():
+        result.skipped_segment_ids.append(sid)
         for fid in record.get("file_ids", []):
-            existing_owner[fid] = sid
+            existing_file_ids.add(fid)
 
-    # Calculate current duration and remaining capacity for each existing segment
-    remaining_capacity: dict[str, float] = {}
-    for _, _, sid, record in ranges:
-        existing_dur = sum(
-            files_by_id[fid].duration_seconds or 0.0
-            for fid in record.get("file_ids", [])
-            if fid in files_by_id
-        )
-        remaining_capacity[sid] = max(0.0, segment_duration - existing_dur)
+        rng = record.get("range")
+        if isinstance(rng, list) and len(rng) == 2:
+            end_dt = parse_iso_utc(rng[1])
+            if end_dt is not None:
+                ts = end_dt.timestamp()
+                # Ignore epoch <= 0 (e.g. 1970 undated segments) when finding max_sealed_epoch
+                if ts > 0:
+                    if max_sealed_epoch is None or ts > max_sealed_epoch:
+                        max_sealed_epoch = ts
 
-    # Assign each file to its existing segment, or to a matching range for new files.
-    assigned: dict[str, list[str]] = {sid: [] for _, _, sid, _ in ranges}
-    free_files: list[ScannedFile] = []
-    for item in files:
-        if item.file_id in existing_owner:
-            owner_sid = existing_owner[item.file_id]
-            if owner_sid in assigned:
-                assigned[owner_sid].append(item.file_id)
-            continue
+    unassigned = [f for f in files if f.file_id not in existing_file_ids]
+    if not unassigned:
+        return result
 
-        if item.captured_epoch is None:
-            free_files.append(item)
-            continue
-
-        # For new files, find candidate ranges that enclose item.captured_epoch.
-        # Sort candidates by span (end - start) so tighter, more specific intervals take precedence.
-        item_dur = item.duration_seconds or 0.0
-        candidates = []
-        for start, end, sid, _ in ranges:
-            if start <= item.captured_epoch <= end:
-                candidates.append((end - start, sid))
-        candidates.sort(key=lambda x: x[0])
-
-        placed = False
-        for _, sid in candidates:
-            if item_dur <= remaining_capacity[sid]:
-                assigned[sid].append(item.file_id)
-                remaining_capacity[sid] -= item_dur
-                placed = True
-                break
-
-        if not placed:
-            free_files.append(item)
-
-    result = Plan()
-
-    # Rebuild existing segments whose content changed.
-    for _start, _end, sid, record in ranges:
-        combined: list[ScannedFile] = []
-        seen: set[str] = set()
-        for file_id in list(record.get("file_ids", [])) + assigned[sid]:
-            if file_id in seen or file_id not in files_by_id:
-                continue
-            seen.add(file_id)
-            combined.append(files_by_id[file_id])
-
-        if not combined:
-            # Every file in this segment was deleted; nothing to rebuild now.
-            _logger.debug("segment %s has no remaining files; skipping rebuild", sid)
-            continue
-
-        combined_dur = sum(f.duration_seconds or 0.0 for f in combined)
-        # Ensure that no combined segment exceeds segment_duration unless a single file is oversized.
-        if len(combined) > 1 and combined_dur > segment_duration:
-            combined_groups = greedy_pack(combined, segment_duration)
-        else:
-            combined_groups = [combined]
-
-        # First group replaces the existing segment (if changed)
-        first_group = combined_groups[0]
-        segment = _make_segment(first_group, params, replaces_segment_id=sid)
-        if segment.segment_id == sid:
-            result.skipped_segment_ids.append(sid)
-            _logger.debug("segment %s unchanged; skipping", sid)
-        elif segment.segment_id in known_ids:
-            result.skipped_segment_ids.append(sid)
-            _logger.debug("segment %s already known as %s; skipping", sid, segment.segment_id)
-        else:
-            known_ids.add(segment.segment_id)
-            result.segments.append(segment)
+    if max_sealed_epoch is None:
+        # First run / no existing sealed segments with timestamps: pack everything
+        ordered = sorted(unassigned, key=_sort_key)
+        groups = greedy_pack(ordered, segment_duration)
+        if groups and not flush and _is_partial(groups[-1], segment_duration):
+            result.pending_files = groups.pop()
             _logger.info(
-                "rebuild planned: %s (%s) replaces %s",
-                segment.segment_id[:12],
-                segment.title,
-                sid[:12],
+                "holding %d file(s) as pending (last group shorter than %.1fs and not flushing)",
+                len(result.pending_files),
+                segment_duration,
             )
 
-        # Any extra groups (if repacked) become new segments
-        for extra_group in combined_groups[1:]:
-            extra_seg = _make_segment(extra_group, params)
-            if extra_seg.segment_id not in known_ids:
-                known_ids.add(extra_seg.segment_id)
-                result.segments.append(extra_seg)
+        for group in groups:
+            seg = _make_segment(group, params)
+            if seg.segment_id not in known_ids:
+                known_ids.add(seg.segment_id)
+                result.segments.append(seg)
                 _logger.info(
-                    "rebuild overflow segment planned: %s (%s) with %d file(s), %.1fs",
-                    extra_seg.segment_id[:12],
-                    extra_seg.title,
-                    len(extra_seg.file_ids),
-                    extra_seg.duration_seconds,
+                    "new segment planned: %s (%s) with %d file(s), %.1fs",
+                    seg.segment_id[:12],
+                    seg.title,
+                    len(seg.file_ids),
+                    seg.duration_seconds,
+                )
+        return result
+
+    # Later runs: split unassigned into tail and history files
+    tail_files: list[ScannedFile] = []
+    history_files: list[ScannedFile] = []
+
+    for item in unassigned:
+        if item.captured_epoch is not None and item.captured_epoch >= max_sealed_epoch:
+            tail_files.append(item)
+        else:
+            history_files.append(item)
+
+    # 1. History files (old or undated photos added after segments already exist)
+    if history_files:
+        history_ordered = sorted(history_files, key=_sort_key)
+        history_groups = greedy_pack(history_ordered, segment_duration)
+        for group in history_groups:
+            seg = _make_segment(group, params)
+            if seg.segment_id not in known_ids:
+                known_ids.add(seg.segment_id)
+                result.segments.append(seg)
+                _logger.info(
+                    "new historical segment planned: %s (%s) with %d file(s), %.1fs",
+                    seg.segment_id[:12],
+                    seg.title,
+                    len(seg.file_ids),
+                    seg.duration_seconds,
                 )
 
-    # Pack free files into new segments.
-    groups = greedy_pack(free_files, segment_duration)
-    _logger.debug("packed %d free file(s) into %d new group(s)", len(free_files), len(groups))
-    if groups and not flush and _is_partial(groups[-1], segment_duration):
-        result.pending_files = groups.pop()
-        _logger.info(
-            "holding %d file(s) as pending (last group shorter than %.1fs and not flushing)",
-            len(result.pending_files),
-            segment_duration,
-        )
-
-    for group in groups:
-        segment = _make_segment(group, params)
-        if segment.segment_id in known_ids:
-            _logger.debug("new segment %s already known; skipping", segment.segment_id)
-            continue
-        known_ids.add(segment.segment_id)
-        result.segments.append(segment)
-        _logger.info(
-            "new segment planned: %s (%s) with %d file(s), %.1fs",
-            segment.segment_id[:12],
-            segment.title,
-            len(segment.file_ids),
-            segment.duration_seconds,
-        )
+    # 2. Tail files (newest photos >= max_sealed_epoch)
+    if tail_files:
+        tail_ordered = sorted(tail_files, key=_sort_key)
+        tail_groups = greedy_pack(tail_ordered, segment_duration)
+        if tail_groups and not flush and _is_partial(tail_groups[-1], segment_duration):
+            result.pending_files = tail_groups.pop()
+            _logger.info(
+                "holding %d tail file(s) as pending (last group shorter than %.1fs and not flushing)",
+                len(result.pending_files),
+                segment_duration,
+            )
+        for group in tail_groups:
+            seg = _make_segment(group, params)
+            if seg.segment_id not in known_ids:
+                known_ids.add(seg.segment_id)
+                result.segments.append(seg)
+                _logger.info(
+                    "new tail segment planned: %s (%s) with %d file(s), %.1fs",
+                    seg.segment_id[:12],
+                    seg.title,
+                    len(seg.file_ids),
+                    seg.duration_seconds,
+                )
 
     return result
