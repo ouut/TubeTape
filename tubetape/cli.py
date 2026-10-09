@@ -328,7 +328,11 @@ def _file_persister(db: Database):
     return persist
 
 
-def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> int:
+def run_pipeline(
+    args: argparse.Namespace,
+    reporter: Reporter | None = None,
+    force_scan: bool = False,
+) -> int:
     reporter = reporter or Reporter()
     db = Database.load(args.db)
 
@@ -380,7 +384,7 @@ def run_pipeline(args: argparse.Namespace, reporter: Reporter | None = None) -> 
         if uploader is not None:
             coordinator.uploader = uploader
 
-    if getattr(args, "no_scan", False):
+    if getattr(args, "no_scan", False) and not force_scan:
         _log.info("skipping initial full scan (--no-scan); loading files from database")
         reporter.status("skipping scan (--no-scan); loading files from database ...")
         scanned_files = [
@@ -765,7 +769,7 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
                 quota_retry_at = 0.0
                 reporter.status("quota backoff elapsed; retrying ...")
                 _log.info("quota backoff elapsed; re-running pipeline")
-                status = run_pipeline(args, reporter)
+                status = run_pipeline(args, reporter, force_scan=True)
                 mtime_scanner.scan()
                 last_mtime_scan = time.monotonic()
                 has_changes = False
@@ -777,7 +781,7 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
             if has_changes and now - last_change >= args.quiet_period:
                 reporter.status("quiet period elapsed; re-processing ...")
                 _log.info("quiet period (%.1fs) elapsed; re-running pipeline", args.quiet_period)
-                status = run_pipeline(args, reporter)
+                status = run_pipeline(args, reporter, force_scan=True)
                 mtime_scanner.scan()
                 last_mtime_scan = time.monotonic()
                 has_changes = False

@@ -1956,11 +1956,14 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
                 仅本地构建，不上传到 YouTube (--no-upload)
               </label>
             </div>
-            <div class="form-item" style="justify-content: center;">
-              <label class="form-label">
+            <div class="form-item" style="justify-content: center; flex-direction: column; align-items: flex-start;">
+              <label class="form-label" style="cursor: pointer;">
                 <input type="checkbox" id="cfg-no_scan" style="margin-right: 6px;" />
                 启动时跳过扫描，直接读取数据库 (--no-scan)
               </label>
+              <div style="font-size: 0.73rem; color: #a1a1aa; margin-top: 3px; line-height: 1.35;">
+                开启后，服务启动跳过耗时的磁盘全量遍历，秒级载入数据库；当有新文件写入或在仪表盘点击“开始全量扫描”时会自动触发扫描。
+              </div>
             </div>
             <div class="form-item">
               <label class="form-label">YouTube 隐私设置:</label>
@@ -1982,10 +1985,16 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="form-item">
               <label class="form-label">Watch 静默期 (如 10m):</label>
               <input class="form-control" id="cfg-quiet_period" type="text" />
+              <div style="font-size: 0.72rem; color: #a1a1aa; margin-top: 3px; line-height: 1.35;">
+                写入防抖等待期。检测到新文件后，需持续保持 N 分钟无新写入才开始处理，防止文件写入未完成导致转码损坏。
+              </div>
             </div>
             <div class="form-item">
               <label class="form-label">Watch 轮询周期 (如 30s):</label>
               <input class="form-control" id="cfg-poll_interval" type="text" />
+              <div style="font-size: 0.72rem; color: #a1a1aa; margin-top: 3px; line-height: 1.35;">
+                后台监控心跳间隔。检查目录时间戳兜底、配额退避及事件锁的轮询周期。
+              </div>
             </div>
             <div class="form-item" style="justify-content: center;">
               <label class="form-label">

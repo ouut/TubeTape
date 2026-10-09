@@ -294,7 +294,7 @@ class AppCoordinator:
             try:
                 _logger.info("manual full scan triggered from dashboard")
                 web.set_web_status("scanning", "正在全量扫描媒体文件...")
-                cli.run_pipeline(self.args)
+                cli.run_pipeline(self.args, force_scan=True)
             except Exception as exc:
                 _logger.error("scan pipeline failed: %s", exc, exc_info=True)
                 web.set_web_status("error", f"扫描任务出错: {exc}")

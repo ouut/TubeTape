@@ -464,6 +464,33 @@ class TestKeepSegments:
         assert rc == 0
         assert scanned_called == []
 
+    def test_run_pipeline_force_scan_overrides_no_scan(self, tmp_path, monkeypatch):
+        from tubetape import cli
+        from tubetape.db import Database
+        from tubetape.scanner import ScanResult
+
+        db_path = tmp_path / "db.json"
+        db = Database(path=str(db_path))
+        db.save()
+
+        scanned_called = []
+        def fake_scan(*args, **kwargs):
+            scanned_called.append(1)
+            return ScanResult(files=[], processed_file_ids=[])
+
+        monkeypatch.setattr(cli, "scan", fake_scan)
+
+        args = cli.parse_args([
+            "--no-scan",
+            "--dry-run",
+            "--no-watch",
+            "--input", str(tmp_path),
+            "--db", str(db_path),
+        ])
+        rc = cli.run_pipeline(args, force_scan=True)
+        assert rc == 0
+        assert len(scanned_called) == 1
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
