@@ -491,6 +491,82 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
         server.stop()
 
 
+def test_log_dashboard_html_and_js_syntax():
+    import re
+    import shutil
+    import subprocess
+
+    # 1. HTML contains dashboard and log controls
+    assert "TubeTape" in web._LOG_DASHBOARD_HTML
+    assert "log-box" in web._LOG_DASHBOARD_HTML
+    assert "pollDashboard" in web._LOG_DASHBOARD_HTML
+    assert "pollLogs" in web._LOG_DASHBOARD_HTML
+
+    # 2. Extract JS from script tag and check syntax
+    m = re.search(r"<script>(.*?)</script>", web._LOG_DASHBOARD_HTML, re.DOTALL)
+    assert m is not None, "Script tag missing in _LOG_DASHBOARD_HTML"
+    js_code = m.group(1)
+
+    node_bin = shutil.which("node")
+    if node_bin:
+        res = subprocess.run([node_bin, "--check"], input=js_code, capture_output=True, text=True)
+        assert res.returncode == 0, f"JS SyntaxError in _LOG_DASHBOARD_HTML: {res.stderr}"
+
+
+def test_dashboard_scanning_status_and_logs(tmp_path):
+    log_file = tmp_path / "app.log"
+    log_file.write_text("2026-10-09 INFO scanning directory: /data\n", encoding="utf-8")
+
+    server = web.WebServer(host="127.0.0.1", port=0, log_file=str(log_file))
+    server.start()
+    time.sleep(0.1)
+
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        # Simulate active scanning state
+        web.set_web_status("scanning", "正在扫描 /data ...")
+        web.update_web_scanner(is_scanning=True, count=128, current="family/vacation.jpg")
+
+        # 1. GET /log HTML
+        with urllib.request.urlopen(f"{base_url}/log") as res:
+            assert res.status == 200
+            html = res.read().decode("utf-8")
+            assert "实时运行日志" in html
+
+        # 2. GET /api/dashboard during scan
+        with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
+            assert res.status == 200
+            d = json.loads(res.read().decode("utf-8"))
+            assert d["status"] == "scanning"
+            assert d["task"] == "正在扫描 /data ..."
+            assert d["scanner"]["is_scanning"] is True
+            assert d["scanner"]["count"] == 128
+            assert d["scanner"]["current"] == "family/vacation.jpg"
+
+        # 3. GET /api/logs incremental
+        with urllib.request.urlopen(f"{base_url}/api/logs?offset=0") as res:
+            assert res.status == 200
+            l1 = json.loads(res.read().decode("utf-8"))
+            assert "scanning directory: /data" in l1["content"]
+            offset = l1["offset"]
+
+        # Append new log line
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write("2026-10-09 INFO scan [1/1] family/vacation.jpg (image, 2.5 MB)\n")
+
+        with urllib.request.urlopen(f"{base_url}/api/logs?offset={offset}") as res:
+            assert res.status == 200
+            l2 = json.loads(res.read().decode("utf-8"))
+            assert "scan [1/1] family/vacation.jpg" in l2["content"]
+
+    finally:
+        web.set_web_status("idle", "")
+        web.update_web_scanner(is_scanning=False, count=0)
+        server.stop()
+
+
 
 
 

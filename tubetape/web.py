@@ -2103,7 +2103,25 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
         const res = await fetch('/api/dashboard');
         if (res.ok) {
           const d = await res.json();
-          statusText.textContent = d.task || d.status || '就绪';
+          let displayStatus = d.task || d.status || '就绪';
+          if (d.status === 'scanning' && !d.task) displayStatus = '正在扫描...';
+          else if (d.status === 'idle' && !d.task) displayStatus = '空闲就绪';
+          else if (d.status === 'watching') displayStatus = '常驻监听中';
+          statusText.textContent = displayStatus;
+
+          const dot = document.querySelector('.status-dot');
+          if (dot) {
+            if (d.status === 'scanning' || d.status === 'transcoding' || d.status === 'building') {
+              dot.style.background = '#f59e0b';
+              dot.style.boxShadow = '0 0 8px #f59e0b';
+            } else if (d.status === 'error' || d.status === 'failed') {
+              dot.style.background = '#ef4444';
+              dot.style.boxShadow = '0 0 8px #ef4444';
+            } else {
+              dot.style.background = '#10b981';
+              dot.style.boxShadow = '0 0 8px #10b981';
+            }
+          }
 
           // OAuth banner
           const authBanner = document.getElementById('auth-banner');
@@ -2118,27 +2136,27 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
           }
 
           // Metrics
-          document.getElementById('metric-files').textContent = d.stats.total_files.toLocaleString();
+          document.getElementById('metric-files').textContent = (d.stats && d.stats.total_files ? d.stats.total_files : 0).toLocaleString();
           if (d.scanner && d.scanner.is_scanning) {
             document.getElementById('metric-scan-detail').innerHTML = `🔍 扫描中: ${d.scanner.count} 个 (${escapeHtml(d.scanner.current || '')})`;
           } else {
             document.getElementById('metric-scan-detail').textContent = '✅ 扫描就绪';
           }
 
-          document.getElementById('metric-segments').textContent = d.stats.total_segments;
+          document.getElementById('metric-segments').textContent = d.stats ? d.stats.total_segments : 0;
           document.getElementById('metric-segments-sub').textContent =
-            `已上传: ${d.stats.uploaded_segments} | 待处理: ${d.stats.total_segments - d.stats.uploaded_segments}`;
+            d.stats ? `已上传: ${d.stats.uploaded_segments} | 待处理: ${d.stats.total_segments - d.stats.uploaded_segments}` : '-';
 
-          document.getElementById('metric-disk-segments').textContent = d.stats.disk_segments_count;
-          document.getElementById('metric-keep-limit').textContent = d.stats.keep_segments;
+          document.getElementById('metric-disk-segments').textContent = d.stats ? d.stats.disk_segments_count : 0;
+          document.getElementById('metric-keep-limit').textContent = d.stats ? d.stats.keep_segments : 0;
 
-          document.getElementById('metric-task').textContent = d.status;
+          document.getElementById('metric-task').textContent = d.status || '空闲';
           document.getElementById('metric-task-sub').textContent = d.task || '-';
 
           // Segments Table
           const tbody = document.getElementById('segments-table-body');
-          document.getElementById('segments-count-text').textContent = `共 ${d.segments.length} 个分段`;
-          if (d.segments.length === 0) {
+          document.getElementById('segments-count-text').textContent = `共 ${d.segments ? d.segments.length : 0} 个分段`;
+          if (!d.segments || d.segments.length === 0) {
             tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #888;">暂无分段信息</td></tr>';
           } else {
             tbody.innerHTML = d.segments.map(seg => {
@@ -2214,9 +2232,13 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
               }
             }
             renderLogBox();
+          } else if (logLines.length === 0) {
+            logBox.textContent = '暂无新日志记录 (等待写入...)\\n';
           }
         }
       } catch (e) {}
+      setTimeout(pollLogs, 1500);
+    }
 
     let initialConfig = null;
     let fingerprintParams = [];
@@ -3224,117 +3246,121 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self._send_html(200, html)
 
     def _api_dashboard(self) -> None:
-        db = get_db()
-        files_count = len(db.files) if db else _server_state["scanner"]["count"]
+        try:
+            db = get_db()
+            files_count = len(db.files) if db else _server_state["scanner"]["count"]
 
-        # Count disk segments in uploaded_segments/
-        disk_count = 0
-        db_path = _server_state.get("db_path")
-        if db_path:
-            segments_dir = os.path.join(os.path.dirname(db_path), "uploaded_segments")
-            if os.path.isdir(segments_dir):
-                for entry in os.scandir(segments_dir):
-                    if entry.is_file() and entry.name.lower().endswith(".mp4") and not entry.name.startswith("."):
-                        disk_count += 1
-
-        # Combine db segments and planned segments
-        segments_dict = {}
-        if db:
-            for sid, srec in db.segments.items():
-                title = srec.get("title")
-                rng = srec.get("range", ["", ""])
-                if not title:
-                    title = f"{rng[0]} - {rng[1]} [{sid[:16]}]" if rng[0] else sid[:16]
-                dur = float(srec.get("duration_seconds", 0.0))
-                segments_dict[sid] = {
-                    "segment_id": sid,
-                    "title": title,
-                    "start_ts": rng[0],
-                    "end_ts": rng[1],
-                    "duration_seconds": dur,
-                    "duration_text": _format_seconds(dur),
-                    "file_count": len(srec.get("file_ids", [])),
-                    "status": "uploaded" if srec.get("youtube_video_id") else srec.get("status", "sealed"),
-                    "youtube_video_id": srec.get("youtube_video_id"),
-                    "progress": None,
-                }
-
-        # Planned segments
-        for seg in _server_state.get("planned_segments", []):
-            sid = getattr(seg, "segment_id", "")
-            title = getattr(seg, "title", "")
-            dur = float(getattr(seg, "duration_seconds", 0.0))
-            fcount = len(getattr(seg, "file_ids", []))
-            start_ts = getattr(seg, "start_ts", "")
-            end_ts = getattr(seg, "end_ts", "")
-            if sid not in segments_dict:
-                segments_dict[sid] = {
-                    "segment_id": sid,
-                    "title": title or f"{start_ts} - {end_ts}",
-                    "start_ts": start_ts,
-                    "end_ts": end_ts,
-                    "duration_seconds": dur,
-                    "duration_text": _format_seconds(dur),
-                    "file_count": fcount,
-                    "status": "pending",
-                    "youtube_video_id": None,
-                    "progress": None,
-                }
-
-        # Current transcode
-        cur_tc = _server_state.get("transcode", {})
-        active_sid = cur_tc.get("segment_id")
-        if active_sid and active_sid in segments_dict:
-            segments_dict[active_sid]["status"] = "building"
-            segments_dict[active_sid]["progress"] = {
-                "done": cur_tc.get("done", 0),
-                "total": cur_tc.get("total", 0),
-                "current_file": cur_tc.get("current_file", ""),
-            }
-
-        # Check has_local_file for each segment
-        coord = get_app_coordinator()
-        for sid, seg_info in segments_dict.items():
-            has_local = False
-            if coord:
-                has_local = coord.find_local_segment_file(sid, seg_info.get("title")) is not None
-            elif db_path:
+            # Count disk segments in uploaded_segments/
+            disk_count = 0
+            db_path = _server_state.get("db_path")
+            if db_path:
                 segments_dir = os.path.join(os.path.dirname(db_path), "uploaded_segments")
                 if os.path.isdir(segments_dir):
-                    t = seg_info.get("title")
-                    cands = [os.path.join(segments_dir, f"{sid}.mp4")]
-                    if t:
-                        cands.append(os.path.join(segments_dir, f"{t}.mp4"))
-                    has_local = any(os.path.isfile(c) for c in cands)
-            seg_info["has_local_file"] = has_local
+                    for entry in os.scandir(segments_dir):
+                        if entry.is_file() and entry.name.lower().endswith(".mp4") and not entry.name.startswith("."):
+                            disk_count += 1
 
-        # Sort segments chronologically
-        segments_list = list(segments_dict.values())
-        segments_list.sort(key=lambda x: (x["start_ts"] or "", x["title"]))
+            # Combine db segments and planned segments
+            segments_dict = {}
+            if db:
+                for sid, srec in list(db.segments.items()):
+                    title = srec.get("title")
+                    rng = srec.get("range", ["", ""])
+                    if not title:
+                        title = f"{rng[0]} - {rng[1]} [{sid[:16]}]" if rng[0] else sid[:16]
+                    dur = float(srec.get("duration_seconds", 0.0))
+                    segments_dict[sid] = {
+                        "segment_id": sid,
+                        "title": title,
+                        "start_ts": rng[0],
+                        "end_ts": rng[1],
+                        "duration_seconds": dur,
+                        "duration_text": _format_seconds(dur),
+                        "file_count": len(srec.get("file_ids", [])),
+                        "status": "uploaded" if srec.get("youtube_video_id") else srec.get("status", "sealed"),
+                        "youtube_video_id": srec.get("youtube_video_id"),
+                        "progress": None,
+                    }
 
-        uploaded_count = sum(1 for s in segments_list if s.get("youtube_video_id"))
-        session = _server_state.get("oauth_session")
-        auth_required = session is not None and not _server_state["auth_event"].is_set()
+            # Planned segments
+            for seg in _server_state.get("planned_segments", []):
+                sid = getattr(seg, "segment_id", "")
+                title = getattr(seg, "title", "")
+                dur = float(getattr(seg, "duration_seconds", 0.0))
+                fcount = len(getattr(seg, "file_ids", []))
+                start_ts = getattr(seg, "start_ts", "")
+                end_ts = getattr(seg, "end_ts", "")
+                if sid not in segments_dict:
+                    segments_dict[sid] = {
+                        "segment_id": sid,
+                        "title": title or f"{start_ts} - {end_ts}",
+                        "start_ts": start_ts,
+                        "end_ts": end_ts,
+                        "duration_seconds": dur,
+                        "duration_text": _format_seconds(dur),
+                        "file_count": fcount,
+                        "status": "pending",
+                        "youtube_video_id": None,
+                        "progress": None,
+                    }
 
-        payload = {
-            "status": _server_state["status"],
-            "task": _server_state["task"],
-            "auth_required": auth_required,
-            "auth_url": session.auth_url if auth_required else None,
-            "scanner": _server_state["scanner"],
-            "transcode": cur_tc,
-            "stats": {
-                "total_files": files_count,
-                "total_segments": len(segments_list),
-                "uploaded_segments": uploaded_count,
-                "disk_segments_count": disk_count,
-                "keep_segments": _server_state.get("keep_segments", 0),
-                "no_upload": bool(getattr(coord.args, "no_upload", False)) if coord else False,
-            },
-            "segments": segments_list,
-        }
+            # Current transcode
+            cur_tc = _server_state.get("transcode", {})
+            active_sid = cur_tc.get("segment_id")
+            if active_sid and active_sid in segments_dict:
+                segments_dict[active_sid]["status"] = "building"
+                segments_dict[active_sid]["progress"] = {
+                    "done": cur_tc.get("done", 0),
+                    "total": cur_tc.get("total", 0),
+                    "current_file": cur_tc.get("current_file", ""),
+                }
 
-        self._send_json(200, payload)
+            # Check has_local_file for each segment
+            coord = get_app_coordinator()
+            for sid, seg_info in segments_dict.items():
+                has_local = False
+                if coord:
+                    has_local = coord.find_local_segment_file(sid, seg_info.get("title")) is not None
+                elif db_path:
+                    segments_dir = os.path.join(os.path.dirname(db_path), "uploaded_segments")
+                    if os.path.isdir(segments_dir):
+                        t = seg_info.get("title")
+                        cands = [os.path.join(segments_dir, f"{sid}.mp4")]
+                        if t:
+                            cands.append(os.path.join(segments_dir, f"{t}.mp4"))
+                        has_local = any(os.path.isfile(c) for c in cands)
+                seg_info["has_local_file"] = has_local
+
+            # Sort segments chronologically
+            segments_list = list(segments_dict.values())
+            segments_list.sort(key=lambda x: (x.get("start_ts") or "", x.get("title") or ""))
+
+            uploaded_count = sum(1 for s in segments_list if s.get("youtube_video_id"))
+            session = _server_state.get("oauth_session")
+            auth_required = session is not None and not _server_state["auth_event"].is_set()
+
+            payload = {
+                "status": _server_state["status"],
+                "task": _server_state["task"],
+                "auth_required": auth_required,
+                "auth_url": session.auth_url if auth_required else None,
+                "scanner": _server_state["scanner"],
+                "transcode": cur_tc,
+                "stats": {
+                    "total_files": files_count,
+                    "total_segments": len(segments_list),
+                    "uploaded_segments": uploaded_count,
+                    "disk_segments_count": disk_count,
+                    "keep_segments": _server_state.get("keep_segments", 0),
+                    "no_upload": bool(getattr(coord.args, "no_upload", False)) if coord else False,
+                },
+                "segments": segments_list,
+            }
+
+            self._send_json(200, payload)
+        except Exception as exc:
+            _logger.exception("dashboard api error: %s", exc)
+            self._send_json(500, {"error": str(exc)})
 
     def _api_media_summary(self) -> None:
         files = _get_sorted_media_files()
