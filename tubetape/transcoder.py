@@ -8,6 +8,7 @@ with stream copy to avoid a second quality loss.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -186,7 +187,7 @@ def transcode_segment(
     work_dir: str | None = None,
     progress: Callable[[int, int, ScannedFile], None] | None = None,
 ) -> tuple[str, list[list[str]]]:
-    """Transcode a segment's files into a single MP4.
+    """Transcode a segment's files into a single MP4 with resumable staging.
 
     Returns ``(out_path, chapters)`` where chapters are ``[[start, title], ...]``.
 
@@ -212,40 +213,82 @@ def transcode_segment(
     )
     _logger.info("built %d chapter(s) from %d file(s)", len(chapters), len(files))
 
-    with tempfile.TemporaryDirectory(dir=work_dir) as tmp:
-        clips: list[str] = []
-        for index, item in enumerate(files):
-            if progress is not None:
-                progress(index + 1, len(files), item)
-            clip_path = os.path.join(tmp, f"clip_{index:04d}.mp4")
-            if item.type == FILE_TYPE_IMAGE:
-                img_src = item.abs_path
-                if os.path.splitext(item.abs_path)[1].lower() in HEIF_EXTENSIONS:
-                    img_src = os.path.join(tmp, f"src_{index:04d}.png")
+    out_abs = os.path.abspath(out_path)
+    out_dir = os.path.dirname(out_abs)
+    out_base = os.path.splitext(os.path.basename(out_abs))[0]
+    os.makedirs(out_dir, exist_ok=True)
+
+    staging_parent = os.path.abspath(work_dir) if work_dir else out_dir
+    staging_dir = os.path.join(staging_parent, f".staging_{out_base}")
+    os.makedirs(staging_dir, exist_ok=True)
+
+    clips: list[str] = []
+    for index, item in enumerate(files):
+        if progress is not None:
+            progress(index + 1, len(files), item)
+
+        clip_name = f"clip_{index:04d}_{item.file_id[:12]}.mp4"
+        clip_path = os.path.join(staging_dir, clip_name)
+        tmp_clip_path = os.path.join(staging_dir, f"clip_{index:04d}_{item.file_id[:12]}.tmp.mp4")
+
+        # Resume check: if clip already exists and has valid size (> 1024 bytes), reuse it!
+        if os.path.isfile(clip_path) and os.path.getsize(clip_path) > 1024:
+            _logger.info(
+                "resuming clip %d/%d: %s (%s) already transcoded, reusing",
+                index + 1,
+                len(files),
+                item.rel_path,
+                clip_name,
+            )
+            clips.append(clip_path)
+            continue
+
+        if os.path.isfile(tmp_clip_path):
+            try:
+                os.remove(tmp_clip_path)
+            except OSError:
+                pass
+
+        if item.type == FILE_TYPE_IMAGE:
+            img_src = item.abs_path
+            if os.path.splitext(item.abs_path)[1].lower() in HEIF_EXTENSIONS:
+                img_src = os.path.join(staging_dir, f"src_{index:04d}_{item.file_id[:12]}.png")
+                if not os.path.isfile(img_src) or os.path.getsize(img_src) == 0:
                     _logger.info(
                         "converting HEIF image %s to PNG for ffmpeg",
                         item.rel_path,
                     )
                     _heif_to_png(item.abs_path, img_src)
-                cmd = build_image_clip_command(
-                    img_src, clip_path, canvas_w, canvas_h,
-                    item.duration_seconds or config.image_duration, config,
-                )
-            elif item.type == FILE_TYPE_VIDEO:
-                cmd = build_video_clip_command(item.abs_path, clip_path, canvas_w, canvas_h, config)
-            else:
-                raise ValueError(f"unknown file type: {item.type!r}")
-            _logger.info("clip %d/%d: %s (%s)", index + 1, len(files), item.rel_path, item.type)
-            run_ffmpeg(cmd)
-            clips.append(clip_path)
+            cmd = build_image_clip_command(
+                img_src, tmp_clip_path, canvas_w, canvas_h,
+                item.duration_seconds or config.image_duration, config,
+            )
+        elif item.type == FILE_TYPE_VIDEO:
+            cmd = build_video_clip_command(item.abs_path, tmp_clip_path, canvas_w, canvas_h, config)
+        else:
+            raise ValueError(f"unknown file type: {item.type!r}")
 
-        list_path = os.path.join(tmp, "concat.txt")
-        with open(list_path, "w", encoding="utf-8") as handle:
-            for clip in clips:
-                handle.write(f"file '{clip}'\n")
-        _logger.debug("concatenating %d clip(s)", len(clips))
+        _logger.info("clip %d/%d: %s (%s)", index + 1, len(files), item.rel_path, item.type)
+        run_ffmpeg(cmd)
+        os.replace(tmp_clip_path, clip_path)
+        clips.append(clip_path)
 
-        run_ffmpeg(build_concat_command(list_path, out_path))
+    list_path = os.path.join(staging_dir, "concat.txt")
+    with open(list_path, "w", encoding="utf-8") as handle:
+        for clip in clips:
+            handle.write(f"file '{clip}'\n")
+    _logger.debug("concatenating %d clip(s)", len(clips))
 
-    _logger.info("transcode complete: %s", out_path)
+    tmp_out = out_abs + ".tmp.mp4"
+    if os.path.isfile(tmp_out):
+        try:
+            os.remove(tmp_out)
+        except OSError:
+            pass
+
+    run_ffmpeg(build_concat_command(list_path, tmp_out))
+    os.replace(tmp_out, out_abs)
+
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    _logger.info("transcode complete: %s (staging cleaned up)", out_path)
     return out_path, chapters

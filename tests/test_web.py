@@ -572,6 +572,149 @@ def test_dashboard_scanning_status_and_logs(tmp_path):
         server.stop()
 
 
+def test_gallery_planned_segments_and_items(tmp_path):
+    from tubetape.db import Database
+    from tubetape.planner import Segment
+
+    db_path = tmp_path / "tubetape.json"
+    db = Database(path=str(db_path))
+    db.upsert_file("f1", {
+        "path": "img1.png",
+        "name": "img1.png",
+        "type": "image",
+        "captured_at_utc": "2024-01-01T12:00:00Z",
+        "duration_seconds": 3.0,
+        "size_bytes": 1024,
+    })
+    db.upsert_file("f2", {
+        "path": "img2.png",
+        "name": "img2.png",
+        "type": "image",
+        "captured_at_utc": "2024-01-01T12:05:00Z",
+        "duration_seconds": 3.0,
+        "size_bytes": 2048,
+    })
+    db.save()
+
+    # Create dummy media files
+    (tmp_path / "img1.png").write_bytes(b"dummy1")
+    (tmp_path / "img2.png").write_bytes(b"dummy2")
+
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        web.set_web_context(media_dir=str(tmp_path), db=db, db_path=str(db_path))
+
+        # Planned segment in memory (db.segments is empty)
+        plan_seg = Segment(
+            segment_id="plan_seg_1234567890abcdef",
+            title="20240101-120000 - 20240101-120500 [plan_seg]",
+            start_ts="2024-01-01T12:00:00Z",
+            end_ts="2024-01-01T12:05:00Z",
+            duration_seconds=6.0,
+            file_ids=["f1", "f2"],
+        )
+        web.set_web_planned_segments([plan_seg])
+
+        # 1. GET /api/segments should return the planned segment
+        with urllib.request.urlopen(f"{base_url}/api/segments") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            segs = data["segments"]
+            assert len(segs) == 1
+            assert segs[0]["id"] == "plan_seg_1234567890abcdef"
+            assert segs[0]["title"] == "20240101-120000 - 20240101-120500 [plan_seg]"
+            assert segs[0]["file_count"] == 2
+            assert segs[0]["status"] == "pending"
+
+        # 2. GET /api/segment/items?id=plan_seg_1234567890abcdef should return files
+        with urllib.request.urlopen(f"{base_url}/api/segment/items?id=plan_seg_1234567890abcdef") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert data["segment_id"] == "plan_seg_1234567890abcdef"
+            assert len(data["items"]) == 2
+            assert data["items"][0]["id"] == "f1"
+            assert data["items"][1]["id"] == "f2"
+
+        # Prefix match should also work
+        with urllib.request.urlopen(f"{base_url}/api/segment/items?id=plan_seg_1234") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert len(data["items"]) == 2
+
+        # 3. Transcoding active state changes status to building
+        web.update_web_transcode(
+            segment_id="plan_seg_1234567890abcdef",
+            title=plan_seg.title,
+            done=1,
+            total=2,
+            current_file="img1.png",
+        )
+        with urllib.request.urlopen(f"{base_url}/api/segments") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["segments"][0]["status"] == "building"
+
+    finally:
+        web.set_web_planned_segments([])
+        web.finish_web_segment("plan_seg_1234567890abcdef")
+        server.stop()
+
+
+def test_gallery_dynamic_plan_fallback(tmp_path):
+    from tubetape.db import Database
+
+    db_path = tmp_path / "tubetape.json"
+    db = Database(path=str(db_path))
+    db.upsert_file("f1", {
+        "path": "photo1.jpg",
+        "name": "photo1.jpg",
+        "type": "image",
+        "captured_at_utc": "2024-05-01T10:00:00Z",
+        "duration_seconds": 3.0,
+        "size_bytes": 1024,
+    })
+    db.save()
+
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        web.set_web_context(media_dir=str(tmp_path), db=db, db_path=str(db_path))
+        web.set_web_planned_segments([])
+
+        # Both db.segments and planned_segments are empty!
+        # /api/segments should dynamically plan from db.files
+        with urllib.request.urlopen(f"{base_url}/api/segments") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            segs = data["segments"]
+            assert len(segs) >= 1
+            dyn_id = segs[0]["id"]
+            assert segs[0]["file_count"] == 1
+
+        # /api/segment/items should also resolve the dynamically planned segment
+        with urllib.request.urlopen(f"{base_url}/api/segment/items?id={dyn_id}") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert len(data["items"]) == 1
+            assert data["items"][0]["id"] == "f1"
+
+    finally:
+        server.stop()
+
+
+
 
 
 

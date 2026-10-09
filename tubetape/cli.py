@@ -539,6 +539,7 @@ def run_pipeline(
             db.upsert_segment(
                 segment.segment_id,
                 {
+                    "title": segment.title,
                     "file_ids": segment.file_ids,
                     "range": [segment.start_ts, segment.end_ts],
                     "duration_seconds": segment.duration_seconds,
@@ -617,6 +618,7 @@ def run_pipeline(
                     db.upsert_segment(
                         segment.segment_id,
                         {
+                            "title": segment.title,
                             "file_ids": segment.file_ids,
                             "range": [segment.start_ts, segment.end_ts],
                             "duration_seconds": segment.duration_seconds,
@@ -657,6 +659,7 @@ def run_pipeline(
                 db.upsert_segment(
                     segment.segment_id,
                     {
+                        "title": segment.title,
                         "file_ids": segment.file_ids,
                         "range": [segment.start_ts, segment.end_ts],
                         "duration_seconds": segment.duration_seconds,

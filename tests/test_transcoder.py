@@ -187,3 +187,80 @@ def _assert_h264_aac(path):
     )
     assert "aac" in aproc.stdout, aproc.stderr
     assert "48000" in aproc.stdout, aproc.stderr
+
+
+class TestResumableTranscoding:
+    def test_resumes_existing_clip(self, tmp_path, monkeypatch):
+        import os
+        from unittest.mock import MagicMock
+
+        make_png(tmp_path / "img1.png", size=(64, 48))
+        make_png(tmp_path / "img2.png", size=(64, 48))
+        f1 = ScannedFile(
+            file_id="id1", abs_path=str(tmp_path / "img1.png"), rel_path="img1.png",
+            name="img1.png", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=0.0, duration_seconds=1.0, resolution="64x48",
+        )
+        f2 = ScannedFile(
+            file_id="id2", abs_path=str(tmp_path / "img2.png"), rel_path="img2.png",
+            name="img2.png", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=1.0, duration_seconds=1.0, resolution="64x48",
+        )
+        out = tmp_path / "seg.mp4"
+        staging = tmp_path / ".staging_seg"
+        staging.mkdir()
+
+        # Pre-transcode clip 0 to simulate prior run
+        clip0 = staging / f"clip_0000_{f1.file_id[:12]}.mp4"
+        # Generate real valid mp4 for clip0
+        transcoder.run_ffmpeg(
+            transcoder.build_image_clip_command(
+                f1.abs_path, str(clip0), 64, 48, 1.0, TranscodeConfig()
+            )
+        )
+        assert clip0.exists() and clip0.stat().st_size > 1024
+
+        real_run_ffmpeg = transcoder.run_ffmpeg
+        called_cmds = []
+
+        def tracking_run_ffmpeg(cmd):
+            called_cmds.append(cmd)
+            real_run_ffmpeg(cmd)
+
+        monkeypatch.setattr(transcoder, "run_ffmpeg", tracking_run_ffmpeg)
+
+        result, chapters = transcode_segment([f1, f2], str(out), TranscodeConfig())
+        assert result == str(out)
+        assert out.exists()
+        # staging directory should be cleaned up after successful transcode
+        assert not staging.exists()
+        # ffmpeg should only have run for clip 1 (f2) and concat, NOT clip 0 (f1)
+        # clip command has dst as last argument
+        clip0_dst = str(clip0)
+        assert not any(clip0_dst in " ".join(c) for c in called_cmds)
+        assert len(called_cmds) == 2  # 1 clip transcode + 1 concat
+
+    def test_corrupt_or_partial_clip_is_retranscoded(self, tmp_path):
+        make_png(tmp_path / "img1.png", size=(64, 48))
+        f1 = ScannedFile(
+            file_id="id1", abs_path=str(tmp_path / "img1.png"), rel_path="img1.png",
+            name="img1.png", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=0.0, duration_seconds=1.0, resolution="64x48",
+        )
+        out = tmp_path / "seg.mp4"
+        staging = tmp_path / ".staging_seg"
+        staging.mkdir()
+
+        # Place a partial / corrupt clip (< 1024 bytes) and a stale .tmp.mp4
+        clip0 = staging / f"clip_0000_{f1.file_id[:12]}.mp4"
+        clip0.write_bytes(b"corrupted partial data")
+        tmp_clip0 = staging / f"clip_0000_{f1.file_id[:12]}.tmp.mp4"
+        tmp_clip0.write_bytes(b"leftover tmp data")
+
+        result, chapters = transcode_segment([f1], str(out), TranscodeConfig())
+        assert result == str(out)
+        assert out.exists()
+        assert out.stat().st_size > 1024
+        assert not staging.exists()
+
+

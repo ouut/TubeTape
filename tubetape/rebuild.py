@@ -92,6 +92,7 @@ class Rebuilder:
             self.db.upsert_segment(
                 new_segment.segment_id,
                 {
+                    "title": new_segment.title,
                     "file_ids": new_segment.file_ids,
                     "range": [new_segment.start_ts, new_segment.end_ts],
                     "duration_seconds": new_segment.duration_seconds,

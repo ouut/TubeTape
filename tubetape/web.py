@@ -97,6 +97,9 @@ def set_web_context(
         _server_state["db"] = db
         _server_state["_file_cache"] = None
         _server_state["_date_groups_cache"] = None
+        _server_state["planned_segments"] = []
+        if _server_state.get("coordinator") and getattr(_server_state["coordinator"], "db", None) is not db:
+            _server_state["coordinator"] = None
     if db_path:
         _server_state["db_path"] = os.path.abspath(db_path)
     _server_state["keep_segments"] = max(0, keep_segments)
@@ -203,6 +206,9 @@ def get_auth_code(timeout: float = 300.0) -> str | None:
 
 def get_db():
     """Get active Database object or attempt to load from db_path."""
+    coord = get_app_coordinator()
+    if coord and getattr(coord, "db", None) is not None:
+        return coord.db
     db = _server_state.get("db")
     if db is not None:
         return db
@@ -291,6 +297,132 @@ def _format_seconds(sec: float) -> str:
     if m > 0:
         return f"{m}m {s}s"
     return f"{s}s"
+
+
+def _format_segment_title(srec_or_seg, sid: str) -> str:
+    """Format a readable title for a segment if missing."""
+    title = getattr(srec_or_seg, "title", None) if not isinstance(srec_or_seg, dict) else srec_or_seg.get("title")
+    if title:
+        return title
+    rng = getattr(srec_or_seg, "range", None) if isinstance(srec_or_seg, dict) else [
+        getattr(srec_or_seg, "start_ts", ""),
+        getattr(srec_or_seg, "end_ts", ""),
+    ]
+    if not rng:
+        rng = [
+            getattr(srec_or_seg, "start_ts", "") if hasattr(srec_or_seg, "start_ts") else srec_or_seg.get("start_ts", ""),
+            getattr(srec_or_seg, "end_ts", "") if hasattr(srec_or_seg, "end_ts") else srec_or_seg.get("end_ts", ""),
+        ]
+    start = (rng[0] or "") if len(rng) > 0 else ""
+    end = (rng[1] or "") if len(rng) > 1 else ""
+    if start and end:
+        return f"{start} - {end} [{sid[:16]}]"
+    elif start:
+        return f"{start} [{sid[:16]}]"
+    return sid[:16]
+
+
+def _collect_segments() -> dict[str, dict]:
+    """Collect all segments from db.segments, planned_segments, and dynamic fallback.
+
+    Returns a dict mapping segment_id -> segment metadata dict.
+    """
+    db = get_db()
+    segments_dict: dict[str, dict] = {}
+
+    # 1. Sealed / committed segments from DB
+    if db and getattr(db, "segments", None):
+        for sid, srec in list(db.segments.items()):
+            title = _format_segment_title(srec, sid)
+            rng = srec.get("range", ["", ""])
+            dur = float(srec.get("duration_seconds", 0.0))
+            fids = list(srec.get("file_ids", []))
+            segments_dict[sid] = {
+                "segment_id": sid,
+                "title": title,
+                "start_ts": rng[0] if len(rng) > 0 else "",
+                "end_ts": rng[1] if len(rng) > 1 else "",
+                "range": rng,
+                "duration_seconds": dur,
+                "duration_text": _format_seconds(dur),
+                "file_count": len(fids),
+                "file_ids": fids,
+                "status": "uploaded" if srec.get("youtube_video_id") else srec.get("status", "sealed"),
+                "youtube_video_id": srec.get("youtube_video_id"),
+                "progress": None,
+            }
+
+    # 2. In-memory planned segments
+    planned = _server_state.get("planned_segments", [])
+    for seg in planned:
+        sid = getattr(seg, "segment_id", None) or (seg.get("segment_id") if isinstance(seg, dict) else "")
+        if not sid:
+            continue
+        title = _format_segment_title(seg, sid)
+        dur = float(getattr(seg, "duration_seconds", 0.0) if hasattr(seg, "duration_seconds") else (seg.get("duration_seconds", 0.0) if isinstance(seg, dict) else 0.0))
+        fids = list(getattr(seg, "file_ids", []) if hasattr(seg, "file_ids") else (seg.get("file_ids", []) if isinstance(seg, dict) else []))
+        start_ts = getattr(seg, "start_ts", "") if hasattr(seg, "start_ts") else (seg.get("start_ts", "") if isinstance(seg, dict) else "")
+        end_ts = getattr(seg, "end_ts", "") if hasattr(seg, "end_ts") else (seg.get("end_ts", "") if isinstance(seg, dict) else "")
+
+        if sid not in segments_dict:
+            segments_dict[sid] = {
+                "segment_id": sid,
+                "title": title,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "range": [start_ts, end_ts],
+                "duration_seconds": dur,
+                "duration_text": _format_seconds(dur),
+                "file_count": len(fids),
+                "file_ids": fids,
+                "status": "pending",
+                "youtube_video_id": None,
+                "progress": None,
+            }
+
+    # 3. Dynamic plan fallback: if no segments exist yet, but DB has files
+    if not segments_dict and db and getattr(db, "files", None):
+        try:
+            from .planner import plan
+            from .scanner import ScannedFile
+
+            media_dir = _server_state.get("media_dir") or "."
+            scanned_files = [ScannedFile.from_record(fid, rec, media_dir) for fid, rec in db.files.items()]
+            coord = get_app_coordinator()
+            seg_dur = float(getattr(getattr(coord, "args", None), "segment_duration", 900.0) if coord else 900.0)
+            plan_res = plan(scanned_files, getattr(db, "segments", {}), seg_dur, flush=True)
+            for seg in plan_res.segments:
+                sid = seg.segment_id
+                if sid not in segments_dict:
+                    segments_dict[sid] = {
+                        "segment_id": sid,
+                        "title": seg.title,
+                        "start_ts": seg.start_ts,
+                        "end_ts": seg.end_ts,
+                        "range": [seg.start_ts, seg.end_ts],
+                        "duration_seconds": seg.duration_seconds,
+                        "duration_text": _format_seconds(seg.duration_seconds),
+                        "file_count": len(seg.file_ids),
+                        "file_ids": list(seg.file_ids),
+                        "status": "pending",
+                        "youtube_video_id": None,
+                        "progress": None,
+                    }
+        except Exception as exc:
+            _logger.debug("dynamic plan fallback failed: %s", exc)
+
+    # 4. Active transcode progress overlay
+    cur_tc = _server_state.get("transcode", {})
+    active_sid = cur_tc.get("segment_id")
+    if active_sid and active_sid in segments_dict:
+        segments_dict[active_sid]["status"] = "building"
+        segments_dict[active_sid]["progress"] = {
+            "done": cur_tc.get("done", 0),
+            "total": cur_tc.get("total", 0),
+            "current_file": cur_tc.get("current_file", ""),
+        }
+
+    return segments_dict
 
 
 # ---------------------------------------------------------------------- HTML Pages
@@ -710,8 +842,15 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
             setTimeout(init, 3000);
             return;
           }
+          currentSegId = null;
+          currentSegIndex = -1;
+          segmentSelect.innerHTML = `<option value="">全部媒体时间线 (${totalItems}项)</option>`;
+          prevSegBtn.disabled = true;
+          nextSegBtn.disabled = true;
+          ytSegLink.style.display = 'none';
           await prefetchRange(0, 10);
           showSlide(0);
+          setTimeout(checkSegmentsPoll, 4000);
         } else {
           renderEmpty();
           setTimeout(init, 3000);
@@ -722,13 +861,36 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function checkSegmentsPoll() {
+      if (segmentsList.length === 0) {
+        try {
+          const segRes = await fetch('/api/segments');
+          if (segRes.ok) {
+            const segData = await segRes.json();
+            if (segData.segments && segData.segments.length > 0) {
+              await init();
+              return;
+            }
+          }
+        } catch (e) {}
+        setTimeout(checkSegmentsPoll, 5000);
+      }
+    }
+
     function renderSegmentOptions() {
       segmentSelect.innerHTML = '';
       segmentsList.forEach((s) => {
         const opt = document.createElement('option');
         opt.value = s.id;
-        const ytTag = s.youtube_video_id ? ' ✅' : '';
-        opt.textContent = `${s.title} (${s.file_count}项 · ${formatSec(s.duration_seconds)})${ytTag}`;
+        let tag = '';
+        if (s.youtube_video_id) {
+          tag = ' ✅';
+        } else if (s.status === 'building') {
+          tag = ' ⏳';
+        } else if (s.status === 'pending') {
+          tag = ' 📋';
+        }
+        opt.textContent = `${s.title} (${s.file_count}项 · ${formatSec(s.duration_seconds)})${tag}`;
         segmentSelect.appendChild(opt);
       });
     }
@@ -737,7 +899,11 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
       currentSegId = segId;
       localStorage.setItem('tubetape_active_seg', segId);
       currentSegIndex = segmentsList.findIndex(s => s.id === segId);
-      segmentSelect.value = segId;
+      if (currentSegIndex < 0 && segmentsList.length > 0) {
+        currentSegIndex = 0;
+        currentSegId = segmentsList[0].id;
+      }
+      segmentSelect.value = currentSegId;
 
       prevSegBtn.disabled = (currentSegIndex <= 0);
       nextSegBtn.disabled = (currentSegIndex >= segmentsList.length - 1);
@@ -752,7 +918,7 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
 
       boxCurr.innerHTML = '<div class="loading-spinner"></div>';
       try {
-        const res = await fetch('/api/segment/items?id=' + encodeURIComponent(segId));
+        const res = await fetch('/api/segment/items?id=' + encodeURIComponent(currentSegId));
         if (res.ok) {
           const data = await res.json();
           itemsCache = {};
@@ -765,11 +931,13 @@ _TIMELINE_VIEWER_HTML = """<!DOCTYPE html>
           if (totalItems > 0) {
             showSlide(0);
           } else {
-            boxCurr.innerHTML = '<div class="empty-state"><div class="empty-title">该分片暂无素材</div></div>';
+            boxCurr.innerHTML = '<div class="empty-state"><div class="empty-title">该分片暂无素材</div><div class="empty-desc">分片中未包含有效媒体文件</div></div>';
           }
+        } else {
+          boxCurr.innerHTML = '<div class="empty-state"><div class="empty-title">载入分片失败</div><div class="empty-desc">未能获取分片详情，可能分片正在更新</div></div>';
         }
       } catch (e) {
-        boxCurr.innerHTML = '<div class="empty-state"><div class="empty-title">载入分片失败</div></div>';
+        boxCurr.innerHTML = '<div class="empty-state"><div class="empty-title">载入分片失败</div><div class="empty-desc">' + escapeHtml(e.message || '') + '</div></div>';
       }
     }
 
@@ -2948,20 +3116,20 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _api_segments(self) -> None:
-        db = get_db()
-        if not db or not db.segments:
+        segments_dict = _collect_segments()
+        if not segments_dict:
             self._send_json(200, {"segments": []})
             return
 
         segs = []
-        for sid, srec in db.segments.items():
+        for sid, srec in segments_dict.items():
             segs.append({
                 "id": sid,
-                "title": srec.get("title") or sid,
-                "file_count": len(srec.get("file_ids", [])),
+                "title": srec.get("title") or sid[:16],
+                "file_count": srec.get("file_count", 0),
                 "duration_seconds": float(srec.get("duration_seconds") or 0.0),
                 "status": srec.get("status") or "sealed",
-                "range": srec.get("range") or [],
+                "range": srec.get("range") or [srec.get("start_ts", ""), srec.get("end_ts", "")],
                 "youtube_video_id": srec.get("youtube_video_id"),
             })
 
@@ -2973,15 +3141,15 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"segments": segs})
 
     def _api_segment_items(self, query: dict) -> None:
-        db = get_db()
         seg_id = query.get("id", [None])[0]
-        if not db or not seg_id:
-            self._send_json(400, {"ok": False, "error": "缺少分片 ID 或数据库未就绪"})
+        if not seg_id:
+            self._send_json(400, {"ok": False, "error": "缺少分片 ID"})
             return
 
-        srec = db.segments.get(seg_id)
+        segments_dict = _collect_segments()
+        srec = segments_dict.get(seg_id)
         if not srec:
-            for s, r in db.segments.items():
+            for s, r in segments_dict.items():
                 if s.startswith(seg_id) or (len(seg_id) >= 8 and s[:len(seg_id)].lower() == seg_id.lower()):
                     srec = r
                     seg_id = s
@@ -2991,31 +3159,33 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": "未找到指定分片"})
             return
 
+        db = get_db()
         file_ids = srec.get("file_ids", [])
         media_dir = _server_state.get("media_dir") or "."
         items = []
-        for fid in file_ids:
-            f = db.files.get(fid)
-            if not f:
-                continue
-            rel_path = f.get("path") or ""
-            abs_path = os.path.abspath(os.path.join(media_dir, rel_path))
-            items.append({
-                "id": fid,
-                "name": f.get("name") or os.path.basename(rel_path),
-                "path": rel_path,
-                "abs_path": abs_path,
-                "type": f.get("type", "image"),
-                "captured_at": f.get("captured_at_utc") or "",
-                "resolution": f.get("resolution") or "",
-                "duration": float(f.get("duration_seconds") or 0.0),
-                "size": int(f.get("size_bytes") or 0),
-            })
+        if db and getattr(db, "files", None):
+            for fid in file_ids:
+                f = db.files.get(fid)
+                if not f:
+                    continue
+                rel_path = f.get("path") or ""
+                abs_path = os.path.abspath(os.path.join(media_dir, rel_path))
+                items.append({
+                    "id": fid,
+                    "name": f.get("name") or os.path.basename(rel_path),
+                    "path": rel_path,
+                    "abs_path": abs_path,
+                    "type": f.get("type", "image"),
+                    "captured_at": f.get("captured_at_utc") or "",
+                    "resolution": f.get("resolution") or "",
+                    "duration": float(f.get("duration_seconds") or 0.0),
+                    "size": int(f.get("size_bytes") or 0),
+                })
 
         self._send_json(200, {
             "ok": True,
             "segment_id": seg_id,
-            "title": srec.get("title") or seg_id,
+            "title": srec.get("title") or seg_id[:16],
             "duration_seconds": float(srec.get("duration_seconds") or 0.0),
             "status": srec.get("status") or "sealed",
             "youtube_video_id": srec.get("youtube_video_id"),
@@ -3023,8 +3193,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_getbytime(self, seg_id: str, min_str: str, sec_str: str, query: dict) -> None:
-        db = get_db()
-        if not db or not db.segments:
+        segments_dict = _collect_segments()
+        if not segments_dict:
             self._send_html(404, "<h2 style='color:#fff;background:#000;padding:40px;font-family:sans-serif;'>数据库未就绪或未找到任何分片</h2>")
             return
 
@@ -3038,11 +3208,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
         target_sid = None
         seg_record = None
-        if seg_id in db.segments:
+        if seg_id in segments_dict:
             target_sid = seg_id
-            seg_record = db.segments[seg_id]
+            seg_record = segments_dict[seg_id]
         else:
-            for s, rec in db.segments.items():
+            for s, rec in segments_dict.items():
                 if s.startswith(seg_id) or (len(seg_id) >= 8 and s[:len(seg_id)].lower() == seg_id.lower()):
                     target_sid = s
                     seg_record = rec
@@ -3057,6 +3227,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_html(404, f"<h2 style='color:#fff;background:#000;padding:40px;font-family:sans-serif;'>分片 {target_sid[:16]} 内无文件记录</h2>")
             return
 
+        db = get_db()
         media_dir = _server_state.get("media_dir") or "."
         current_offset = 0.0
         hit_file_id = None
@@ -3066,7 +3237,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         hit_item_index = 0
 
         for idx, fid in enumerate(file_ids):
-            frec = db.files.get(fid, {})
+            frec = db.files.get(fid, {}) if (db and getattr(db, "files", None)) else {}
             duration = float(frec.get("duration_seconds") or 3.0)
             item_start = current_offset
             item_end = current_offset + duration
@@ -3270,59 +3441,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                             disk_count += 1
 
             # Combine db segments and planned segments
-            segments_dict = {}
-            if db:
-                for sid, srec in list(db.segments.items()):
-                    title = srec.get("title")
-                    rng = srec.get("range", ["", ""])
-                    if not title:
-                        title = f"{rng[0]} - {rng[1]} [{sid[:16]}]" if rng[0] else sid[:16]
-                    dur = float(srec.get("duration_seconds", 0.0))
-                    segments_dict[sid] = {
-                        "segment_id": sid,
-                        "title": title,
-                        "start_ts": rng[0],
-                        "end_ts": rng[1],
-                        "duration_seconds": dur,
-                        "duration_text": _format_seconds(dur),
-                        "file_count": len(srec.get("file_ids", [])),
-                        "status": "uploaded" if srec.get("youtube_video_id") else srec.get("status", "sealed"),
-                        "youtube_video_id": srec.get("youtube_video_id"),
-                        "progress": None,
-                    }
-
-            # Planned segments
-            for seg in _server_state.get("planned_segments", []):
-                sid = getattr(seg, "segment_id", "")
-                title = getattr(seg, "title", "")
-                dur = float(getattr(seg, "duration_seconds", 0.0))
-                fcount = len(getattr(seg, "file_ids", []))
-                start_ts = getattr(seg, "start_ts", "")
-                end_ts = getattr(seg, "end_ts", "")
-                if sid not in segments_dict:
-                    segments_dict[sid] = {
-                        "segment_id": sid,
-                        "title": title or f"{start_ts} - {end_ts}",
-                        "start_ts": start_ts,
-                        "end_ts": end_ts,
-                        "duration_seconds": dur,
-                        "duration_text": _format_seconds(dur),
-                        "file_count": fcount,
-                        "status": "pending",
-                        "youtube_video_id": None,
-                        "progress": None,
-                    }
-
-            # Current transcode
-            cur_tc = _server_state.get("transcode", {})
-            active_sid = cur_tc.get("segment_id")
-            if active_sid and active_sid in segments_dict:
-                segments_dict[active_sid]["status"] = "building"
-                segments_dict[active_sid]["progress"] = {
-                    "done": cur_tc.get("done", 0),
-                    "total": cur_tc.get("total", 0),
-                    "current_file": cur_tc.get("current_file", ""),
-                }
+            segments_dict = _collect_segments()
 
             # Check has_local_file for each segment
             coord = get_app_coordinator()
@@ -3348,6 +3467,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             session = _server_state.get("oauth_session")
             auth_required = session is not None and not _server_state["auth_event"].is_set()
 
+            cur_tc = _server_state.get("transcode", {})
             payload = {
                 "status": _server_state["status"],
                 "task": _server_state["task"],
@@ -3470,6 +3590,18 @@ class WebServer:
 
     def stop(self) -> None:
         _server_state["is_running"] = False
+        _server_state["planned_segments"] = []
+        _server_state["coordinator"] = None
+        _server_state["db"] = None
+        _server_state["_file_cache"] = None
+        _server_state["_date_groups_cache"] = None
+        _server_state["transcode"] = {
+            "segment_id": None,
+            "title": None,
+            "done": 0,
+            "total": 0,
+            "current_file": None,
+        }
         if self._server:
             self._server.shutdown()
             self._server.server_close()

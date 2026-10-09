@@ -258,6 +258,14 @@ except BaseException:
 zoompan=z='min(zoom+0.0015,1.25)':d=180:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=3840x2160:fps=60
 ```
 
+#### 分片转码断点续建与暂存机制 (Resumable Transcoding & Staging)
+为防止长视频转码因进程中断、机器重启或 Docker 停机导致耗费的高额 CPU/GPU 算力付诸东流，`transcoder.py` 引入了细粒度切片级断点续建与暂存机制：
+- **隐藏工作目录**：在最终输出视频同级目录下，为每个分片分配独立的隐藏 staging 目录 `.staging_{out_base}`（例如 `.staging_20240501-120000 - 20240501-122000 [8ebbe961761892c9].mp4`）。
+- **切片命名规范**：各子媒体（照片/视频）首先按序转码为独立片段文件，命名为 `clip_{index:04d}_{file_id[:12]}.mp4`。
+- **原子写入防护**：切片转码时先输出至 `clip_....tmp.mp4`，编码成功完成且非空后原子重命名为正式切片文件，彻底杜绝转码中途被中断留下破损文件。
+- **断点自动复用**：当重新启动或重试转码时，转码引擎优先扫描 staging 目录。若对应的 `clip_....mp4` 已存在且文件大小 $> 1024$ 字节，直接跳过转码，复用已有切片并触发进度通知 `[Cached] Resumed clip X/Y`。
+- **快速拼接与清理**：所有切片准备就绪后，通过 ffmpeg concat demuxer 执行极速流级拼接（Stream Copy / Re-mux），先写入临时输出文件再原子替换至目标 `output_path`；成功完成落盘后，自动使用 `shutil.rmtree` 彻底清理隐藏 staging 目录。
+
 ---
 
 ### 4.5 视频统计简介与时间戳生成 (chapters.py)
@@ -366,7 +374,7 @@ while response is None:
 
 基于 `watchdog.observers.Observer` 监听目录变动：
 - **Quiet Period 去抖动**：检测到变动后，必须维持 10 分钟无新写入才触发构建，防止素材尚在网络写入途中被截断。
-- **mtime 兜底巡检**：每小时触发一次目录修改时间巡检，作为 inotify/FSEvents 在特定网络文件系统（NFS/CIFS）下的安全保障。
+- **mtime 兜底巡检**：默认每 10 分钟（可通过 `--mtime-interval` 自定义配置，如 10m/1h）触发一次目录修改时间巡检，作为 inotify/FSEvents 在特定网络文件系统（NFS/CIFS）下的安全兜底保障。
 
 ---
 
@@ -419,12 +427,30 @@ if not abs_path.startswith(os.path.abspath(media_dir)):
     return None, None  # 拒绝访问 media_dir 外部文件
 ```
 
+#### 4. 画廊分片多源聚合与动态规划降级 (Gallery Segment Aggregation & Dynamic Fallback)
+为了彻底解决画廊在首启扫描后未封板、后台转码中或分片尚未写入数据库时的“分片载入失效/分片列表为空”问题，`web.py` 重构了分片聚合逻辑：
+- **统一聚合多源数据 (`_collect_segments`)**：
+  1. `db.segments`：已持久化的历史已封板分片（包含显式保存的标题 `title`、真实输出路径与 YouTube ID）；
+  2. `coordinator._planned_segments`：当前正在运行或已规划好的内存分片对象（包含动态规划中的起止时间与素材集合）；
+  3. `coordinator._progress["transcode"]`：当前后台 ffmpeg 正在执行转码的实时分片进度与信息。
+- **动态规划降级 (Dynamic Plan Fallback)**：
+  当数据库中尚无已封板分片（`db.segments` 为空）且内存中暂无规划对象时，若数据库已扫描收录媒体（`db.files` 非空），Web 端会自动调用轻量无副作用的 `plan()` 动态生成只读分片规划，使画廊首启即具备完整的分片结构与浏览能力。
+- **前端状态感知与静默轮询**：
+  - 分片下拉菜单与标题实时展示状态前缀徽标：
+    - `✅`：已封板或已上传完成（`sealed` / `uploaded`）；
+    - `⏳`：正在转码构建中（`transcoding`）；
+    - `📋`：已规划待处理（`planned` / `pending`）。
+  - 画廊前端监听分片状态，若存在 `transcoding` 或 `planned` 状态的分片，自动以 5 秒间隔静默轮询 `/api/segments`，转码完成后平滑原地刷新，无需用户手动重载页面。
+  - 在 `WebServer.stop()` 中清理全局 coordinator 引用，保障多实例测试与服务热重载的状态隔离。
+
 ---
 
 ### 4.12 命令行入口与管线编排 (cli.py)
 
 - **配置加载层叠优先级**：
   CLI 命令行参数 > `tubetape.json` 运行时持久化配置 > 代码内置默认参数。
+- **启动与扫描策略**：
+  默认采用目录路径集合比对与精准增量恢复。若需强制全量重新探测与计算采样哈希，可指定 `--force-scan` 参数。文件监控默认每 10 分钟（`--mtime-interval 10m`）进行一次 mtime 巡检。
 - **无凭证纯本地模式兼容**：
   若设置 `--no-upload`，管线完全跳过 Google OAuth 凭据加载与云端对账，直接执行本地转码并退出或进入文件监控。
 - **平稳停机机制**：
@@ -454,19 +480,19 @@ stateDiagram-v2
 ## 6. 测试体系与质量保障
 
 TubeTape 配备了完整的自动化测试套件（基于 `pytest`），对外部依赖进行了严格隔离：
-- **测试用例总数**：254 项自动化测试全部通过。
+- **测试用例总数**：265 项自动化测试全部通过。
 - **覆盖范围**：
-  - `test_cli.py`：参数解析后置校验、流程编排、退出码、本地分片轮转逻辑、`--no-scan` 与 `--no-upload` 模式。
-  - `test_scanner.py`：格式探测、EXIF/ffprobe 解析、文件名正则兜底、快速采样哈希正确性、哈希缓存、`from_record` 恢复。
+  - `test_cli.py`：参数解析后置校验、流程编排、退出码、本地分片轮转逻辑、`--force-scan` 与 `--no-upload` 模式。
+  - `test_scanner.py`：格式探测、EXIF/ffprobe 解析、文件名正则兜底、快速采样哈希正确性、路径集合比对与精准增量探测、`from_record` 恢复。
   - `test_planner.py`：贪心装箱、稳定分片 ID、无时间戳排序与紧凑命名、同秒边界处理、Pending 队列、不可变追加规划。
   - `test_chapters.py`：视频统计概要与纯时长列表生成、播放器可交互章节映射。
   - `test_rebuild.py`：增量分片插入与两阶段提交。
-  - `test_transcoder.py`：画布几何计算、Ken Burns 滤镜、ffmpeg 指令拼装、磁盘空间检测。
+  - `test_transcoder.py`：画布几何计算、Ken Burns 滤镜、ffmpeg 指令拼装、磁盘空间检测、断点续建切片复用与破损临时文件清理 (`TestResumableTranscoding`)。
   - `test_uploader.py`：分块流式上传、配额错误捕获、播放列表写入。
   - `test_auth.py`：无头授权、Token 自动刷新、过期自愈。
   - `test_reconcile.py`：云端标题短 ID 匹配与索引恢复。
   - `test_watcher.py`：Watchdog 事件派发与去抖。
-  - `test_web.py`：画廊展示、分段下拉切换与首尾过渡、Dashboard 统计、HEIC 动态转码、视频 Range 206 流式传输、OAuth 回调拦截、参数配置 API、分段操作调度 API、`/api/segments`、`/api/segment/items`、`/getbytime/...`。
+  - `test_web.py`：画廊展示、分片多源聚合与动态规划降级 (`test_gallery_planned_segments_and_items`, `test_gallery_dynamic_plan_fallback`)、分段下拉切换与首尾过渡、Dashboard 统计、HEIC 动态转码、视频 Range 206 流式传输、OAuth 回调拦截、参数配置 API、分段操作调度 API、`/api/segments`、`/api/segment/items`、`/getbytime/...`。
 
 执行全量测试套件：
 ```bash
