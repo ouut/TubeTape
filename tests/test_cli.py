@@ -575,6 +575,38 @@ class TestKeepSegments:
         # 3. Non-configured parameters retain built-in code default
         assert coord.args.fps == 60
 
+    def test_run_pipeline_saves_db_immediately_after_scan(self, tmp_path, monkeypatch):
+        from conftest import make_png
+        from tubetape import cli
+        from tubetape.db import Database
+
+        make_png(tmp_path / "img1.png", size=(10, 10))
+        db_path = tmp_path / "tubetape.json"
+
+        # Intercept transcode_segment to abort pipeline after scan
+        def fail_transcode(*args, **kwargs):
+            raise RuntimeError("Stop after scan")
+
+        monkeypatch.setattr(cli, "transcode_segment", fail_transcode)
+
+        args = cli.parse_args([
+            "--no-upload",
+            "--no-watch",
+            "--flush",
+            "--input", str(tmp_path),
+            "--db", str(db_path),
+            "--segment-duration", "20s",
+        ])
+
+        with pytest.raises(RuntimeError, match="Stop after scan"):
+            cli.run_pipeline(args)
+
+        # Database must have been saved to disk immediately after scan
+        assert db_path.exists()
+        loaded_db = Database.load(str(db_path))
+        assert len(loaded_db.files) == 1
+        assert "img1.png" in [rec["path"] for rec in loaded_db.files.values()]
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

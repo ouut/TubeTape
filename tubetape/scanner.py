@@ -747,6 +747,7 @@ def scan_files(
     only_phone_videos: bool = False,
     cache: dict[str, dict] | None = None,  # retained for backwards compatibility
     on_file: Callable[[ScannedFile], None] | None = None,
+    on_progress: Callable[[int, int, ScannedFile], None] | None = None,
     candidates: list[tuple[str, str, str, str]] | None = None,
 ) -> tuple[list[ScannedFile], list[dict], list[dict]]:
     """Scan media files, extracting metadata and computing IDs.
@@ -816,6 +817,8 @@ def scan_files(
         scanned.append(item)
         if on_file is not None:
             on_file(item)
+        if on_progress is not None:
+            on_progress(index, total, item)
 
     _logger.info(
         "directory scan finished: %d scanned, %d error(s), %d skipped",
@@ -835,6 +838,7 @@ def scan(
     only_phone_videos: bool = False,
     force_scan: bool = False,
     on_file: Callable[[ScannedFile], None] | None = None,
+    on_progress: Callable[[int, int, ScannedFile, str, int], None] | None = None,
 ) -> ScanResult:
     """Scan and reconcile against the database using path sets and precise incremental loading.
 
@@ -873,6 +877,10 @@ def scan(
     # Case 1: Force full scan
     if force_scan:
         _logger.info("force-scan enabled: rescanning all %d media files", len(candidates))
+        def _prog_full(done: int, total: int, item: ScannedFile) -> None:
+            if on_progress is not None:
+                on_progress(done, total, item, "full", 0)
+
         scanned, errors, skipped = scan_files(
             input_dir,
             timezone,
@@ -880,6 +888,7 @@ def scan(
             only_camera_photos=only_camera_photos,
             only_phone_videos=only_phone_videos,
             on_file=on_file,
+            on_progress=_prog_full if on_progress is not None else None,
             candidates=candidates,
         )
         scanned_ids = {f.file_id for f in scanned}
@@ -946,6 +955,11 @@ def scan(
     )
 
     retained_files, skipped = _restore_retained(retained_paths)
+    retained_count = len(retained_files)
+
+    def _prog_incr(done: int, total: int, item: ScannedFile) -> None:
+        if on_progress is not None:
+            on_progress(done, total, item, "incremental", retained_count)
 
     # Scan only the newly added candidate files
     added_candidates = [candidate_map[p] for p in sorted(added_paths) if p in candidate_map]
@@ -956,6 +970,7 @@ def scan(
         only_camera_photos=only_camera_photos,
         only_phone_videos=only_phone_videos,
         on_file=on_file,
+        on_progress=_prog_incr if on_progress is not None else None,
         candidates=added_candidates,
     )
     skipped.extend(added_skipped)

@@ -447,6 +447,12 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
             assert d["stats"]["no_upload"] is True
             assert d["segments"][0]["has_local_file"] is True
 
+        # Wait for any in-flight background task to complete before triggering scan
+        for _ in range(50):
+            if coord.current_task is None:
+                break
+            time.sleep(0.05)
+
         # 7. POST /api/scan/start
         req_scan = urllib.request.Request(f"{base_url}/api/scan/start", data=b"", method="POST")
         with urllib.request.urlopen(req_scan) as res:

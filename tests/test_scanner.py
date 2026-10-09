@@ -382,3 +382,44 @@ class TestScanReconcile:
         names = [c[2] for c in candidates]
         assert "normal.png" in names
         assert "thumb.png" not in names
+
+    def test_scan_on_progress_incremental(self, tmp_path):
+        make_png(tmp_path / "exist.png", size=(10, 10))
+        make_png(tmp_path / "new1.png", size=(20, 20))
+        fid_exist = scanner.file_sha256(str(tmp_path / "exist.png"))
+
+        db = Database()
+        db.upsert_file(fid_exist, {"path": "exist.png", "type": "image"})
+
+        progress_events = []
+        def on_prog(done, total, item, mode, retained):
+            progress_events.append((done, total, item.rel_path, mode, retained))
+
+        res = scanner.scan(str(tmp_path), db, SHANGHAI, on_progress=on_prog)
+        assert len(res.new_file_ids) == 1
+        assert len(progress_events) == 1
+        done, total, path, mode, retained = progress_events[0]
+        assert done == 1
+        assert total == 1
+        assert path == "new1.png"
+        assert mode == "incremental"
+        assert retained == 1
+
+    def test_scan_on_progress_full(self, tmp_path):
+        make_png(tmp_path / "img1.png", size=(10, 10))
+        db = Database()
+
+        progress_events = []
+        def on_prog(done, total, item, mode, retained):
+            progress_events.append((done, total, item.rel_path, mode, retained))
+
+        res = scanner.scan(str(tmp_path), db, SHANGHAI, force_scan=True, on_progress=on_prog)
+        assert len(res.files) == 1
+        assert len(progress_events) == 1
+        done, total, path, mode, retained = progress_events[0]
+        assert done == 1
+        assert total == 1
+        assert path == "img1.png"
+        assert mode == "full"
+        assert retained == 0
+

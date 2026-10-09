@@ -36,7 +36,10 @@ _server_state = {
     "scanner": {
         "is_scanning": False,
         "count": 0,
+        "total": 0,
         "current": None,
+        "mode": "idle",
+        "retained": 0,
     },
     "transcode": {
         "segment_id": None,
@@ -105,10 +108,20 @@ def set_web_context(
     _server_state["keep_segments"] = max(0, keep_segments)
 
 
-def update_web_scanner(is_scanning: bool, count: int = 0, current: str | None = None) -> None:
+def update_web_scanner(
+    is_scanning: bool,
+    count: int = 0,
+    total: int = 0,
+    current: str | None = None,
+    mode: str = "idle",
+    retained: int = 0,
+) -> None:
     """Update scanner state for real-time progress display in dashboard."""
     _server_state["scanner"]["is_scanning"] = is_scanning
     _server_state["scanner"]["count"] = count
+    _server_state["scanner"]["total"] = total
+    _server_state["scanner"]["mode"] = mode
+    _server_state["scanner"]["retained"] = retained
     if current is not None:
         _server_state["scanner"]["current"] = current
     elif not is_scanning:
@@ -2322,10 +2335,18 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
 
           // Metrics
           document.getElementById('metric-files').textContent = (d.stats && d.stats.total_files ? d.stats.total_files : 0).toLocaleString();
+          const scanDetailEl = document.getElementById('metric-scan-detail');
           if (d.scanner && d.scanner.is_scanning) {
-            document.getElementById('metric-scan-detail').innerHTML = `🔍 扫描中: ${d.scanner.count} 个 (${escapeHtml(d.scanner.current || '')})`;
+            const curPath = d.scanner.current ? escapeHtml(d.scanner.current) : '';
+            if (d.scanner.mode === 'incremental') {
+              scanDetailEl.innerHTML = `🔍 增量扫描中: ${d.scanner.count}/${d.scanner.total || '?'} 个 (已秒级载入 ${d.scanner.retained || 0} 个)<br><span style="opacity:0.75;font-size:11px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${curPath}</span>`;
+            } else if (d.scanner.mode === 'full') {
+              scanDetailEl.innerHTML = `🔍 全量扫描中: ${d.scanner.count}/${d.scanner.total || '?'} 个<br><span style="opacity:0.75;font-size:11px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${curPath}</span>`;
+            } else {
+              scanDetailEl.innerHTML = `🔍 扫描中: ${d.scanner.count} 个 (${curPath})`;
+            }
           } else {
-            document.getElementById('metric-scan-detail').textContent = '✅ 扫描就绪';
+            scanDetailEl.textContent = '✅ 扫描就绪 (索引已同步)';
           }
 
           document.getElementById('metric-segments').textContent = d.stats ? d.stats.total_segments : 0;
@@ -3436,7 +3457,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def _api_dashboard(self) -> None:
         try:
             db = get_db()
-            files_count = len(db.files) if db else _server_state["scanner"]["count"]
+            scanner_info = _server_state.get("scanner", {})
+            if scanner_info.get("is_scanning") and scanner_info.get("mode") == "incremental":
+                files_count = scanner_info.get("retained", 0) + scanner_info.get("total", 0)
+            else:
+                files_count = len(db.files) if db else scanner_info.get("count", 0)
 
             # Count disk segments in uploaded_segments/
             disk_count = 0

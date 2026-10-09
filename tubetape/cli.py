@@ -324,9 +324,6 @@ def _file_persister(db: Database):
         db.upsert_file(item.file_id, item.to_record())
         state["count"] += 1
         state["indexed"] += 1
-        from . import web
-
-        web.update_web_scanner(is_scanning=True, count=state["indexed"], current=item.rel_path)
         now = time.monotonic()
         if state["count"] >= 1000 or now - state["last_save"] >= 30.0:
             db.save()
@@ -334,6 +331,14 @@ def _file_persister(db: Database):
             state["count"] = 0
             state["last_save"] = now
 
+    def flush() -> None:
+        if state["count"] > 0:
+            db.save()
+            _log.debug("flushed %d indexed file(s) to db", state["count"])
+            state["count"] = 0
+            state["last_save"] = time.monotonic()
+
+    persist.flush = flush  # type: ignore[attr-defined]
     return persist
 
 
@@ -350,6 +355,26 @@ def run_pipeline(
         db = coordinator.db
     else:
         db = Database.load(args.db)
+
+    try:
+        return _run_pipeline_impl(args, reporter, force_scan, db)
+    except KeyboardInterrupt:
+        if not args.dry_run and db is not None:
+            try:
+                db.save()
+                _log.info("interrupted by signal; database saved cleanly to %s", db.path)
+            except Exception as e:
+                _log.warning("failed to save database on interrupt: %s", e)
+        raise
+
+
+def _run_pipeline_impl(
+    args: argparse.Namespace,
+    reporter: Reporter,
+    force_scan: bool,
+    db: Database,
+) -> int:
+    from . import web
 
     web.set_web_context(
         media_dir=args.input,
@@ -398,7 +423,7 @@ def run_pipeline(
             coordinator.uploader = uploader
 
     is_force_scan = force_scan or getattr(args, "force_scan", False)
-    web.update_web_scanner(is_scanning=True, count=0)
+    web.update_web_scanner(is_scanning=True, count=0, total=0, mode="checking", retained=len(db.files))
     web.set_web_status("scanning", f"正在检查/扫描媒体文件 {args.input} ...")
     reporter.status(f"scanning {args.input} ...")
 
@@ -406,6 +431,18 @@ def run_pipeline(
     # long scan survives interruption.
     # Dry-run stays read-only and passes no callback.
     on_file = None if args.dry_run else _file_persister(db)
+
+    def _scan_progress(done: int, total: int, item, mode: str, retained: int) -> None:
+        reporter.status(f"scanning [{done}/{total}]: {item.rel_path}")
+        web.update_web_scanner(
+            is_scanning=True,
+            count=done,
+            total=total,
+            current=item.rel_path,
+            mode=mode,
+            retained=retained,
+        )
+
     result = scan(
         args.input,
         db,
@@ -415,8 +452,19 @@ def run_pipeline(
         only_phone_videos=args.only_phone_videos,
         force_scan=is_force_scan,
         on_file=on_file,
+        on_progress=_scan_progress,
     )
-    web.update_web_scanner(is_scanning=False, count=len(result.files))
+    if on_file is not None and hasattr(on_file, "flush"):
+        on_file.flush()
+
+    web.update_web_scanner(
+        is_scanning=False,
+        count=len(result.files),
+        total=len(result.files),
+        current=None,
+        mode="idle",
+        retained=len(result.files),
+    )
     if not is_force_scan and len(result.new_file_ids) == 0 and len(result.deleted_file_ids) == 0:
         reporter.status(f"media files match database index ({len(result.files)} files); skipped scanning")
         _log.info("media files match database index (%d files); full scan skipped", len(result.files))
@@ -507,6 +555,11 @@ def run_pipeline(
     for file_id in result.deleted_file_ids:
         db.remove_file(file_id)
         _log.debug("removed deleted file %s from index", file_id[:12])
+
+    # Immediately save the database after scanning and reconciliation so
+    # the index on disk is 100% up to date before long-running transcoding begins.
+    db.save()
+    _log.info("database saved after scan sync: %d file(s)", len(db.files))
 
     # Real run: transcode each new/rebuild segment, then upload.
 
@@ -734,9 +787,14 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
 
     reporter = reporter or Reporter()
 
-    code = run_pipeline(args, reporter)
-    if code == _EXIT_ERROR:
-        return code
+    try:
+        code = run_pipeline(args, reporter)
+        if code == _EXIT_ERROR:
+            return code
+    except KeyboardInterrupt:
+        reporter.status("stopping on signal ...")
+        _log.info("received exit/interrupt signal during initial pipeline; shutting down cleanly")
+        return 0
     args.force_scan = False  # subsequent watch runs use incremental scan
 
     reporter.status(
@@ -902,9 +960,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         web_server.start()
 
-    if args.watch and not args.dry_run:
-        return run_watch(args)
-    return run_pipeline(args)
+    import signal
+
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(KeyboardInterrupt()))
+        except (ValueError, AttributeError):
+            pass
+
+    try:
+        if args.watch and not args.dry_run:
+            return run_watch(args)
+        return run_pipeline(args)
+    except KeyboardInterrupt:
+        _log.info("received exit/interrupt signal; shutting down cleanly")
+        return 0
 
 
 if __name__ == "__main__":
