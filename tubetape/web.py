@@ -48,6 +48,9 @@ _server_state = {
         "total": 0,
         "current_file": None,
         "resumed": False,
+        "file_progress": None,
+        "fps": None,
+        "speed": None,
     },
     "planned_segments": [],
     "coordinator": None,
@@ -141,6 +144,9 @@ def update_web_transcode(
     total: int,
     current_file: str,
     resumed: bool = False,
+    file_progress: float | None = None,
+    fps: float | None = None,
+    speed: str | None = None,
 ) -> None:
     """Update transcode progress for real-time progress display in dashboard."""
     _server_state["transcode"] = {
@@ -150,6 +156,9 @@ def update_web_transcode(
         "total": total,
         "current_file": current_file,
         "resumed": resumed,
+        "file_progress": file_progress,
+        "fps": fps,
+        "speed": speed,
     }
 
 
@@ -445,6 +454,9 @@ def _collect_segments() -> dict[str, dict]:
             "total": cur_tc.get("total", 0),
             "current_file": cur_tc.get("current_file", ""),
             "resumed": cur_tc.get("resumed", False),
+            "file_progress": cur_tc.get("file_progress"),
+            "fps": cur_tc.get("fps"),
+            "speed": cur_tc.get("speed"),
         }
 
     return segments_dict
@@ -1986,10 +1998,10 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- Metrics Cards -->
     <div class="metrics-grid">
       <div class="metric-card">
-        <div class="metric-label">扫描进度 / 媒体总数</div>
+        <div class="metric-label">媒体库实际总数 (独立文件)</div>
         <div class="metric-value">
           <span id="metric-files">0</span>
-          <span style="font-size: 0.85rem; font-weight: normal; color: #a1a1aa;">个文件</span>
+          <span style="font-size: 0.85rem; font-weight: normal; color: #a1a1aa;">个独立文件</span>
         </div>
         <div class="metric-sub" id="metric-scan-detail">正在检查...</div>
       </div>
@@ -2000,6 +2012,7 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
           <span style="font-size: 0.85rem; font-weight: normal; color: #a1a1aa;">个分段</span>
         </div>
         <div class="metric-sub" id="metric-segments-sub">已上传: 0 | 待构建: 0</div>
+        <div class="metric-sub" id="metric-segments-note" style="font-size: 0.72rem; color: #888; margin-top: 3px;"></div>
       </div>
       <div class="metric-card">
         <div class="metric-label">本地磁盘保留视频</div>
@@ -2027,6 +2040,7 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
         <div style="font-size: 0.8rem; color: var(--muted);" id="segments-count-text">共 0 个分段</div>
       </div>
+      <div id="segments-explanation" style="padding: 8px 18px; font-size: 0.76rem; color: #94a3b8; background: rgba(30, 41, 59, 0.45); border-bottom: 1px solid rgba(255,255,255,0.06); display: none;"></div>
       <div class="table-container">
         <table>
           <thead>
@@ -2354,16 +2368,67 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
           }
 
           document.getElementById('metric-segments').textContent = d.stats ? d.stats.total_segments : 0;
-          document.getElementById('metric-segments-sub').textContent =
-            d.stats ? `已上传: ${d.stats.uploaded_segments} | 待处理: ${d.stats.total_segments - d.stats.uploaded_segments}` : '-';
+          if (d.stats) {
+            const upSegs = d.stats.uploaded_segments || 0;
+            const upFiles = (d.stats.uploaded_files_count || 0).toLocaleString();
+            const pendSegs = d.stats.pending_segments !== undefined ? d.stats.pending_segments : (d.stats.total_segments - upSegs);
+            const pendFiles = (d.stats.pending_files_count || 0).toLocaleString();
+            document.getElementById('metric-segments-sub').textContent =
+              `已上传: ${upSegs} (${upFiles} 媒体) | 待处理: ${pendSegs} (${pendFiles} 媒体)`;
+
+            const noteEl = document.getElementById('metric-segments-note');
+            if (noteEl) {
+              if (d.stats.overlap_files > 0) {
+                noteEl.innerHTML = `分片引用媒体项: <b>${(d.stats.total_segment_files || 0).toLocaleString()}</b> 项 (含 <b>${d.stats.overlap_files.toLocaleString()}</b> 项历史重叠)`;
+              } else {
+                noteEl.textContent = `包含全部 ${(d.stats.total_files || 0).toLocaleString()} 个媒体文件`;
+              }
+            }
+
+            const explEl = document.getElementById('segments-explanation');
+            if (explEl) {
+              if (d.stats.overlap_files > 0) {
+                explEl.style.display = 'block';
+                explEl.innerHTML = `ℹ️ <b>说明：</b>媒体库磁盘物理文件共 <b>${(d.stats.total_files || 0).toLocaleString()}</b> 个。列表中分片媒体项合计为 <b>${(d.stats.total_segment_files || 0).toLocaleString()}</b> 项（已上传 ${upSegs} 分片包含 ${upFiles} 项，待处理 ${pendSegs} 分片包含 ${pendFiles} 项）。差额 <b>${d.stats.overlap_files.toLocaleString()}</b> 项源于早期不同参数下已封存上传的历史分片与重新规划分片的引用重叠，不影响当前待处理任务。`;
+              } else {
+                explEl.style.display = 'none';
+              }
+            }
+          } else {
+            document.getElementById('metric-segments-sub').textContent = '-';
+          }
 
           document.getElementById('metric-disk-segments').textContent = d.stats ? d.stats.disk_segments_count : 0;
           document.getElementById('metric-keep-limit').textContent = d.stats ? d.stats.keep_segments : 0;
 
+          const taskValueEl = document.getElementById('metric-task');
+          if (taskValueEl) {
+            if (d.status === 'transcoding' || d.status === 'building') {
+              taskValueEl.textContent = '🎞️ 视频转码中';
+            } else if (d.status === 'uploading') {
+              taskValueEl.textContent = '☁️ 上传中';
+            } else if (d.status === 'scanning') {
+              taskValueEl.textContent = '🔍 扫描中';
+            } else if (d.status === 'idle') {
+              taskValueEl.textContent = '☕ 空闲';
+            } else if (d.status === 'watching') {
+              taskValueEl.textContent = '👀 监听中';
+            } else {
+              taskValueEl.textContent = d.task || displayStatus || '就绪';
+            }
+          }
+
           let taskDetail = d.task || '-';
-          if (d.transcode && d.transcode.total > 0 && d.status === 'transcoding') {
+          if (d.transcode && d.transcode.total > 0 && (d.status === 'transcoding' || d.status === 'building')) {
             const resumeTag = d.transcode.resumed ? '[⚡断点复用] ' : '';
-            taskDetail = `${resumeTag}${d.transcode.title || ''} (${d.transcode.done}/${d.transcode.total}): ${d.transcode.current_file || ''}`;
+            let fileProgText = '';
+            if (typeof d.transcode.file_progress === 'number' && d.transcode.file_progress >= 0) {
+              fileProgText = ` [${d.transcode.file_progress.toFixed(1)}%`;
+              if (d.transcode.fps) fileProgText += ` · ${d.transcode.fps}fps`;
+              if (d.transcode.speed) fileProgText += ` · ${d.transcode.speed}`;
+              fileProgText += ']';
+            }
+            taskDetail = `${resumeTag}${d.transcode.title || ''} (${d.transcode.done}/${d.transcode.total})${fileProgText}: ${d.transcode.current_file || ''}`;
           }
           document.getElementById('metric-task-sub').textContent = taskDetail;
 
@@ -2381,9 +2446,14 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
                 const prog = seg.progress || { done: 0, total: 1, current_file: '' };
                 const pct = prog.total > 0 ? Math.round((prog.done / prog.total) * 100) : 0;
                 const resumeBadge = prog.resumed ? ' <span style="color:#10b981;font-weight:600;font-size:0.75rem;">[⚡断点复用]</span>' : '';
+                let fileProgBadge = '';
+                if (typeof prog.file_progress === 'number' && prog.file_progress >= 0) {
+                  const spd = prog.speed ? ` · ${escapeHtml(prog.speed)}` : '';
+                  fileProgBadge = ` <span style="color:#38bdf8;font-size:0.75rem;font-weight:600;">(${prog.file_progress.toFixed(1)}%${spd})</span>`;
+                }
                 statusHtml = `
                   <div>
-                    <span class="badge badge-building">⚡ 正在构建 (${prog.done}/${prog.total})${resumeBadge}</span>
+                    <span class="badge badge-building">⚡ 正在构建 (${prog.done}/${prog.total})${resumeBadge}${fileProgBadge}</span>
                     <div class="progress-bar-wrap"><div class="progress-bar-fill" style="width: ${pct}%"></div></div>
                     <div style="font-size: 0.72rem; color: #888; max-width: 180px; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(prog.current_file || '')}</div>
                   </div>
@@ -3506,6 +3576,12 @@ class _RequestHandler(BaseHTTPRequestHandler):
             segments_list.sort(key=lambda x: (x.get("start_ts") or "", x.get("title") or ""))
 
             uploaded_count = sum(1 for s in segments_list if s.get("youtube_video_id"))
+            uploaded_files_count = sum(s.get("file_count", 0) for s in segments_list if s.get("youtube_video_id"))
+            pending_segments_count = len(segments_list) - uploaded_count
+            pending_files_count = sum(s.get("file_count", 0) for s in segments_list if not s.get("youtube_video_id"))
+            total_segment_files = sum(s.get("file_count", 0) for s in segments_list)
+            overlap_files = max(0, total_segment_files - files_count)
+
             session = _server_state.get("oauth_session")
             auth_required = session is not None and not _server_state["auth_event"].is_set()
 
@@ -3521,6 +3597,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
                     "total_files": files_count,
                     "total_segments": len(segments_list),
                     "uploaded_segments": uploaded_count,
+                    "uploaded_files_count": uploaded_files_count,
+                    "pending_segments": pending_segments_count,
+                    "pending_files_count": pending_files_count,
+                    "total_segment_files": total_segment_files,
+                    "overlap_files": overlap_files,
                     "disk_segments_count": disk_count,
                     "keep_segments": _server_state.get("keep_segments", 0),
                     "no_upload": bool(getattr(coord.args, "no_upload", False)) if coord else False,

@@ -199,16 +199,21 @@ def test_web_server_dashboard_and_logs_endpoints(tmp_path):
         with urllib.request.urlopen(f"{base_url}/logs") as res:
             assert res.status == 200
 
-        # /api/dashboard
         web.update_web_scanner(is_scanning=True, count=42, current="test.jpg")
-        web.update_web_transcode(segment_id="seg1", title="Segment 1", done=5, total=10, current_file="a.jpg")
+        web.update_web_transcode(segment_id="seg1", title="Segment 1", done=5, total=10, current_file="a.jpg", file_progress=50.0, fps=30.0, speed="1.2x")
         with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
             assert res.status == 200
             data = json.loads(res.read().decode("utf-8"))
             assert data["scanner"]["is_scanning"] is True
             assert data["scanner"]["count"] == 42
             assert data["transcode"]["title"] == "Segment 1"
+            assert data["transcode"]["file_progress"] == 50.0
+            assert data["transcode"]["fps"] == 30.0
+            assert data["transcode"]["speed"] == "1.2x"
             assert "stats" in data
+            assert "uploaded_files_count" in data["stats"]
+            assert "pending_files_count" in data["stats"]
+            assert "overlap_files" in data["stats"]
             assert "segments" in data
     finally:
         web.update_web_scanner(is_scanning=False, count=0)

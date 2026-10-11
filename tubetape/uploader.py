@@ -126,11 +126,17 @@ class Uploader:
         if hasattr(request, "next_chunk"):
             response = None
             retry = 0
+            last_log = time.monotonic()
             while response is None:
                 try:
                     status, response = request.next_chunk()
-                    if status and progress_callback:
-                        progress_callback(status.progress())
+                    if status:
+                        if progress_callback:
+                            progress_callback(status.progress())
+                        now = time.monotonic()
+                        if now - last_log >= 15.0:
+                            last_log = now
+                            _logger.info("[上传中] upload progress: %.1f%%", status.progress() * 100.0)
                     retry = 0
                 except Exception as exc:
                     if is_quota_error(exc):

@@ -223,9 +223,9 @@ class TestResumableTranscoding:
         real_run_ffmpeg = transcoder.run_ffmpeg
         called_cmds = []
 
-        def tracking_run_ffmpeg(cmd):
+        def tracking_run_ffmpeg(cmd, *args, **kwargs):
             called_cmds.append(cmd)
-            real_run_ffmpeg(cmd)
+            real_run_ffmpeg(cmd, *args, **kwargs)
 
         monkeypatch.setattr(transcoder, "run_ffmpeg", tracking_run_ffmpeg)
 
@@ -309,9 +309,9 @@ class TestResumableTranscoding:
         called_cmds = []
         real_run = transcoder.run_ffmpeg
 
-        def tracking_run(cmd):
+        def tracking_run(cmd, *args, **kwargs):
             called_cmds.append(cmd)
-            real_run(cmd)
+            real_run(cmd, *args, **kwargs)
 
         monkeypatch.setattr(transcoder, "run_ffmpeg", tracking_run)
 

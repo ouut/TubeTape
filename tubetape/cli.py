@@ -634,9 +634,23 @@ def _run_pipeline_impl(
         )
 
         def transcode_fn(files, _out_path=out_path):
-            def progress(done: int, total: int, item, is_resumed: bool = False) -> None:
+            def progress(
+                done: int,
+                total: int,
+                item,
+                is_resumed: bool = False,
+                file_progress: float | None = None,
+                fps: float | None = None,
+                speed: str | None = None,
+            ) -> None:
                 if is_resumed:
                     reporter.status(f"    [断点复用 {done}/{total}] {item.rel_path}")
+                elif file_progress is not None:
+                    spd_info = f" [速度 {speed}]" if speed and speed != "N/A" else ""
+                    fps_info = f" ({fps:.1f} fps)" if fps and fps > 0 else ""
+                    reporter.status(
+                        f"    transcode {done}/{total}: {item.rel_path} ({file_progress:.1f}%{spd_info}{fps_info})"
+                    )
                 else:
                     reporter.status(f"    transcode {done}/{total}: {item.rel_path} ({item.type})")
                 web.update_web_transcode(
@@ -646,6 +660,9 @@ def _run_pipeline_impl(
                     total=total,
                     current_file=item.rel_path,
                     resumed=is_resumed,
+                    file_progress=file_progress,
+                    fps=fps,
+                    speed=speed,
                 )
 
             return transcode_segment(files, _out_path, config, progress=progress)
@@ -712,11 +729,15 @@ def _run_pipeline_impl(
                     reporter.status(f"uploading {segment.title} ...")
                     web.set_web_status("uploading", f"正在上传 {segment.title}")
                     description = build_segment_description(segment_files, total_duration=segment.duration_seconds)
+                    def _upload_cb(pct: float) -> None:
+                        web.set_web_status("uploading", f"正在上传 {segment.title} ({pct * 100:.1f}%)")
+
                     video_id = uploader.upload(
                         out_path,
                         segment.title,
                         description,
                         privacy=args.privacy,
+                        progress_callback=_upload_cb,
                     )
                     _log.info("sealed segment %s -> video id %s", segment.segment_id, video_id)
                 else:

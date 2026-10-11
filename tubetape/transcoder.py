@@ -11,7 +11,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -144,23 +146,132 @@ def build_concat_command(list_path: str, dst: str) -> list[str]:
     return ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", dst]
 
 
-def run_ffmpeg(cmd: list[str]) -> None:
+def _format_clock(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "00:00"
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    if m >= 60:
+        h = m // 60
+        m = m % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def run_ffmpeg(
+    cmd: list[str],
+    total_duration: float | None = None,
+    desc: str | None = None,
+    on_progress: Callable[[float, float, float, float, str], None] | None = None,
+    log_interval: float = 15.0,
+    timeout: float = 3600.0,
+) -> None:
     _logger.debug("ffmpeg command: %s", " ".join(cmd))
     start = time.monotonic()
+
+    # Inject -progress pipe:1 if not present
+    run_cmd = list(cmd)
+    if "-progress" not in run_cmd:
+        if len(run_cmd) >= 2 and run_cmd[1] == "-y":
+            run_cmd[2:2] = ["-progress", "pipe:1"]
+        else:
+            run_cmd[1:1] = ["-progress", "pipe:1"]
+
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        _logger.error("ffmpeg command failed after %.1fs: %s", time.monotonic() - start, exc)
+        proc = subprocess.Popen(
+            run_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        _logger.error("ffmpeg not found: %s", exc)
+        raise RuntimeError(f"ffmpeg not found: {exc}") from exc
+
+    stderr_lines = deque(maxlen=60)
+
+    def _drain_stderr():
+        try:
+            if proc.stderr:
+                for line in proc.stderr:
+                    stderr_lines.append(line)
+        except Exception:
+            pass
+
+    err_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    err_thread.start()
+
+    last_log_time = start
+    cur_fps = 0.0
+    cur_speed = "N/A"
+    cur_sec = 0.0
+
+    try:
+        if proc.stdout:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k == "fps":
+                    try:
+                        cur_fps = float(v)
+                    except ValueError:
+                        pass
+                elif k == "speed":
+                    cur_speed = v.strip()
+                elif k == "out_time_us":
+                    try:
+                        cur_sec = max(0.0, int(v) / 1_000_000.0)
+                    except ValueError:
+                        pass
+                elif k == "progress":
+                    now = time.monotonic()
+                    if v == "continue" and now - last_log_time >= log_interval:
+                        last_log_time = now
+                        pct = (
+                            min(99.9, max(0.0, (cur_sec / total_duration) * 100.0))
+                            if total_duration and total_duration > 0
+                            else 0.0
+                        )
+                        cur_clk = _format_clock(cur_sec)
+                        tot_clk = _format_clock(total_duration) if total_duration else "--:--"
+                        pct_text = f"{pct:.1f}%" if (total_duration and total_duration > 0) else cur_clk
+                        _logger.info(
+                            "[转码中] %s: %s (已编码 %s / 总长 %s) | fps=%.1f | 速度=%s",
+                            desc or "视频处理",
+                            pct_text,
+                            cur_clk,
+                            tot_clk,
+                            cur_fps,
+                            cur_speed,
+                        )
+                        if on_progress:
+                            try:
+                                on_progress(pct, cur_sec, total_duration or 0.0, cur_fps, cur_speed)
+                            except Exception:
+                                pass
+        proc.wait(timeout=max(60.0, timeout))
+    except (subprocess.TimeoutExpired, Exception) as exc:
+        proc.kill()
+        _logger.error("ffmpeg command failed or timed out after %.1fs: %s", time.monotonic() - start, exc)
         raise RuntimeError(f"ffmpeg failed: {exc}") from exc
+    finally:
+        err_thread.join(timeout=1.0)
+
+    duration = time.monotonic() - start
     if proc.returncode != 0:
+        err_msg = "".join(stderr_lines)[-2000:]
         _logger.error(
             "ffmpeg exited with code %d after %.1fs: %s",
             proc.returncode,
-            time.monotonic() - start,
-            proc.stderr[-2000:],
+            duration,
+            err_msg,
         )
-        raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {proc.stderr[-2000:]}")
-    _logger.debug("ffmpeg finished successfully in %.1fs", time.monotonic() - start)
+        raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {err_msg}")
+
+    _logger.debug("ffmpeg finished successfully in %.1fs", duration)
 
 
 def check_disk_space(path: str, required_bytes: int) -> None:
@@ -310,17 +421,50 @@ def transcode_segment(
                         item.rel_path,
                     )
                     _heif_to_png(item.abs_path, img_src)
+            clip_dur = item.duration_seconds or config.image_duration
             cmd = build_image_clip_command(
                 img_src, tmp_clip_path, canvas_w, canvas_h,
-                item.duration_seconds or config.image_duration, config,
+                clip_dur, config,
             )
         elif item.type == FILE_TYPE_VIDEO:
+            clip_dur = item.duration_seconds
             cmd = build_video_clip_command(item.abs_path, tmp_clip_path, canvas_w, canvas_h, config)
         else:
             raise ValueError(f"unknown file type: {item.type!r}")
 
         _logger.info("clip %d/%d: %s (%s)", index + 1, len(files), item.rel_path, item.type)
-        run_ffmpeg(cmd)
+
+        def _on_clip_prog(pct: float, cur_s: float, tot_s: float, fps: float, speed: str) -> None:
+            if progress is not None:
+                try:
+                    progress(
+                        index + 1,
+                        len(files),
+                        item,
+                        False,
+                        file_progress=pct,
+                        fps=fps,
+                        speed=speed,
+                    )
+                except TypeError:
+                    try:
+                        progress(index + 1, len(files), item, False)
+                    except TypeError:
+                        progress(index + 1, len(files), item)
+
+        try:
+            run_ffmpeg(
+                cmd,
+                total_duration=clip_dur,
+                desc=f"clip {index + 1}/{len(files)} ({item.name})",
+                on_progress=_on_clip_prog,
+                log_interval=15.0,
+            )
+        except TypeError as te:
+            if "unexpected keyword argument" in str(te):
+                run_ffmpeg(cmd)
+            else:
+                raise
         os.replace(tmp_clip_path, clip_path)
         clips.append(clip_path)
 
@@ -337,7 +481,23 @@ def transcode_segment(
         except OSError:
             pass
 
-    run_ffmpeg(build_concat_command(list_path, tmp_out))
+    total_concat_dur = sum(
+        (item.duration_seconds or config.image_duration) if item.type == FILE_TYPE_IMAGE else (item.duration_seconds or 0.0)
+        for item in files
+    )
+    _logger.info("concatenating %d clip(s) into %s ...", len(clips), out_path)
+    try:
+        run_ffmpeg(
+            build_concat_command(list_path, tmp_out),
+            total_duration=total_concat_dur,
+            desc=f"concat {out_base}",
+            log_interval=10.0,
+        )
+    except TypeError as te:
+        if "unexpected keyword argument" in str(te):
+            run_ffmpeg(build_concat_command(list_path, tmp_out))
+        else:
+            raise
     os.replace(tmp_out, out_abs)
 
     shutil.rmtree(staging_dir, ignore_errors=True)

@@ -379,7 +379,15 @@ class AppCoordinator:
                 out_path = os.path.join(self.segments_dir, f"{title}.mp4")
 
                 def transcode_fn(flist, _out=out_path):
-                    def progress(done: int, total: int, item, is_resumed: bool = False) -> None:
+                    def progress(
+                        done: int,
+                        total: int,
+                        item,
+                        is_resumed: bool = False,
+                        file_progress: float | None = None,
+                        fps: float | None = None,
+                        speed: str | None = None,
+                    ) -> None:
                         web.update_web_transcode(
                             segment_id=segment_id,
                             title=title,
@@ -387,6 +395,9 @@ class AppCoordinator:
                             total=total,
                             current_file=item.rel_path,
                             resumed=is_resumed,
+                            file_progress=file_progress,
+                            fps=fps,
+                            speed=speed,
                         )
 
                     return transcode_segment(flist, _out, config, progress=progress)
