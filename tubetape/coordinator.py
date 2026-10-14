@@ -18,7 +18,7 @@ from .db import SEGMENT_STATUS_FAILED, SEGMENT_STATUS_SEALED, Database
 from .planner import ScannedFile, plan
 from .rebuild import Rebuilder
 from .reconcile import fetch_remote_index
-from .scanner import scan
+from .scanner import FILE_TYPE_VIDEO, VIDEO_EXTENSIONS, scan
 from .transcoder import TranscodeConfig, transcode_segment
 
 _logger = logging.getLogger("tubetape.coordinator")
@@ -37,27 +37,32 @@ FINGERPRINT_PARAMS = frozenset([
 
 
 def rotate_uploaded_segments(directory: str, keep_count: int) -> list[str]:
-    """Maintain at most `keep_count` newest .mp4 files in `directory`.
+    """Maintain at most `keep_count` newest video files in `directory`.
 
-    If keep_count <= 0, deletes all non-hidden .mp4 files.
+    If keep_count <= 0, deletes all non-hidden video files.
     Returns list of deleted file paths.
     """
     if not os.path.isdir(directory):
         return []
 
-    mp4_files = []
+    valid_exts = VIDEO_EXTENSIONS | {".mp4"}
+    video_files = []
     for entry in os.scandir(directory):
-        if entry.is_file() and entry.name.lower().endswith(".mp4") and not entry.name.startswith("."):
+        if (
+            entry.is_file()
+            and os.path.splitext(entry.name)[1].lower() in valid_exts
+            and not entry.name.startswith(".")
+        ):
             try:
-                mp4_files.append((entry.path, entry.stat().st_mtime))
+                video_files.append((entry.path, entry.stat().st_mtime))
             except OSError:
                 continue
 
     # Sort descending by mtime (newest first)
-    mp4_files.sort(key=lambda x: x[1], reverse=True)
+    video_files.sort(key=lambda x: x[1], reverse=True)
 
     deleted = []
-    to_delete = mp4_files[max(0, keep_count):]
+    to_delete = video_files[max(0, keep_count):]
     for path, _ in to_delete:
         try:
             os.remove(path)
@@ -151,11 +156,11 @@ class AppCoordinator:
                 "no_upload": bool(getattr(a, "no_upload", False)),
                 "force_scan": bool(getattr(a, "force_scan", False)),
                 "image_duration": float(getattr(a, "image_duration", 3.0)),
-                "crf": int(getattr(a, "crf", 16)),
+                "crf": int(getattr(a, "crf", 18)),
                 "max_resolution": max_res_str,
                 "canvas_mode": str(getattr(a, "canvas_mode", "max")),
-                "fps": int(getattr(a, "fps", 60)),
-                "x264_preset": str(getattr(a, "x264_preset", "slow")),
+                "fps": int(getattr(a, "fps", 30)),
+                "x264_preset": str(getattr(a, "x264_preset", "fast")),
                 "ken_burns": bool(getattr(a, "ken_burns", False)),
                 "privacy": str(getattr(a, "privacy", "private")),
                 "playlist": str(getattr(a, "playlist", "") or ""),
@@ -275,6 +280,8 @@ class AppCoordinator:
         candidates = []
         if t:
             candidates.append(os.path.join(self.segments_dir, f"{t}.mp4"))
+            for ext in VIDEO_EXTENSIONS:
+                candidates.append(os.path.join(self.segments_dir, f"{t}{ext}"))
         candidates.append(os.path.join(self.segments_dir, f"{segment_id}.mp4"))
 
         for c in candidates:
@@ -284,8 +291,9 @@ class AppCoordinator:
         # Search for sid[:16] prefix/suffix in uploaded_segments directory
         if os.path.isdir(self.segments_dir):
             sid16 = segment_id[:16]
+            valid_exts = VIDEO_EXTENSIONS | {".mp4"}
             for entry in os.scandir(self.segments_dir):
-                if entry.is_file() and entry.name.lower().endswith(".mp4") and sid16 in entry.name:
+                if entry.is_file() and os.path.splitext(entry.name)[1].lower() in valid_exts and sid16 in entry.name:
                     return entry.path
 
         return None
@@ -376,7 +384,12 @@ class AppCoordinator:
                     preset=self.args.x264_preset,
                 )
 
-                out_path = os.path.join(self.segments_dir, f"{title}.mp4")
+                is_single_vid = len(files) == 1 and files[0].type == FILE_TYPE_VIDEO
+                if is_single_vid:
+                    ext = os.path.splitext(files[0].abs_path)[1].lower() or ".mp4"
+                    out_path = os.path.join(self.segments_dir, f"{title}{ext}")
+                else:
+                    out_path = os.path.join(self.segments_dir, f"{title}.mp4")
 
                 def transcode_fn(flist, _out=out_path):
                     def progress(

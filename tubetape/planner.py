@@ -17,15 +17,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .log import get_logger
-from .scanner import ScannedFile, format_iso_utc, parse_iso_utc
+from .scanner import FILE_TYPE_VIDEO, ScannedFile, format_iso_utc, parse_iso_utc
 
 _logger = get_logger("planner")
 
-_DISPLAY_TS_FORMAT = "%Y%m%d-%H%M%S"
+_DISPLAY_TS_FORMAT = "%Y%m%d_%H%M%S"
 
 
 def display_ts(epoch: float) -> str:
-    """Format an epoch as ``YYYYMMDD-HHMMSS`` (UTC)."""
+    """Format an epoch as ``YYYYMMDD_HHMMSS`` (UTC)."""
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(_DISPLAY_TS_FORMAT)
 
 
@@ -83,16 +83,15 @@ def _make_segment(
     short_id = sid[:16]
 
     if not epochs:
-        # All files in this segment are undated: 19700101_000000-19700101_000000_[{short_id}]
+        # All files in this segment are undated: 19700101_000000[{short_id}]
         start_ts = "1970-01-01T00:00:00Z"
         end_ts = "1970-01-01T00:00:00Z"
-        title = f"19700101_000000-19700101_000000_[{short_id}]"
+        title = f"19700101_000000[{short_id}]"
     else:
-        start = min(epochs)
-        end = max(epochs)
-        start_ts = format_iso_utc(datetime.fromtimestamp(start, tz=timezone.utc))
-        end_ts = format_iso_utc(datetime.fromtimestamp(end, tz=timezone.utc))
-        title = f"{display_ts(start)} - {display_ts(end)} [{short_id}]"
+        start = epochs[0]
+        start_ts = format_iso_utc(datetime.fromtimestamp(min(epochs), tz=timezone.utc))
+        end_ts = format_iso_utc(datetime.fromtimestamp(max(epochs), tz=timezone.utc))
+        title = f"{display_ts(start)}[{short_id}]"
 
     return Segment(
         file_ids=[f.file_id for f in ordered],
@@ -109,7 +108,8 @@ def greedy_pack(files: list[ScannedFile], segment_duration: float) -> list[list[
     """Greedily pack capture-time-sorted files into segments.
 
     Each segment accumulates content duration up to ``segment_duration``. A
-    single file longer than the limit is never split: it closes the current
+    video file is always packed standalone into its own segment (untranscoded).
+    A single file longer than the limit is never split: it closes the current
     segment and becomes its own (oversized) segment.
     """
     ordered = sorted(files, key=_sort_key)
@@ -118,6 +118,14 @@ def greedy_pack(files: list[ScannedFile], segment_duration: float) -> list[list[
     current_duration = 0.0
 
     for item in ordered:
+        if item.type == FILE_TYPE_VIDEO:
+            if current:
+                segments.append(current)
+                current = []
+                current_duration = 0.0
+            segments.append([item])
+            continue
+
         duration = item.duration_seconds or 0.0
         if duration > segment_duration:
             if current:
@@ -141,6 +149,9 @@ def greedy_pack(files: list[ScannedFile], segment_duration: float) -> list[list[
 def _is_partial(group: list[ScannedFile], segment_duration: float) -> bool:
     duration = sum(f.duration_seconds or 0.0 for f in group)
     if duration >= segment_duration:
+        return False
+    # A single video file is complete, not partial.
+    if len(group) == 1 and group[0].type == FILE_TYPE_VIDEO:
         return False
     # A single oversized file is complete, not partial.
     if len(group) == 1 and (group[0].duration_seconds or 0.0) > segment_duration:

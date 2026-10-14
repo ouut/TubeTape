@@ -19,7 +19,7 @@ from .log import get_logger, setup_logging
 from .planner import plan
 from .rebuild import Rebuilder
 from .reconcile import embed_segment_id, fetch_remote_index
-from .scanner import ScannedFile, ScanResult, scan
+from .scanner import FILE_TYPE_VIDEO, ScannedFile, ScanResult, scan
 from .transcoder import TranscodeConfig, transcode_segment
 from .ui import Reporter
 from .uploader import QuotaExceededError
@@ -76,14 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--crf",
         type=int,
-        default=16,
-        help="video re-encode quality; lower is better (default: 16)",
+        default=18,
+        help="video re-encode quality; lower is better (default: 18)",
     )
     parser.add_argument(
         "--max-resolution",
         type=durations.parse_resolution,
-        default="7680x4320",
-        help="resolution ceiling WxH, never upscaling (default: 7680x4320). "
+        default="3840x2160",
+        help="resolution ceiling WxH, never upscaling (default: 3840x2160 4K). "
         "The actual output is the segment's bounding box, so <=4K content "
         "stays <=4K and only true 8K content uses 8K",
     )
@@ -97,8 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fps",
         type=int,
-        default=60,
-        help="output frame rate (default: 60; preserves up to 60fps sources)",
+        default=30,
+        help="output frame rate (default: 30; YouTube recommended for static photo albums)",
     )
     parser.add_argument(
         "--x264-preset",
@@ -106,9 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
             "ultrafast", "superfast", "veryfast", "faster", "fast",
             "medium", "slow", "slower", "veryslow",
         ],
-        default="slow",
+        default="fast",
         help="x264 speed/efficiency preset; slower = better quality per bitrate "
-        "(default: slow)",
+        "(default: fast)",
     )
     parser.add_argument(
         "--ken-burns",
@@ -588,7 +588,12 @@ def _run_pipeline_impl(
     total_segments = len(plan_result.segments)
     for index, segment in enumerate(plan_result.segments, start=1):
         segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
-        out_path = os.path.join(segments_dir, f"{segment.title}.mp4")
+        is_single_vid = len(segment_files) == 1 and segment_files[0].type == FILE_TYPE_VIDEO
+        if is_single_vid:
+            ext = os.path.splitext(segment_files[0].abs_path)[1].lower() or ".mp4"
+            out_path = os.path.join(segments_dir, f"{segment.title}{ext}")
+        else:
+            out_path = os.path.join(segments_dir, f"{segment.title}.mp4")
 
         # Already on YouTube (e.g. after a lost db or restart): record locally and skip.
         existing_video = remote_index.get(segment.segment_id) or remote_index.get(segment.segment_id[:16])

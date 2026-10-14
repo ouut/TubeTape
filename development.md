@@ -218,15 +218,16 @@ except BaseException:
 - 分片 ID 不依赖执行时间或随机数，仅由分片内文件哈希与转码配置参数严格决定：
   $$\text{segment\_id} = \text{SHA256}\left(\sum_{f \in \text{sorted(file\_ids)}} f + \sum_{p \in \text{params}} p\right)$$
 - **标题命名规范**：
-  - 含有拍摄时间的常规分片：`{start_ts} - {end_ts} [{short_id}]`（如 `20140513-062834 - 20141001-015345 [8ebbe961761892c9]`）。
-  - 若分片内所有素材均缺失拍摄时间，紧凑命名为 `19700101_000000-19700101_000000_[{short_id}]`（短横线与下划线无空格紧凑排列）。
+  - 含有拍摄时间的常规分片：`{YYYYMMDD_HHMMSS}[{short_id}]`（如 `20140513_062834[8ebbe961761892c9]`，以起始素材的拍摄时间命名）。
+  - 若分片内所有素材均缺失拍摄时间，紧凑命名为 `19700101_000000[{short_id}]`。
 
 #### 不可变追加规划体系 (Append-Only Immutable Planning)
 为彻底杜绝增量扫描时老分片被动重新规划、级联重建与 YouTube 上传配额雪崩，TubeTape 确立了**历史分片永久不可变**的核心准则：
 1. **已封板分片免扰**：已存在于数据库中的已封板（`sealed`）分片，其素材列表与分片定义永不被增量扫描修改或拆分。
-2. **前沿文件动态入队**：仅当新增素材的拍摄时间 $\ge$ 历史已封板分片的最大时间戳时，才视为时间线最前沿的新鲜增量，追加至末尾的 `pending` 待封板分片；当达到目标时长或用户执行 `--flush` 时，予以封板。
-3. **历史回填与无日期素材独立成片**：若用户导入了更早年份的历史素材（拍摄时间 $<$ 历史最大时间戳）或无拍摄时间素材，系统绝不打散历史分片，而是将其归集为全新的独立分片并立即封板，形成自洽的新视频。
-4. **单文件超长防护**：若单个素材时长本身超过 `segment_duration`，算法将其单独独立成片，允许单片时长自然超出设定阈值，保障素材完整性。
+2. **视频与照片严格分离**：所有视频文件（无论长短）一律独立成片，免重新编码并保留原始扩展名直接上传 YouTube，绝不参与贪心装箱混排，且立即成段不作为 `pending` 暂存。
+3. **前沿照片动态入队**：仅当新增照片素材的拍摄时间 $\ge$ 历史已封板分片的最大时间戳时，才视为时间线最前沿的新鲜增量，追加至末尾的 `pending` 待封板分片；当达到目标时长或用户执行 `--flush` 时，予以封板。
+4. **历史回填与无日期照片独立成片**：若用户导入了更早年份的历史素材（拍摄时间 $<$ 历史最大时间戳）或无拍摄时间素材，系统绝不打散历史分片，而是将其归集为全新的独立分片并立即封板，形成自洽的新视频。
+5. **单文件超长防护**：若单个照片素材时长本身超过 `segment_duration`，算法将其单独独立成片，允许单片时长自然超出设定阈值。
 
 ---
 
@@ -240,31 +241,34 @@ except BaseException:
 
 ---
 
-### 4.4 高保真视频转码引擎 (transcoder.py)
+### 4.4 极速相册转码与原画直传引擎 (transcoder.py)
 
-#### 自适应包围盒画布 (Bounding Box Canvas)
-- 当 `--canvas-mode max` 时，动态扫描分片内所有静态照片与视频的分辨率：
-  $$W_{\text{canvas}} = \min(\max_{i} W_i, W_{\text{max\_res}}), \quad H_{\text{canvas}} = \min(\max_{i} H_i, H_{\text{max\_res}})$$
-- 确保输出符合 16:9 / 4:3 像素对齐（偶数化），对横屏与竖屏混排场景自动加黑边居中填充，素材本身绝不降采样。
+#### 单视频免重编码直传 (Single-Video Bypass)
+当分片仅由单个视频文件组成时，系统彻底跳过 FFmpeg 重编码：
+- 直接保留原始容器扩展名（如 `.mov`, `.mp4`），原子复制到 `uploaded_segments/`；
+- 秒级触发 YouTube 上传，100% 保持原始视音频轨道与原生画质。
 
-#### iPhone HEIC 转码桥接
-由于大多数标准 Linux ffmpeg 发行版并未编译 `libheif`，转码器在处理 HEIC/HEIF 图片时：
-- 先通过 Python `Pillow` + `pillow-heif` 将其解码为临时无损 PNG 图像。
-- 将临时 PNG 送入 ffmpeg 的 concat demuxer 管道，彻底避开底层编解码器缺失问题。
+#### 纯照片 Concat Demuxer 极速合成 (Photo Album Fast-Path)
+对于纯静态照片相册，抛弃低效的多 clip 独立编码模式，改用内存高效的单进程极速构建方案：
+1. **生成 `images.txt` 列表**：写入每张照片绝对路径与持续停留时长（如 `duration 3`），末尾图片按 FFmpeg 要求重复写一次且不带 duration；
+2. **iPhone HEIC 动态转换**：若存在 HEIC/HEIF 图片，自动通过 Pillow 转换为临时 PNG 供 FFmpeg 读取；
+3. **单进程高画质 4K 直出**：
+   ```bash
+   ffmpeg -y -f concat -safe 0 -i images.txt \
+     -f lavfi -i anullsrc=r=48000:cl=stereo \
+     -vf "scale=3840:2160:force_original_aspect_ratio=decrease:flags=lanczos,pad=3840:2160:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p" \
+     -c:v libx264 -preset fast -tune stillimage -crf 18 \
+     -bf 2 -g 15 -movflags +faststart \
+     -c:a aac -b:a 128k -shortest output.mp4
+   ```
+4. **滤镜链黄金法则**：必须将 `fps=30` 放置在 `scale` 和 `pad` 之后，让 400 张照片仅做 400 次 Lanczos 插值计算，提速 20 倍以上；
+5. **YouTube 画质与规格对齐**：4K 强制触发 YouTube 分配高级 VP9/AV1 转码器，`-tune stillimage` 配合 CRF 18 达到视觉无损并极大压缩静止帧。
 
-#### Ken Burns 运镜滤镜生成
-若开启 `--ken-burns`，为静态照片生成平滑的缩放平移变换滤镜：
+#### Ken Burns 运镜动效支持 (可选)
+若显式开启 `--ken-burns`，为静态照片启用多 clip 逐张平滑推拉运镜：
 ```
-zoompan=z='min(zoom+0.0015,1.25)':d=180:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=3840x2160:fps=60
+zoompan=z='min(zoom+0.0015,1.25)':d=180:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=3840x2160:fps=30
 ```
-
-#### 分片转码断点续建与暂存机制 (Resumable Transcoding & Staging)
-为防止长视频转码因进程中断、机器重启或 Docker 停机导致耗费的高额 CPU/GPU 算力付诸东流，`transcoder.py` 引入了细粒度切片级断点续建与暂存机制：
-- **隐藏工作目录**：在最终输出视频同级目录下，为每个分片分配独立的隐藏 staging 目录 `.staging_{out_base}`（例如 `.staging_20240501-120000 - 20240501-122000 [8ebbe961761892c9].mp4`）。
-- **切片命名规范**：各子媒体（照片/视频）首先按序转码为独立片段文件，命名为 `clip_{index:04d}_{file_id[:12]}.mp4`。
-- **原子写入防护**：切片转码时先输出至 `clip_....tmp.mp4`，编码成功完成且非空后原子重命名为正式切片文件，彻底杜绝转码中途被中断留下破损文件。
-- **断点自动复用**：当重新启动或重试转码时，转码引擎优先扫描 staging 目录。若对应的 `clip_....mp4` 已存在且文件大小 $> 1024$ 字节，直接跳过转码，复用已有切片并触发进度通知 `[Cached] Resumed clip X/Y`。
-- **快速拼接与清理**：所有切片准备就绪后，通过 ffmpeg concat demuxer 执行极速流级拼接（Stream Copy / Re-mux），先写入临时输出文件再原子替换至目标 `output_path`；成功完成落盘后，自动使用 `shutil.rmtree` 彻底清理隐藏 staging 目录。
 
 ---
 
@@ -293,11 +297,11 @@ TubeTape 在 YouTube 视频简介中输出纯净统计与纯时长列表（通�
 #### 标题内嵌防截断短 ID
 视频标题命名规则严格定义为：
 ```
-{start_ts} - {end_ts} [{short_id}]
+{YYYYMMDD_HHMMSS}[{short_id}]
 ```
 其中 `short_id = segment_id[:16]`。对于全无时间戳的素材分段，使用紧凑无空格格式：
 ```
-19700101_000000-19700101_000000_[{short_id}]
+19700101_000000[{short_id}]
 ```
 - **背景**：YouTube Data API 会自动清洗并截断过长的视频简介，导致存放在简介末尾的 Marker 丢失。
 - **机制**：标题尾部的短 ID 永不被截断。`fetch_remote_index` 通过 `channels.list` 与 `playlistItems.list` 仅拉取标题文本，即可在本地库缺失时自动恢复映射并跳过已传分片。

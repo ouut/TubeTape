@@ -69,12 +69,20 @@ class TestGreedyPack:
         groups = greedy_pack(files, 20)
         assert [f.file_id for f in groups[0]] == ["earlier", "later"]
 
+    def test_video_file_standalone(self):
+        files = [
+            sf("img1", 100, 3, ftype="image"),
+            sf("vid1", 101, 10, ftype="video"),
+            sf("img2", 102, 3, ftype="image"),
+        ]
+        groups = greedy_pack(files, 30)
+        assert [[f.file_id for f in g] for g in groups] == [["img1"], ["vid1"], ["img2"]]
+
 
 class TestMakeSegment:
     def test_title_and_range(self):
         seg = planner._make_segment([sf("a", 100, 5), sf("b", 150, 5)], ())
-        assert seg.title.startswith("19700101-000140 - 19700101-000230")
-        assert seg.title.endswith(f"[{seg.segment_id[:16]}]")
+        assert seg.title == f"19700101_000140[{seg.segment_id[:16]}]"
         assert seg.start_ts == iso(100)
         assert seg.end_ts == iso(150)
         assert seg.duration_seconds == 10.0
@@ -183,12 +191,19 @@ class TestPlanLaterRuns:
         # First segment is undated
         seg0 = result.segments[0]
         assert seg0.file_ids == ["u1", "u2"]
-        assert seg0.title.startswith("19700101_000000-19700101_000000_[")
+        assert seg0.title == f"19700101_000000[{seg0.segment_id[:16]}]"
         assert seg0.start_ts == "1970-01-01T00:00:00Z"
 
         # Second segment is dated
         seg1 = result.segments[1]
         assert seg1.file_ids == ["d1"]
+
+    def test_standalone_video_not_pending(self):
+        files = [sf("vid1", 100, 10, ftype="video")]
+        result = plan(files, {}, segment_duration=60, flush=False)
+        assert len(result.segments) == 1
+        assert result.segments[0].file_ids == ["vid1"]
+        assert result.pending_files == []
 
     def test_multiple_historical_files_respect_capacity(self):
         # Existing segment spans 100..200

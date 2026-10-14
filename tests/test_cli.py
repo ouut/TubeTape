@@ -20,11 +20,11 @@ class TestDefaults:
         assert args.input == os.path.abspath(".")
         assert args.db == os.path.join(os.path.abspath("."), "tubetape.json")
         assert args.segment_duration == 3600.0
-        assert args.crf == 16
-        assert args.max_resolution == (7680, 4320)
+        assert args.crf == 18
+        assert args.max_resolution == (3840, 2160)
         assert args.canvas_mode == "max"
-        assert args.fps == 60
-        assert args.x264_preset == "slow"
+        assert args.fps == 30
+        assert args.x264_preset == "fast"
         assert args.ken_burns is False
         assert args.privacy == "private"
         assert args.flush is False
@@ -573,7 +573,7 @@ class TestKeepSegments:
         assert coord.args.image_duration == 5.0
         assert coord.args.segment_duration == 1200.0
         # 3. Non-configured parameters retain built-in code default
-        assert coord.args.fps == 60
+        assert coord.args.fps == 30
 
     def test_run_pipeline_saves_db_immediately_after_scan(self, tmp_path, monkeypatch):
         from conftest import make_png

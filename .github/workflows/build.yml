@@ -2,18 +2,24 @@ name: build
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for release (optional, e.g. v1.4.0)'
+        required: false
+        default: ''
 
 jobs:
-  build:
+  build-binaries:
+    name: Build Binary (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Build Linux on an older glibc (Ubuntu 22.04) so the binary runs on
-          # older distros too (glibc is backward- but not forward-compatible).
           - os: ubuntu-22.04
             name: linux
           - os: windows-latest
@@ -31,7 +37,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller tzdata Pillow exifread google-api-python-client google-auth-oauthlib watchdog rich
+          pip install pyinstaller
+          pip install .
 
       - name: Build executable
         run: python scripts/build.py --name tubetape-${{ matrix.name }}
@@ -43,13 +50,58 @@ jobs:
           path: |
             dist/tubetape*
 
+  docker:
+    name: Build & Push Multi-Arch Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: chet2026/tubetape
+          tags: |
+            type=raw,value=latest,enable=true
+            type=ref,event=tag
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    name: Create GitHub Release
+    needs: [build-binaries, docker]
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -58,6 +110,8 @@ jobs:
       - name: Create release and upload binaries
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GH_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           generate_release_notes: true
           files: |
             artifacts/tubetape-linux/*

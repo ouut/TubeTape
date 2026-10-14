@@ -34,13 +34,13 @@ _logger = get_logger("transcoder")
 
 @dataclass
 class TranscodeConfig:
-    crf: int = 16
-    max_resolution: tuple[int, int] = (7680, 4320)
+    crf: int = 18
+    max_resolution: tuple[int, int] = (3840, 2160)
     canvas_mode: str = "max"  # "max" (bounding box) | "first"
     ken_burns: bool = False
     image_duration: float = 3.0
-    fps: int = 60
-    preset: str = "slow"
+    fps: int = 30
+    preset: str = "fast"
 
 
 def target_resolution(
@@ -90,7 +90,7 @@ def segment_canvas(files: list[ScannedFile], config: TranscodeConfig) -> tuple[i
 
 def _scale_pad_filter(canvas_w: int, canvas_h: int) -> str:
     return (
-        f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,"
+        f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
         f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
     )
 
@@ -138,6 +138,27 @@ def build_video_clip_command(
         "-c:v", "libx264", "-preset", config.preset, "-crf", str(config.crf),
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "128k",
+        dst,
+    ]
+
+
+def build_photos_concat_command(
+    list_path: str, dst: str, canvas_w: int, canvas_h: int, config: TranscodeConfig
+) -> list[str]:
+    vf = (
+        f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,"
+        f"fps={config.fps},format=yuv420p"
+    )
+    gop = max(1, config.fps // 2)
+    return [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0", "-i", list_path,
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", config.preset, "-tune", "stillimage", "-crf", str(config.crf),
+        "-bf", "2", "-g", str(gop), "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", "128k", "-shortest",
         dst,
     ]
 
@@ -363,6 +384,22 @@ def transcode_segment(
                                 progress(len(files), len(files), files[-1])
                         return entry.path, chapters
 
+    # 0. Single-video segment: do not re-encode! Copy directly without quality loss.
+    if len(files) == 1 and files[0].type == FILE_TYPE_VIDEO:
+        src_path = os.path.abspath(files[0].abs_path)
+        if src_path != out_abs:
+            if not os.path.isfile(out_abs) or os.path.getsize(out_abs) != os.path.getsize(src_path):
+                _logger.info("single video segment: copying %s -> %s without re-encoding", src_path, out_abs)
+                shutil.copy2(src_path, out_abs)
+            else:
+                _logger.info("single video segment already present at %s, reusing", out_abs)
+        if progress is not None:
+            try:
+                progress(1, 1, files[0], True)
+            except TypeError:
+                pass
+        return out_path, chapters
+
     staging_parent = os.path.abspath(work_dir) if work_dir else out_dir
     staging_dir = os.path.join(staging_parent, f".staging_{out_base}")
     # If exact staging dir does not exist, look for any staging dir matching [sid16]
@@ -375,6 +412,89 @@ def transcode_segment(
                     _logger.info("reusing existing staging directory %s matching %s", staging_dir, sid_tag)
                     break
     os.makedirs(staging_dir, exist_ok=True)
+
+    # 2. Pure photo album fast-path using concat demuxer (single-pass encode)
+    if all(item.type == FILE_TYPE_IMAGE for item in files) and not config.ken_burns:
+        images_txt = os.path.join(staging_dir, "images.txt")
+        cum_durations: list[float] = []
+        cur_cum = 0.0
+        with open(images_txt, "w", encoding="utf-8") as handle:
+            for index, item in enumerate(files):
+                img_src = os.path.abspath(item.abs_path)
+                if os.path.splitext(item.abs_path)[1].lower() in HEIF_EXTENSIONS:
+                    img_src = os.path.join(staging_dir, f"src_{index:04d}_{item.file_id[:12]}.png")
+                    if not os.path.isfile(img_src) or os.path.getsize(img_src) == 0:
+                        _logger.info("converting HEIF image %s to PNG for ffmpeg", item.rel_path)
+                        _heif_to_png(item.abs_path, img_src)
+                dur = item.duration_seconds or config.image_duration
+                cur_cum += dur
+                cum_durations.append(cur_cum)
+                escaped = img_src.replace("'", "'\\''")
+                handle.write(f"file '{escaped}'\n")
+                handle.write(f"duration {dur}\n")
+            if files:
+                last_item = files[-1]
+                last_src = os.path.abspath(last_item.abs_path)
+                if os.path.splitext(last_item.abs_path)[1].lower() in HEIF_EXTENSIONS:
+                    last_src = os.path.join(staging_dir, f"src_{len(files)-1:04d}_{last_item.file_id[:12]}.png")
+                escaped_last = last_src.replace("'", "'\\''")
+                handle.write(f"file '{escaped_last}'\n")
+
+        tmp_out = out_abs + ".tmp.mp4"
+        if os.path.isfile(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
+
+        total_dur = cum_durations[-1] if cum_durations else 0.0
+        cmd = build_photos_concat_command(images_txt, tmp_out, canvas_w, canvas_h, config)
+
+        def _on_photos_prog(pct: float, cur_s: float, tot_s: float, fps: float, speed: str) -> None:
+            if progress is not None and files:
+                cur_idx = 0
+                for idx, c_dur in enumerate(cum_durations):
+                    if cur_s <= c_dur:
+                        cur_idx = idx
+                        break
+                else:
+                    cur_idx = len(files) - 1
+                item = files[cur_idx]
+                try:
+                    progress(
+                        cur_idx + 1,
+                        len(files),
+                        item,
+                        False,
+                        file_progress=pct,
+                        fps=fps,
+                        speed=speed,
+                    )
+                except TypeError:
+                    try:
+                        progress(cur_idx + 1, len(files), item, False)
+                    except TypeError:
+                        progress(cur_idx + 1, len(files), item)
+
+        _logger.info("rendering photo album with concat demuxer: %d photo(s) -> %s", len(files), out_path)
+        try:
+            run_ffmpeg(
+                cmd,
+                total_duration=total_dur,
+                desc=f"photos {out_base}",
+                on_progress=_on_photos_prog,
+                log_interval=10.0,
+            )
+        except TypeError as te:
+            if "unexpected keyword argument" in str(te):
+                run_ffmpeg(cmd)
+            else:
+                raise
+
+        os.replace(tmp_out, out_abs)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        _logger.info("photo album transcode complete: %s (staging cleaned up)", out_path)
+        return out_path, chapters
 
     clips: list[str] = []
     for index, item in enumerate(files):

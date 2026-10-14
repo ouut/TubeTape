@@ -46,7 +46,7 @@ class TestCommandBuilding:
         assert "scale=640:480" in joined
         assert "pad=640:480" in joined
         assert "libx264" in cmd and "yuv420p" in cmd
-        assert "aac" in cmd and "-crf" in cmd and "16" in cmd
+        assert "aac" in cmd and "-crf" in cmd and "18" in cmd
 
     def test_image_command_ken_burns(self):
         cfg = TranscodeConfig(ken_burns=True)
@@ -82,7 +82,7 @@ class TestSegmentCanvas:
             name="a.png", type=FILE_TYPE_IMAGE, size_bytes=1,
             captured_epoch=0.0, duration_seconds=3.0, resolution=None,
         )
-        assert segment_canvas([f], TranscodeConfig()) == (7680, 4320)
+        assert segment_canvas([f], TranscodeConfig()) == (3840, 2160)
 
     def _file(self, w, h):
         return ScannedFile(
@@ -121,7 +121,7 @@ class TestTranscodeSegment:
         result, chapters = transcode_segment([f], str(out), TranscodeConfig())
         assert result == str(out)
         assert out.exists()
-        assert chapters == [["0:00", "19700101-000000"]]
+        assert chapters == [["0:00", "19700101_000000"]]
         _assert_h264_aac(str(out))
 
     def test_heic_image_segment(self, tmp_path):
@@ -136,7 +136,7 @@ class TestTranscodeSegment:
         result, chapters = transcode_segment([f], str(out), TranscodeConfig())
         assert result == str(out)
         assert out.exists()
-        assert chapters == [["0:00", "19700101-000000"]]
+        assert chapters == [["0:00", "19700101_000000"]]
         _assert_h264_aac(str(out))
 
     def test_video_segment(self, tmp_path):
@@ -229,7 +229,7 @@ class TestResumableTranscoding:
 
         monkeypatch.setattr(transcoder, "run_ffmpeg", tracking_run_ffmpeg)
 
-        result, chapters = transcode_segment([f1, f2], str(out), TranscodeConfig())
+        result, chapters = transcode_segment([f1, f2], str(out), TranscodeConfig(ken_burns=True))
         assert result == str(out)
         assert out.exists()
         # staging directory should be cleaned up after successful transcode
@@ -257,7 +257,7 @@ class TestResumableTranscoding:
         tmp_clip0 = staging / f"clip_0000_{f1.file_id[:12]}.tmp.mp4"
         tmp_clip0.write_bytes(b"leftover tmp data")
 
-        result, chapters = transcode_segment([f1], str(out), TranscodeConfig())
+        result, chapters = transcode_segment([f1], str(out), TranscodeConfig(ken_burns=True))
         assert result == str(out)
         assert out.exists()
         assert out.stat().st_size > 1024
@@ -300,7 +300,7 @@ class TestResumableTranscoding:
         clip0 = old_staging / f"clip_0000_{f1.file_id[:12]}.mp4"
         transcoder.run_ffmpeg(
             transcoder.build_image_clip_command(
-                f1.abs_path, str(clip0), 64, 48, 1.0, TranscodeConfig()
+                f1.abs_path, str(clip0), 64, 48, 1.0, TranscodeConfig(ken_burns=True)
             )
         )
         assert clip0.exists() and clip0.stat().st_size > 1024
@@ -315,12 +315,61 @@ class TestResumableTranscoding:
 
         monkeypatch.setattr(transcoder, "run_ffmpeg", tracking_run)
 
-        res_path, chapters = transcode_segment([f1, f2], str(out), TranscodeConfig())
+        res_path, chapters = transcode_segment([f1, f2], str(out), TranscodeConfig(ken_burns=True))
         assert res_path == str(out)
         assert out.exists()
         # Clip 0 was reused from old_staging, only clip 1 + concat ran!
         assert len(called_cmds) == 2
         assert not any(str(clip0) in " ".join(c) for c in called_cmds)
+
+    def test_pure_photos_concat_demuxer_single_pass(self, tmp_path, monkeypatch):
+        make_png(tmp_path / "p1.png", size=(64, 48))
+        make_png(tmp_path / "p2.png", size=(64, 48))
+        f1 = ScannedFile(
+            file_id="p1", abs_path=str(tmp_path / "p1.png"), rel_path="p1.png",
+            name="p1.png", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=100.0, duration_seconds=2.0, resolution="64x48",
+        )
+        f2 = ScannedFile(
+            file_id="p2", abs_path=str(tmp_path / "p2.png"), rel_path="p2.png",
+            name="p2.png", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=102.0, duration_seconds=3.0, resolution="64x48",
+        )
+        out = tmp_path / "photos.mp4"
+        called_cmds = []
+        real_run = transcoder.run_ffmpeg
+
+        def tracking_run(cmd, *args, **kwargs):
+            called_cmds.append(cmd)
+            real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(transcoder, "run_ffmpeg", tracking_run)
+        res_path, chapters = transcode_segment([f1, f2], str(out), TranscodeConfig())
+        assert res_path == str(out)
+        assert out.exists()
+        # Pure photos must only invoke FFmpeg ONCE (single-pass concat demuxer)!
+        assert len(called_cmds) == 1
+        assert "concat" in " ".join(called_cmds[0])
+        assert "flags=lanczos" in " ".join(called_cmds[0])
+        assert "-tune stillimage" in " ".join(called_cmds[0])
+
+    def test_single_video_bypass_no_ffmpeg(self, tmp_path, monkeypatch):
+        make_video(tmp_path / "source.mov", duration=1, size="64x48")
+        f = ScannedFile(
+            file_id="v1", abs_path=str(tmp_path / "source.mov"), rel_path="source.mov",
+            name="source.mov", type=FILE_TYPE_VIDEO, size_bytes=100,
+            captured_epoch=200.0, duration_seconds=5.0, resolution="64x48",
+        )
+        out = tmp_path / "standalone.mov"
+        called_cmds = []
+        monkeypatch.setattr(transcoder, "run_ffmpeg", lambda cmd, *a, **k: called_cmds.append(cmd))
+
+        res_path, chapters = transcode_segment([f], str(out), TranscodeConfig())
+        assert res_path == str(out)
+        assert out.exists()
+        assert out.stat().st_size == (tmp_path / "source.mov").stat().st_size
+        # No ffmpeg re-encode!
+        assert len(called_cmds) == 0
 
 
 

@@ -363,7 +363,7 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
             assert res.status == 200
             data = json.loads(res.read().decode("utf-8"))
             assert "config" in data
-            assert data["config"]["crf"] == 16
+            assert data["config"]["crf"] == 18
             assert "segment_duration" in data["fingerprint_params"]
 
         # 2. POST /api/config
