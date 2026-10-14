@@ -281,6 +281,66 @@ tubetape \
 
 ---
 
+### 💡 极简实践：二进制直接放在媒体文件夹根目录运行（开箱即用 / 全默认配置）
+
+如果您从 [Releases](../../releases) 下载了对应平台的独立可执行文件（macOS / Linux 下为 `tubetape`，Windows 下为 `tubetape.exe`），可以直接**拷贝到照片/视频媒体文件夹的根目录下**（例如 `/Volumes/Untitled/bone-ash` 或 `D:\bone-ash`）。
+
+得益于 TubeTape 完备的默认缺省值（默认当前目录为输入源、同级 `tubetape.json` 数据库、同级 `client_secret.json` 凭据、20 分钟相册、300s 短视频混合打包、2.0s 误录过滤、`--encoder auto` 全自动显卡加速、8080 端口），**绝大多数参数均不需要显式书写**！
+
+#### 示例 1：纯本地转码（无网络依赖、先生成成品）
+适合无外网环境、离线挂机或希望在本地先完整生成并核对全部视频分片的场景。
+
+**macOS / Linux：**
+```bash
+# 1. 终端进入媒体根目录（tubetape 可执行文件已放置在当前目录）
+cd /Volumes/Untitled/bone-ash
+
+# 2. 赋予可执行权限（仅首次需要）
+chmod +x ./tubetape
+
+# 3. 运行纯本地转码（全自动检测硬件加速，分片保存在 ./uploaded_segments/）
+./tubetape --no-upload -v
+```
+
+**Windows：**
+```bat
+REM 1. 打开命令提示符（CMD）或 PowerShell 进入媒体根目录
+cd /d D:\bone-ash
+
+REM 2. 运行纯本地转码（全自动探测并调用 NVIDIA GTX/RTX 显卡 NVENC 硬件加速）
+tubetape.exe --no-upload -v
+```
+
+> [!TIP]
+> **外置移动硬盘 / 机械硬盘加速技巧**：如果媒体目录位于较慢的外置移动硬盘或机械硬盘上，强烈建议加上 `--segments-dir` 将输出分片指向本机的高速 SSD（例如 macOS 下 `--segments-dir ~/tubetape_segments` 或 Windows 下 `--segments-dir C:\tubetape_segments`），可大幅缩短碎片小文件 I/O 耗时！
+
+---
+
+#### 示例 2：全自动云端上传（将成品推送到 YouTube）
+当本地转码全部完成后，**去掉 `--no-upload` 直接运行**即可。系统会自动检测到本地已生成的分片，**0 秒极速跳过转码**，直接按时间线依次将视频分片逐个上传至 YouTube。
+
+**macOS / Linux：**
+```bash
+cd /Volumes/Untitled/bone-ash
+
+# 确保媒体根目录下已放置 client_secret.json
+./tubetape -v
+```
+
+**Windows：**
+```bat
+cd /d D:\bone-ash
+
+REM 确保 D:\bone-ash 目录下已放置 client_secret.json
+tubetape.exe -v
+```
+
+- 首次运行会在浏览器弹出 Google 账号一键授权（或访问 `http://localhost:8080/log` 进行授权）；
+- 触发每日 YouTube API 上传配额上限（约 50~100 部/天）时，TubeTape 会自动休眠等待并在次日继续续传，全程无需人工干预；
+- 每成功上传一个分片，系统会根据 `--keep-segments`（默认 0）自动清理本地已上传的旧分片，边传边释放磁盘空间。
+
+---
+
 ## Web 交互系统深度指南
 
 TubeTape 内置极度轻量的原生异步 HTTP 服务，无需安装任何前端 Node.js 依赖或外部 Web 服务器。
