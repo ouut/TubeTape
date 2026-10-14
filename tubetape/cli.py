@@ -16,7 +16,7 @@ from .chapters import build_segment_description, chapters_text
 from .db import SEGMENT_STATUS_SEALED, Database
 from .coordinator import AppCoordinator
 from .log import get_logger, setup_logging
-from .planner import plan
+from .planner import Segment, plan
 from .rebuild import Rebuilder
 from .reconcile import embed_segment_id, fetch_remote_index
 from .scanner import FILE_TYPE_VIDEO, ScannedFile, ScanResult, scan
@@ -608,10 +608,40 @@ def _run_pipeline_impl(
 
     # Real run: transcode each new/rebuild segment, then upload.
 
+    # Identify any sealed segments in the database that have not yet been uploaded
+    # to YouTube (e.g. transcoded previously under --no-upload, or pending retry).
+    # If upload is enabled (uploader is present), queue them for uploading!
+    segments_to_process = list(plan_result.segments)
+    if uploader is not None:
+        unuploaded_segs = []
+        for sid, srec in db.segments.items():
+            if srec.get("status") == SEGMENT_STATUS_SEALED and not srec.get("youtube_video_id"):
+                file_ids = srec.get("file_ids", [])
+                rng = srec.get("range") or ["", ""]
+                unuploaded_segs.append(
+                    Segment(
+                        file_ids=file_ids,
+                        start_ts=rng[0] if len(rng) > 0 else "",
+                        end_ts=rng[1] if len(rng) > 1 else "",
+                        duration_seconds=float(srec.get("duration_seconds", 0.0)),
+                        segment_id=sid,
+                        title=srec.get("title") or sid[:16],
+                    )
+                )
+        if unuploaded_segs:
+            unuploaded_segs.sort(key=lambda s: (s.start_ts, s.title))
+            _log.info(
+                "found %d previously sealed segment(s) not yet uploaded to YouTube; queuing for upload",
+                len(unuploaded_segs),
+            )
+            reporter.status(f"found {len(unuploaded_segs)} unuploaded segment(s) in database; queuing for upload")
+            segments_to_process = unuploaded_segs + segments_to_process
+            web.set_web_planned_segments(segments_to_process)
+
     # Reconcile against YouTube so a lost local database does not re-upload
     # everything: only list when there is actually something to upload.
     remote_index: dict[str, str] = {}
-    if plan_result.segments and uploader is not None:
+    if segments_to_process and uploader is not None:
         reporter.status("listing existing uploads on YouTube ...")
         remote_index = fetch_remote_index(uploader.service)
         if remote_index:
@@ -630,8 +660,8 @@ def _run_pipeline_impl(
     segments_dir = getattr(args, "segments_dir", None) or os.path.join(os.path.dirname(args.db), "uploaded_segments")
     os.makedirs(segments_dir, exist_ok=True)
 
-    total_segments = len(plan_result.segments)
-    for index, segment in enumerate(plan_result.segments, start=1):
+    total_segments = len(segments_to_process)
+    for index, segment in enumerate(segments_to_process, start=1):
         segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
         is_single_vid = len(segment_files) == 1 and segment_files[0].type == FILE_TYPE_VIDEO
         if is_single_vid:
@@ -771,7 +801,8 @@ def _run_pipeline_impl(
                     if segment.replaces_segment_id:
                         db.segments.pop(segment.replaces_segment_id, None)
 
-                rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
+                if not is_no_upload:
+                    rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
                 web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
             else:
                 _, chapters = transcode_fn(segment_files)
@@ -795,7 +826,8 @@ def _run_pipeline_impl(
                     reporter.status(f"transcoded {segment.title} (saved locally to {out_path})")
                     _log.info("sealed segment %s locally (no-upload)", segment.segment_id)
 
-                saved_out_path = out_path if getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path) else None
+                saved_out_path = out_path if (is_no_upload or (getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path))) else None
+                srec = db.segments.get(segment.segment_id, {})
                 db.upsert_segment(
                     segment.segment_id,
                     {
@@ -805,15 +837,16 @@ def _run_pipeline_impl(
                         "duration_seconds": segment.duration_seconds,
                         "output_path": saved_out_path,
                         "youtube_video_id": video_id,
-                        "previous_video_ids": [],
+                        "previous_video_ids": srec.get("previous_video_ids", []),
                         "status": SEGMENT_STATUS_SEALED,
-                        "chapters": chapters,
-                        "last_rebuilt_at": None,
-                        "attempts": 0,
+                        "chapters": chapters if chapters else srec.get("chapters", []),
+                        "last_rebuilt_at": srec.get("last_rebuilt_at"),
+                        "attempts": srec.get("attempts", 0),
                         "error": None,
                     },
                 )
-                rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
+                if not is_no_upload:
+                    rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
                 web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
         except QuotaExceededError as exc:
             reporter.status(
@@ -837,7 +870,7 @@ def _run_pipeline_impl(
     web.set_web_status("watching" if args.watch else "done", "常驻监听中" if args.watch else "已完成")
     _log.info(
         "pipeline done: %d segment(s) processed, %d pending",
-        len(plan_result.segments),
+        len(segments_to_process),
         len(plan_result.pending_files),
     )
     reporter.status("done")

@@ -445,6 +445,65 @@ class TestKeepSegments:
         assert seg["output_path"] is not None
         assert os.path.isfile(seg["output_path"])
 
+    def test_run_pipeline_upload_previously_sealed_no_upload_segments(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+        from conftest import make_png
+        from tubetape import cli
+        from tubetape.db import Database
+
+        make_png(tmp_path / "img1.png", size=(10, 10))
+        db_path = tmp_path / "db.json"
+        segments_dir = tmp_path / "segs"
+        segments_dir.mkdir()
+
+        # Step 1: transcode with --no-upload
+        def fake_transcode(files, out_path, config, progress=None):
+            with open(out_path, "wb") as f:
+                f.write(b"dummy-mp4-content-already-transcoded")
+            return out_path, [["0:00", "Start"]]
+
+        monkeypatch.setattr(cli, "transcode_segment", fake_transcode)
+
+        rc1 = cli.main(
+            [
+                "--no-upload",
+                "--no-watch",
+                "--flush",
+                "--input", str(tmp_path),
+                "--db", str(db_path),
+                "--segments-dir", str(segments_dir),
+                "--segment-duration", "20s",
+            ]
+        )
+        assert rc1 == 0
+        db1 = Database.load(str(db_path))
+        assert len(db1.segments) == 1
+        sid = list(db1.segments.keys())[0]
+        assert db1.segments[sid]["youtube_video_id"] is None
+
+        # Step 2: run again without --no-upload, mock uploader
+        mock_uploader = MagicMock()
+        mock_uploader.service = MagicMock()
+        mock_uploader.upload.return_value = "yt_test_video_123"
+
+        monkeypatch.setattr(cli, "_build_uploader", lambda args, db: mock_uploader)
+        monkeypatch.setattr(cli, "fetch_remote_index", lambda s: {})
+
+        rc2 = cli.main(
+            [
+                "--no-watch",
+                "--flush",
+                "--input", str(tmp_path),
+                "--db", str(db_path),
+                "--segments-dir", str(segments_dir),
+                "--segment-duration", "20s",
+            ]
+        )
+        assert rc2 == 0
+        assert mock_uploader.upload.called
+        db2 = Database.load(str(db_path))
+        assert db2.segments[sid]["youtube_video_id"] == "yt_test_video_123"
+
     def test_run_pipeline_auto_skip_scan_when_paths_match(self, tmp_path, monkeypatch):
         from tubetape import cli
         from tubetape.db import Database
