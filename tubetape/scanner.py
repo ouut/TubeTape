@@ -655,17 +655,27 @@ def normalize_rel_path(path: str, input_dir: str = "") -> str:
     return norm.lstrip("./")
 
 
-def collect_media_files(input_dir: str) -> list[tuple[str, str, str, str]]:
+def collect_media_files(
+    input_dir: str,
+    exclude_dirs: set[str] | list[str] | None = None,
+) -> list[tuple[str, str, str, str]]:
     """Recursively collect (abs_path, rel_path, name, ftype) for all supported media files."""
     input_dir = os.path.abspath(input_dir)
     candidates: list[tuple[str, str, str, str]] = []
+    normalized_excludes = {
+        os.path.abspath(d) for d in (exclude_dirs or []) if d
+    }
     for root, dirs, names in os.walk(input_dir):
         # Skip hidden files/dirs: the transcode output is a dotfile written
         # next to the db, and must not be re-scanned as media.
-        # Also skip NAS metadata dirs like Synology @eaDir.
+        # Also skip NAS metadata dirs like Synology @eaDir, and segment output directories.
         dirs[:] = [
             d for d in dirs
-            if not d.startswith(".") and d != "@eaDir" and not d.startswith("@")
+            if not d.startswith(".")
+            and d != "@eaDir"
+            and not d.startswith("@")
+            and d != "uploaded_segments"
+            and os.path.abspath(os.path.join(root, d)) not in normalized_excludes
         ]
         for name in sorted(names):
             if name.startswith("."):
@@ -837,6 +847,7 @@ def scan(
     only_camera_photos: bool = False,
     only_phone_videos: bool = False,
     force_scan: bool = False,
+    segments_dir: str | None = None,
     on_file: Callable[[ScannedFile], None] | None = None,
     on_progress: Callable[[int, int, ScannedFile, str, int], None] | None = None,
 ) -> ScanResult:
@@ -848,7 +859,10 @@ def scan(
       and retains unchanged files directly from database without re-reading them.
     """
     input_dir = os.path.abspath(input_dir)
-    candidates = collect_media_files(input_dir)
+    candidates = collect_media_files(
+        input_dir,
+        exclude_dirs=[segments_dir] if segments_dir else None,
+    )
     disk_paths = {normalize_rel_path(c[1], input_dir) for c in candidates}
     candidate_map = {normalize_rel_path(c[1], input_dir): c for c in candidates}
 

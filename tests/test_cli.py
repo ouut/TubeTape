@@ -19,7 +19,7 @@ class TestDefaults:
         assert args.image_duration == 3.0
         assert args.input == os.path.abspath(".")
         assert args.db == os.path.join(os.path.abspath("."), "tubetape.json")
-        assert args.segment_duration == 3600.0
+        assert args.segment_duration == 1200.0
         assert args.crf == 18
         assert args.max_resolution == (3840, 2160)
         assert args.canvas_mode == "max"
@@ -32,8 +32,12 @@ class TestDefaults:
         assert args.dry_run is False
         assert args.mtime_interval == 600.0
         assert args.quota_backoff == 3600.0
-        assert args.timezone is not None
+        assert str(args.timezone) == "Asia/Shanghai"
         assert args.web_port == 8080
+        assert args.segments_dir == os.path.join(os.path.abspath("."), "uploaded_segments")
+        assert args.short_video_threshold == 300.0
+        assert args.min_video_duration == 2.0
+        assert args.ignore_live_photos is True
 
     def test_db_default_joins_input(self, tmp_path):
         args = _parse("--input", str(tmp_path))
@@ -77,6 +81,22 @@ class TestExplicitValues:
         args = _parse("--timezone", "Asia/Shanghai")
         assert isinstance(args.timezone, ZoneInfo)
         assert args.timezone.key == "Asia/Shanghai"
+
+    def test_port_and_segments_dir(self, tmp_path):
+        custom_out = tmp_path / "custom_out"
+        args = _parse("--port", "9090", "--segments-dir", str(custom_out))
+        assert args.web_port == 9090
+        assert args.segments_dir == str(custom_out)
+
+    def test_short_video_and_live_photo_flags(self):
+        args = _parse(
+            "--short-video-threshold", "2m",
+            "--min-video-duration", "1.5s",
+            "--no-ignore-live-photos",
+        )
+        assert args.short_video_threshold == 120.0
+        assert args.min_video_duration == 1.5
+        assert args.ignore_live_photos is False
 
 
 class TestInvalidValues:

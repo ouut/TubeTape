@@ -60,18 +60,41 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"JSON database path (default: <input>/{_DEFAULT_DB_NAME})",
     )
     parser.add_argument(
+        "-s",
         "--segment-duration",
         type=durations.parse_duration,
-        default="1200s",
-        help="max duration per uploaded video; supports 1h / 3600s / 1:00:00 "
-        "(default: 1200s)",
+        default="20m",
+        help="max duration per uploaded video; supports 20m / 1h / 1200s / 1:00:00 "
+        "(default: 20m)",
+    )
+    parser.add_argument(
+        "--short-video-threshold",
+        type=durations.parse_duration,
+        default="300s",
+        help="videos shorter than or equal to this threshold are packed into the mixed "
+        "media stream alongside photos up to --segment-duration; videos longer than "
+        "this threshold are uploaded standalone (default: 300s / 5m; 0 to disable)",
+    )
+    parser.add_argument(
+        "--min-video-duration",
+        type=durations.parse_duration,
+        default="2s",
+        help="minimum video duration to include; videos shorter than this (e.g. accidental "
+        "micro-clips) are skipped (default: 2s; 0 to disable)",
+    )
+    parser.add_argument(
+        "--ignore-live-photos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="skip Apple Live Photo companion videos (<=3.5s videos sharing stem and folder with an image) "
+        "(default: True; use --no-ignore-live-photos to disable)",
     )
     parser.add_argument(
         "--timezone",
         type=durations.parse_timezone,
-        default=None,
+        default="Asia/Shanghai",
         help="timezone used to interpret timezone-less EXIF times "
-        "(default: system local)",
+        "(default: Asia/Shanghai)",
     )
     parser.add_argument(
         "--crf",
@@ -202,10 +225,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to client_secret.json for --login (default: <db dir>/client_secret.json)",
     )
     parser.add_argument(
+        "-p",
+        "--port",
         "--web-port",
+        dest="web_port",
         type=int,
         default=8080,
         help="port for the web live log and status console (default: 8080, 0 to disable)",
+    )
+    parser.add_argument(
+        "--segments-dir",
+        default=None,
+        help="directory where transcoded segment videos are written (default: <db dir>/uploaded_segments)",
     )
     parser.add_argument(
         "--keep-segments",
@@ -240,7 +271,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.db = os.path.abspath(args.db)
 
     if args.timezone is None:
-        args.timezone = durations.system_local_timezone()
+        args.timezone = durations.parse_timezone("Asia/Shanghai")
+
+    if getattr(args, "segments_dir", None):
+        args.segments_dir = os.path.abspath(args.segments_dir)
+    else:
+        args.segments_dir = os.path.join(os.path.dirname(args.db), "uploaded_segments")
 
     if args.crf < 0:
         parser.error("--crf must be >= 0")
@@ -275,6 +311,9 @@ def _segment_params(args: argparse.Namespace) -> tuple:
         args.canvas_mode,
         args.fps,
         args.x264_preset,
+        getattr(args, "short_video_threshold", 300.0),
+        getattr(args, "ignore_live_photos", True),
+        getattr(args, "min_video_duration", 2.0),
     )
 
 
@@ -406,8 +445,11 @@ def _run_pipeline_impl(
 
     # If this is a real run (not dry-run and not no-upload), ensure YouTube uploader credentials
     # early so any OAuth authorization prompts or web waits happen up-front.
+    coordinator = getattr(args, "_coordinator", None) or web.get_app_coordinator()
     uploader = None
-    if not args.dry_run and not getattr(args, "no_upload", False):
+    if coordinator and coordinator.uploader is not None:
+        uploader = coordinator.uploader
+    elif not args.dry_run and not getattr(args, "no_upload", False):
         uploader = _build_uploader(args, db)
         if uploader is None:
             reporter.status("no YouTube credentials; set TUBETAPE_TOKEN or token.json")
@@ -416,7 +458,6 @@ def _run_pipeline_impl(
             _log.info("database saved to %s", db.path)
             return _EXIT_ERROR
 
-    coordinator = getattr(args, "_coordinator", None) or web.get_app_coordinator()
     if coordinator:
         coordinator.db = db
         if uploader is not None:
@@ -451,6 +492,7 @@ def _run_pipeline_impl(
         only_camera_photos=args.only_camera_photos,
         only_phone_videos=args.only_phone_videos,
         force_scan=is_force_scan,
+        segments_dir=getattr(args, "segments_dir", None),
         on_file=on_file,
         on_progress=_scan_progress,
     )
@@ -499,6 +541,9 @@ def _run_pipeline_impl(
         args.segment_duration,
         params=_segment_params(args),
         flush=args.flush,
+        short_video_threshold=getattr(args, "short_video_threshold", 300.0),
+        ignore_live_photos=getattr(args, "ignore_live_photos", True),
+        min_video_duration=getattr(args, "min_video_duration", 2.0),
     )
     web.set_web_planned_segments(plan_result.segments)
     _log.info(
@@ -582,7 +627,7 @@ def _run_pipeline_impl(
         preset=args.x264_preset,
     )
 
-    segments_dir = os.path.join(os.path.dirname(args.db), "uploaded_segments")
+    segments_dir = getattr(args, "segments_dir", None) or os.path.join(os.path.dirname(args.db), "uploaded_segments")
     os.makedirs(segments_dir, exist_ok=True)
 
     total_segments = len(plan_result.segments)

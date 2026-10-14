@@ -383,6 +383,21 @@ class TestScanReconcile:
         assert "normal.png" in names
         assert "thumb.png" not in names
 
+    def test_uploaded_segments_and_exclude_dirs_ignored(self, tmp_path):
+        make_png(tmp_path / "normal.png", size=(10, 10))
+        seg_dir = tmp_path / "uploaded_segments"
+        seg_dir.mkdir()
+        (seg_dir / "seg1.mp4").write_bytes(b"dummy_mp4")
+        custom_out = tmp_path / "custom_out"
+        custom_out.mkdir()
+        (custom_out / "seg2.mp4").write_bytes(b"dummy_mp4")
+
+        candidates = scanner.collect_media_files(str(tmp_path), exclude_dirs=[str(custom_out)])
+        names = [c[2] for c in candidates]
+        assert "normal.png" in names
+        assert "seg1.mp4" not in names
+        assert "seg2.mp4" not in names
+
     def test_scan_on_progress_incremental(self, tmp_path):
         make_png(tmp_path / "exist.png", size=(10, 10))
         make_png(tmp_path / "new1.png", size=(20, 20))

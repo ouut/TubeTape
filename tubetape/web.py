@@ -420,10 +420,22 @@ def _collect_segments() -> dict[str, dict]:
             if seg_dur is None and db and getattr(db, "config", None):
                 seg_dur = db.config.get("segment_duration")
             if seg_dur is None:
-                seg_dur = 3600.0
+                seg_dur = 1200.0
             seg_dur = float(seg_dur)
             params = coord.segment_params() if coord else ()
-            plan_res = plan(scanned_files, getattr(db, "segments", {}), seg_dur, params=params, flush=True)
+            short_th = getattr(coord.args, "short_video_threshold", 300.0) if coord and getattr(coord, "args", None) else 300.0
+            ign_lp = getattr(coord.args, "ignore_live_photos", True) if coord and getattr(coord, "args", None) else True
+            min_vd = getattr(coord.args, "min_video_duration", 2.0) if coord and getattr(coord, "args", None) else 2.0
+            plan_res = plan(
+                scanned_files,
+                getattr(db, "segments", {}),
+                seg_dur,
+                params=params,
+                flush=True,
+                short_video_threshold=short_th,
+                ignore_live_photos=ign_lp,
+                min_video_duration=min_vd,
+            )
             for seg in plan_res.segments:
                 sid = seg.segment_id
                 if sid not in segments_dict:
@@ -3149,16 +3161,18 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 from .coordinator import FINGERPRINT_PARAMS
                 self._send_json(200, {
                     "config": {
-                        "segment_duration": 3600.0,
+                        "segment_duration": 1200.0,
+                        "segments_dir": "uploaded_segments",
+                        "web_port": 8080,
                         "keep_segments": _server_state.get("keep_segments", 0),
                         "no_upload": False,
                         "force_scan": False,
                         "image_duration": 3.0,
-                        "crf": 16,
-                        "max_resolution": "7680x4320",
+                        "crf": 18,
+                        "max_resolution": "3840x2160",
                         "canvas_mode": "max",
-                        "fps": 60,
-                        "x264_preset": "slow",
+                        "fps": 30,
+                        "x264_preset": "fast",
                         "ken_burns": False,
                         "privacy": "private",
                         "playlist": "",
@@ -3168,6 +3182,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
                         "poll_interval": 30.0,
                         "mtime_interval": 600.0,
                         "quota_backoff": 3600.0,
+                        "short_video_threshold": 300.0,
+                        "ignore_live_photos": True,
+                        "min_video_duration": 2.0,
                     },
                     "fingerprint_params": list(FINGERPRINT_PARAMS),
                 })

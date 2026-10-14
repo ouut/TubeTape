@@ -13,6 +13,7 @@ changes produce a new ID, which is what triggers re-transcode/re-upload.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -22,6 +23,11 @@ from .scanner import FILE_TYPE_VIDEO, ScannedFile, format_iso_utc, parse_iso_utc
 _logger = get_logger("planner")
 
 _DISPLAY_TS_FORMAT = "%Y%m%d_%H%M%S"
+
+DEFAULT_SHORT_VIDEO_THRESHOLD = 300.0  # 5 minutes
+DEFAULT_IGNORE_LIVE_PHOTOS = True
+DEFAULT_MIN_VIDEO_DURATION = 2.0  # filter accidental micro clips
+DEFAULT_LIVE_PHOTO_MAX_DURATION = 3.5  # Apple Live Photo companion .mov length
 
 
 def display_ts(epoch: float) -> str:
@@ -104,21 +110,91 @@ def _make_segment(
     )
 
 
-def greedy_pack(files: list[ScannedFile], segment_duration: float) -> list[list[ScannedFile]]:
+def find_live_photo_video_ids(
+    files: list[ScannedFile], max_duration: float = DEFAULT_LIVE_PHOTO_MAX_DURATION
+) -> set[str]:
+    """Identify Apple Live Photo companion video files.
+
+    A companion video is a video with duration <= max_duration (typically 1.5s - 3.5s)
+    that shares the same directory and base stem (name without extension) with an image.
+    """
+    dir_stem_map: dict[tuple[str, str], dict[str, list]] = {}
+    for f in files:
+        path_str = f.rel_path or f.name or f.abs_path
+        d = os.path.dirname(path_str)
+        stem = os.path.splitext(os.path.basename(path_str))[0].lower()
+        key = (d, stem)
+        if key not in dir_stem_map:
+            dir_stem_map[key] = {"has_image": False, "videos": []}
+        if f.type != FILE_TYPE_VIDEO:
+            dir_stem_map[key]["has_image"] = True
+        else:
+            dir_stem_map[key]["videos"].append(f)
+
+    live_ids: set[str] = set()
+    for key, group in dir_stem_map.items():
+        if group["has_image"]:
+            for v in group["videos"]:
+                dur = v.duration_seconds or 0.0
+                if dur <= max_duration:
+                    live_ids.add(v.file_id)
+    return live_ids
+
+
+def greedy_pack(
+    files: list[ScannedFile],
+    segment_duration: float,
+    short_video_threshold: float = DEFAULT_SHORT_VIDEO_THRESHOLD,
+    ignore_live_photos: bool = DEFAULT_IGNORE_LIVE_PHOTOS,
+    min_video_duration: float = DEFAULT_MIN_VIDEO_DURATION,
+    live_photo_ids: set[str] | None = None,
+) -> list[list[ScannedFile]]:
     """Greedily pack capture-time-sorted files into segments.
 
-    Each segment accumulates content duration up to ``segment_duration``. A
-    video file is always packed standalone into its own segment (untranscoded).
-    A single file longer than the limit is never split: it closes the current
-    segment and becomes its own (oversized) segment.
+    Each segment accumulates content duration up to ``segment_duration``.
+    Short videos (<= short_video_threshold) and images are packed together
+    into mixed segments.
+    Videos longer than ``short_video_threshold`` are emitted as standalone segments
+    without interrupting the photo/short-video stream.
+    If ``ignore_live_photos`` is True, Live Photo companion videos are omitted.
+    If ``min_video_duration`` > 0, videos shorter than that duration are skipped.
     """
     ordered = sorted(files, key=_sort_key)
+    if live_photo_ids is None and ignore_live_photos:
+        live_photo_ids = find_live_photo_video_ids(files)
+
     segments: list[list[ScannedFile]] = []
     current: list[ScannedFile] = []
     current_duration = 0.0
 
     for item in ordered:
         if item.type == FILE_TYPE_VIDEO:
+            # 1. Skip Live Photo companion videos
+            if ignore_live_photos and live_photo_ids and item.file_id in live_photo_ids:
+                _logger.debug("skipping live photo companion video: %s", item.name)
+                continue
+
+            dur = item.duration_seconds or 0.0
+            # 2. Skip micro-videos shorter than min_video_duration
+            if min_video_duration > 0 and dur < min_video_duration:
+                _logger.debug("skipping micro-video shorter than %.1fs: %s (%.2fs)", min_video_duration, item.name, dur)
+                continue
+
+            # 3. Check if video exceeds short_video_threshold
+            if dur > short_video_threshold:
+                # Standalone long video: emitted directly as its own segment.
+                # Does NOT interrupt or reset current accumulating stream!
+                segments.append([item])
+                continue
+
+            # Packable short video
+            item_duration = dur
+        else:
+            item_duration = item.duration_seconds or 3.0
+
+        # Oversized packable item: if a single item > segment_duration,
+        # it forms its own oversized segment
+        if item_duration > segment_duration:
             if current:
                 segments.append(current)
                 current = []
@@ -126,20 +202,12 @@ def greedy_pack(files: list[ScannedFile], segment_duration: float) -> list[list[
             segments.append([item])
             continue
 
-        duration = item.duration_seconds or 0.0
-        if duration > segment_duration:
-            if current:
-                segments.append(current)
-                current = []
-                current_duration = 0.0
-            segments.append([item])
-            continue
-        if current and current_duration + duration > segment_duration:
+        if current and current_duration + item_duration > segment_duration:
             segments.append(current)
             current = []
             current_duration = 0.0
         current.append(item)
-        current_duration += duration
+        current_duration += item_duration
 
     if current:
         segments.append(current)
@@ -165,6 +233,9 @@ def plan(
     segment_duration: float,
     params: tuple = (),
     flush: bool = False,
+    short_video_threshold: float = DEFAULT_SHORT_VIDEO_THRESHOLD,
+    ignore_live_photos: bool = DEFAULT_IGNORE_LIVE_PHOTOS,
+    min_video_duration: float = DEFAULT_MIN_VIDEO_DURATION,
 ) -> Plan:
     """Compute the segment plan.
 
@@ -174,10 +245,10 @@ def plan(
 
     New files:
     - Files with captured_epoch >= max_sealed_epoch (or all files if no sealed segments exist)
-      are 'tail' files: greedily packed up to segment_duration, with the trailing partial group
-      held as pending (unless flush=True).
+       are 'tail' files: greedily packed up to segment_duration, with the trailing partial group
+       held as pending (unless flush=True).
     - Other files (historical files with captured_epoch < max_sealed_epoch, or undated files)
-      are packed into new independent segments and sealed immediately.
+       are packed into new independent segments and sealed immediately.
     """
     result = Plan()
     known_ids = set(existing_segments.keys())
@@ -209,10 +280,20 @@ def plan(
     if not unassigned:
         return result
 
+    # Find Live Photo IDs across all files in library
+    live_photo_ids = find_live_photo_video_ids(files) if ignore_live_photos else set()
+
     if max_sealed_epoch is None:
         # First run / no existing sealed segments with timestamps: pack everything
         ordered = sorted(unassigned, key=_sort_key)
-        groups = greedy_pack(ordered, segment_duration)
+        groups = greedy_pack(
+            ordered,
+            segment_duration,
+            short_video_threshold=short_video_threshold,
+            ignore_live_photos=ignore_live_photos,
+            min_video_duration=min_video_duration,
+            live_photo_ids=live_photo_ids,
+        )
         if groups and not flush and _is_partial(groups[-1], segment_duration):
             result.pending_files = groups.pop()
             _logger.info(
@@ -233,6 +314,7 @@ def plan(
                     len(seg.file_ids),
                     seg.duration_seconds,
                 )
+        result.segments.sort(key=lambda s: s.start_ts)
         return result
 
     # Later runs: split unassigned into tail and history files
@@ -248,7 +330,14 @@ def plan(
     # 1. History files (old or undated photos added after segments already exist)
     if history_files:
         history_ordered = sorted(history_files, key=_sort_key)
-        history_groups = greedy_pack(history_ordered, segment_duration)
+        history_groups = greedy_pack(
+            history_ordered,
+            segment_duration,
+            short_video_threshold=short_video_threshold,
+            ignore_live_photos=ignore_live_photos,
+            min_video_duration=min_video_duration,
+            live_photo_ids=live_photo_ids,
+        )
         for group in history_groups:
             seg = _make_segment(group, params)
             if seg.segment_id not in known_ids:
@@ -265,7 +354,14 @@ def plan(
     # 2. Tail files (newest photos >= max_sealed_epoch)
     if tail_files:
         tail_ordered = sorted(tail_files, key=_sort_key)
-        tail_groups = greedy_pack(tail_ordered, segment_duration)
+        tail_groups = greedy_pack(
+            tail_ordered,
+            segment_duration,
+            short_video_threshold=short_video_threshold,
+            ignore_live_photos=ignore_live_photos,
+            min_video_duration=min_video_duration,
+            live_photo_ids=live_photo_ids,
+        )
         if tail_groups and not flush and _is_partial(tail_groups[-1], segment_duration):
             result.pending_files = tail_groups.pop()
             _logger.info(
@@ -286,4 +382,6 @@ def plan(
                     seg.duration_seconds,
                 )
 
+    result.segments.sort(key=lambda s: s.start_ts)
     return result
+

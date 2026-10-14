@@ -33,6 +33,9 @@ FINGERPRINT_PARAMS = frozenset([
     "fps",
     "x264_preset",
     "ken_burns",
+    "short_video_threshold",
+    "ignore_live_photos",
+    "min_video_duration",
 ])
 
 
@@ -85,9 +88,8 @@ class AppCoordinator:
         self.current_task: str | None = None
         self._db_path = getattr(args, "db", None)
         self.segments_dir = (
-            os.path.join(os.path.dirname(args.db), "uploaded_segments")
-            if getattr(args, "db", None)
-            else "uploaded_segments"
+            getattr(args, "segments_dir", None)
+            or (os.path.join(os.path.dirname(args.db), "uploaded_segments") if getattr(args, "db", None) else "uploaded_segments")
         )
         os.makedirs(self.segments_dir, exist_ok=True)
 
@@ -126,6 +128,7 @@ class AppCoordinator:
 
         try:
             cfg = self.get_config()["config"]
+            cfg["force_scan"] = False  # never persist force_scan across restarts
             self.db.config = cfg
             self.db.save()
             # Clean up legacy config.json if present
@@ -151,7 +154,9 @@ class AppCoordinator:
         )
         return {
             "config": {
-                "segment_duration": float(getattr(a, "segment_duration", 3600.0)),
+                "segment_duration": float(getattr(a, "segment_duration", 1200.0)),
+                "segments_dir": str(getattr(a, "segments_dir", None) or self.segments_dir),
+                "web_port": int(getattr(a, "web_port", 8080)),
                 "keep_segments": int(getattr(a, "keep_segments", 0)),
                 "no_upload": bool(getattr(a, "no_upload", False)),
                 "force_scan": bool(getattr(a, "force_scan", False)),
@@ -170,12 +175,15 @@ class AppCoordinator:
                 "poll_interval": float(getattr(a, "poll_interval", 30.0)),
                 "mtime_interval": float(getattr(a, "mtime_interval", 600.0)),
                 "quota_backoff": float(getattr(a, "quota_backoff", 3600.0)),
+                "short_video_threshold": float(getattr(a, "short_video_threshold", 300.0)),
+                "ignore_live_photos": bool(getattr(a, "ignore_live_photos", True)),
+                "min_video_duration": float(getattr(a, "min_video_duration", 2.0)),
             },
             "fingerprint_params": list(FINGERPRINT_PARAMS),
         }
 
     def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
-        """Validate, apply, and persist configuration updates."""
+        """Validate, apply, and persist configuration updates, then restart pipeline."""
         self._apply_dict_to_args(updates)
         self.save_config()
 
@@ -186,7 +194,32 @@ class AppCoordinator:
             web._server_state["keep_segments"] = self.args.keep_segments
             rotate_uploaded_segments(self.segments_dir, self.args.keep_segments)
 
+        self.restart_pipeline()
         return self.get_config()
+
+    def restart_pipeline(self) -> tuple[bool, str]:
+        """Re-run pipeline in background with updated configuration."""
+        if not self.task_lock.acquire(blocking=False):
+            return False, f"已有任务正在运行中 ({self.current_task})，新配置已落盘，待当前任务结束后生效"
+
+        self.current_task = "应用新配置并重新构建"
+
+        def _worker():
+            from . import cli, web
+
+            try:
+                _logger.info("re-running pipeline with updated configuration")
+                web.set_web_status("scanning", "配置已更新，正在按新配置重新核对并运行...")
+                cli.run_pipeline(self.args, force_scan=False)
+            except Exception as exc:
+                _logger.error("pipeline re-run failed: %s", exc, exc_info=True)
+                web.set_web_status("error", f"重新运行出错: {exc}")
+            finally:
+                self.current_task = None
+                self.task_lock.release()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True, "已按照新配置重新启动流水线"
 
     def _apply_dict_to_args(self, updates: dict[str, Any]) -> None:
         a = self.args
@@ -198,6 +231,13 @@ class AppCoordinator:
                 if val <= 0:
                     raise ValueError("segment_duration 必须大于 0")
                 a.segment_duration = val
+            elif k in ("web_port", "port"):
+                a.web_port = int(v)
+            elif k == "segments_dir":
+                if v and str(v).strip():
+                    a.segments_dir = os.path.abspath(str(v).strip())
+                    self.segments_dir = a.segments_dir
+                    os.makedirs(self.segments_dir, exist_ok=True)
             elif k == "image_duration":
                 val = float(v)
                 if val <= 0:
@@ -252,6 +292,18 @@ class AppCoordinator:
             elif k in ("quiet_period", "poll_interval", "mtime_interval", "quota_backoff"):
                 val = durations.parse_duration(v) if isinstance(v, str) else float(v)
                 setattr(a, k, val)
+            elif k == "short_video_threshold":
+                val = durations.parse_duration(v) if isinstance(v, str) else float(v)
+                if val < 0:
+                    raise ValueError("short_video_threshold 不能为负数")
+                a.short_video_threshold = val
+            elif k == "min_video_duration":
+                val = durations.parse_duration(v) if isinstance(v, str) else float(v)
+                if val < 0:
+                    raise ValueError("min_video_duration 不能为负数")
+                a.min_video_duration = val
+            elif k == "ignore_live_photos":
+                a.ignore_live_photos = bool(v)
 
     def is_task_running(self) -> bool:
         return self.current_task is not None
@@ -266,6 +318,9 @@ class AppCoordinator:
             a.canvas_mode,
             a.fps,
             a.x264_preset,
+            getattr(a, "short_video_threshold", 300.0),
+            getattr(a, "ignore_live_photos", True),
+            getattr(a, "min_video_duration", 2.0),
         )
 
     def find_local_segment_file(self, segment_id: str, title: str | None = None) -> str | None:

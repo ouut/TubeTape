@@ -69,14 +69,69 @@ class TestGreedyPack:
         groups = greedy_pack(files, 20)
         assert [f.file_id for f in groups[0]] == ["earlier", "later"]
 
-    def test_video_file_standalone(self):
+    def test_video_file_standalone_when_threshold_zero(self):
         files = [
             sf("img1", 100, 3, ftype="image"),
             sf("vid1", 101, 10, ftype="video"),
             sf("img2", 102, 3, ftype="image"),
         ]
-        groups = greedy_pack(files, 30)
-        assert [[f.file_id for f in g] for g in groups] == [["img1"], ["vid1"], ["img2"]]
+        groups = greedy_pack(files, 30, short_video_threshold=0.0)
+        # Even with threshold=0 (all videos standalone), the photo stream is decoupled
+        # and not chopped into 1-photo fragments by the video!
+        assert [[f.file_id for f in g] for g in groups] == [["vid1"], ["img1", "img2"]]
+
+    def test_short_video_packed_with_images(self):
+        files = [
+            sf("img1", 100, 3, ftype="image"),
+            sf("vid1", 101, 10, ftype="video"),
+            sf("img2", 102, 3, ftype="image"),
+        ]
+        groups = greedy_pack(files, 30, short_video_threshold=300.0)
+        assert [[f.file_id for f in g] for g in groups] == [["img1", "vid1", "img2"]]
+
+    def test_long_video_decoupled_stream(self):
+        files = [
+            sf("img1", 100, 3, ftype="image"),
+            sf("vid_long", 101, 500, ftype="video"),
+            sf("img2", 102, 3, ftype="image"),
+        ]
+        groups = greedy_pack(files, 30, short_video_threshold=300.0)
+        # vid_long emitted standalone without breaking img1 and img2 accumulation
+        assert [[f.file_id for f in g] for g in groups] == [["vid_long"], ["img1", "img2"]]
+
+    def test_ignore_live_photos(self):
+        def sf_path(fid, epoch, dur, ftype, rel_path):
+            f = sf(fid, epoch, dur, ftype=ftype)
+            f.rel_path = rel_path
+            f.abs_path = f"/data/{rel_path}"
+            return f
+
+        files = [
+            sf_path("img1", 100, 3, "image", "2024/IMG_0001.JPG"),
+            sf_path("mov1", 100, 2.5, "video", "2024/IMG_0001.MOV"),
+            sf_path("img2", 102, 3, "image", "2024/IMG_0002.JPG"),
+        ]
+        # With ignore_live_photos=True: companion mov1 is skipped
+        groups_ignore = greedy_pack(files, 30, ignore_live_photos=True)
+        assert [[f.file_id for f in g] for g in groups_ignore] == [["img1", "img2"]]
+
+        # With ignore_live_photos=False: companion mov1 is included
+        groups_keep = greedy_pack(files, 30, ignore_live_photos=False)
+        assert [[f.file_id for f in g] for g in groups_keep] == [["img1", "mov1", "img2"]]
+
+    def test_min_video_duration(self):
+        files = [
+            sf("img1", 100, 3, ftype="image"),
+            sf("micro_vid", 101, 0.8, ftype="video"),
+            sf("img2", 102, 3, ftype="image"),
+        ]
+        # Default min_video_duration=2.0 skips micro_vid
+        groups = greedy_pack(files, 30, min_video_duration=2.0)
+        assert [[f.file_id for f in g] for g in groups] == [["img1", "img2"]]
+
+        # When min_video_duration=0, micro_vid is included
+        groups_zero = greedy_pack(files, 30, min_video_duration=0.0)
+        assert [[f.file_id for f in g] for g in groups_zero] == [["img1", "micro_vid", "img2"]]
 
 
 class TestMakeSegment:

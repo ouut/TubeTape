@@ -79,6 +79,17 @@ def parse_resolution(value: str) -> tuple[int, int]:
     return width, height
 
 
+DEFAULT_TIMEZONE_NAME = "Asia/Shanghai"
+
+
+def default_timezone():
+    """Return Asia/Shanghai as default tzinfo."""
+    try:
+        return ZoneInfo(DEFAULT_TIMEZONE_NAME)
+    except Exception:
+        return timezone.utc
+
+
 def system_local_timezone():
     """Return the system's local timezone as a tzinfo.
 
@@ -95,14 +106,14 @@ def system_local_timezone():
     return datetime.now().astimezone().tzinfo
 
 
-def parse_timezone(value: str):
+def parse_timezone(value: str | None = None):
     """Parse a timezone string into a tzinfo.
 
-    Empty input falls back to the system local timezone.
+    Empty input falls back to Asia/Shanghai.
     """
     text = str(value).strip() if value is not None else ""
     if not text:
-        return system_local_timezone()
+        return default_timezone()
     try:
         return ZoneInfo(text)
     except ZoneInfoNotFoundError as exc:

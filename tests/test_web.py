@@ -321,18 +321,23 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
     from tubetape.cli import parse_args
     from tubetape.db import Database
 
+    from conftest import make_png
+    from tubetape.scanner import file_sha256
+    make_png(tmp_path / "img.png")
+    real_fid = file_sha256(str(tmp_path / "img.png"))
+
     db_path = tmp_path / "db.json"
     db = Database(path=str(db_path))
     db.upsert_segment("seg1", {
         "title": "20240101 - 20240102 [seg1]",
-        "file_ids": ["f1"],
+        "file_ids": [real_fid],
         "range": ["2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"],
         "duration_seconds": 60.0,
         "youtube_video_id": "yt_existing_123",
         "previous_video_ids": [],
         "status": "sealed",
     })
-    db.upsert_file("f1", {
+    db.upsert_file(real_fid, {
         "path": "img.png",
         "name": "img.png",
         "type": "image",
@@ -340,9 +345,6 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
         "duration_seconds": 3.0,
         "size_bytes": 10,
     })
-    db.save()
-
-    (tmp_path / "img.png").write_bytes(b"dummy_png")
 
     args = parse_args(["--input", str(tmp_path), "--db", str(db_path)])
     fake_uploader = _FakeUploader()
@@ -403,6 +405,12 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(bad_req)
         assert exc_info.value.code == 400
+
+        # Wait for any in-flight background task to complete before modifying segments
+        for _ in range(50):
+            if coord.current_task is None:
+                break
+            time.sleep(0.05)
 
         # 4. POST /api/segment/delete_youtube
         del_req = urllib.request.Request(
@@ -478,7 +486,7 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
             data = json.loads(res.read().decode("utf-8"))
             assert data["ok"] is True
             assert len(data["items"]) == 1
-            assert data["items"][0]["id"] == "f1"
+            assert data["items"][0]["id"] == real_fid
             assert "img.png" in data["items"][0]["abs_path"]
 
         # 10. GET /getbytime/seg1/0/1 (HTML with real file path)
@@ -493,7 +501,7 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
             assert res.status == 200
             data = json.loads(res.read().decode("utf-8"))
             assert data["ok"] is True
-            assert data["file_id"] == "f1"
+            assert data["file_id"] == real_fid
             assert data["path"] == "img.png"
             assert "img.png" in data["abs_path"]
 
