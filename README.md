@@ -308,7 +308,7 @@ REM 1. 打开命令提示符（CMD）或 PowerShell 进入媒体根目录
 cd /d D:\bone-ash
 
 REM 2. 运行纯本地转码（全自动探测并调用 NVIDIA GTX/RTX 显卡 NVENC 硬件加速）
-tubetape.exe --no-upload -v
+tubetape.exe --no-upload --keep-segments 300 -v
 ```
 
 > [!TIP]
@@ -332,7 +332,7 @@ cd /Volumes/Untitled/bone-ash
 cd /d D:\bone-ash
 
 REM 确保 D:\bone-ash 目录下已放置 client_secret.json
-tubetape.exe -v
+tubetape.exe  --keep-segments 300 -v
 ```
 
 - 首次运行会在浏览器弹出 Google 账号一键授权（或访问 `http://localhost:8080/log` 进行授权）；
