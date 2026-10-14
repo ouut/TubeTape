@@ -407,6 +407,10 @@ class TestKeepSegments:
         args2 = _parse("--force-scan", "--no-upload")
         assert args2.force_scan is True
         assert args2.no_upload is True
+        assert args2.encoder == "auto"
+
+        args3 = _parse("--encoder", "h264_nvenc")
+        assert args3.encoder == "h264_nvenc"
 
     def test_run_pipeline_no_upload_mode(self, tmp_path, monkeypatch):
         import json

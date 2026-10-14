@@ -2153,6 +2153,16 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
                 <option value="veryslow">veryslow</option>
               </select>
             </div>
+            <div class="form-item">
+              <label class="form-label">视频编码器 (Encoder):</label>
+              <select class="form-control" id="cfg-encoder" onchange="checkConfigChanges()">
+                <option value="auto">auto (自动选择最佳显卡/硬件加速)</option>
+                <option value="h264_nvenc">h264_nvenc (NVIDIA 显卡硬件加速)</option>
+                <option value="h264_videotoolbox">h264_videotoolbox (Apple Mac 硬件加速)</option>
+                <option value="h264_qsv">h264_qsv (Intel QuickSync 硬件加速)</option>
+                <option value="libx264">libx264 (CPU 纯软编通用)</option>
+              </select>
+            </div>
             <div class="form-item" style="justify-content: center;">
               <label class="form-label">
                 <input type="checkbox" id="cfg-ken_burns" onchange="checkConfigChanges()" style="margin-right: 6px;" />
@@ -2555,6 +2565,7 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('cfg-fps').value = initialConfig.fps;
         document.getElementById('cfg-canvas_mode').value = initialConfig.canvas_mode;
         document.getElementById('cfg-x264_preset').value = initialConfig.x264_preset;
+        document.getElementById('cfg-encoder').value = initialConfig.encoder || 'auto';
         document.getElementById('cfg-ken_burns').checked = !!initialConfig.ken_burns;
 
         document.getElementById('cfg-keep_segments').value = initialConfig.keep_segments;
@@ -2625,6 +2636,7 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
         fps: parseInt(document.getElementById('cfg-fps').value, 10),
         canvas_mode: document.getElementById('cfg-canvas_mode').value,
         x264_preset: document.getElementById('cfg-x264_preset').value,
+        encoder: document.getElementById('cfg-encoder').value,
         ken_burns: document.getElementById('cfg-ken_burns').checked,
         keep_segments: parseInt(document.getElementById('cfg-keep_segments').value, 10),
         no_upload: document.getElementById('cfg-no_upload').checked,
@@ -3185,6 +3197,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                         "short_video_threshold": 300.0,
                         "ignore_live_photos": True,
                         "min_video_duration": 2.0,
+                        "encoder": "auto",
                     },
                     "fingerprint_params": list(FINGERPRINT_PARAMS),
                 })

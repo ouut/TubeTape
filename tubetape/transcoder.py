@@ -41,6 +41,7 @@ class TranscodeConfig:
     image_duration: float = 3.0
     fps: int = 30
     preset: str = "fast"
+    encoder: str = "auto"
 
 
 def target_resolution(
@@ -110,18 +111,116 @@ def _image_filter(canvas_w: int, canvas_h: int, config: TranscodeConfig) -> str:
     return _scale_pad_filter(canvas_w, canvas_h)
 
 
+_PROBED_ENCODERS: dict[str, bool] = {}
+_DETECTED_ENCODER: str | None = None
+
+
+def probe_encoder(name: str) -> bool:
+    """Test if a given ffmpeg encoder can actually encode a 1-frame test clip."""
+    if name in _PROBED_ENCODERS:
+        return _PROBED_ENCODERS[name]
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", "color=s=64x64:d=0.04",
+        "-c:v", name,
+        "-f", "null", "-",
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+        ok = (res.returncode == 0)
+    except Exception:
+        ok = False
+    _PROBED_ENCODERS[name] = ok
+    return ok
+
+
+def detect_best_encoder() -> str:
+    """Probe ffmpeg for the best available H.264 video encoder.
+
+    Checks in priority order:
+    1. h264_nvenc (NVIDIA GPU hardware acceleration)
+    2. h264_videotoolbox (Apple Silicon / Mac GPU hardware acceleration)
+    3. h264_qsv (Intel QuickSync hardware acceleration)
+    4. libx264 (Universal CPU software fallback)
+    """
+    global _DETECTED_ENCODER
+    if _DETECTED_ENCODER is not None:
+        return _DETECTED_ENCODER
+
+    for name in ("h264_nvenc", "h264_videotoolbox", "h264_qsv"):
+        if probe_encoder(name):
+            _logger.info("hardware video encoder detected and verified: %s", name)
+            _DETECTED_ENCODER = name
+            return name
+
+    _logger.info("no hardware video encoder detected; using CPU libx264")
+    _DETECTED_ENCODER = "libx264"
+    return "libx264"
+
+
+def resolve_encoder(requested: str | None) -> str:
+    """Resolve requested encoder name, auto-detecting if 'auto' or empty."""
+    if not requested or requested.lower() == "auto":
+        return detect_best_encoder()
+    req = requested.lower().strip()
+    if not probe_encoder(req):
+        best = detect_best_encoder()
+        _logger.warning("requested encoder %r is not supported on this system; falling back to %s", req, best)
+        return best
+    return req
+
+
+def get_encoder_flags(encoder: str, config: TranscodeConfig, is_still: bool = False) -> list[str]:
+    """Generate ffmpeg command-line flags for the chosen encoder and configuration."""
+    enc = resolve_encoder(encoder)
+    if enc == "h264_nvenc":
+        # NVENC: supports -preset (p1-p7 or fast/medium/slow), -cq:v, -rc:v vbr
+        preset = config.preset if config.preset in ("p1", "p2", "p3", "p4", "p5", "p6", "p7", "fast", "medium", "slow") else "fast"
+        return [
+            "-c:v", "h264_nvenc",
+            "-preset", preset,
+            "-rc:v", "vbr",
+            "-cq:v", str(config.crf),
+            "-pix_fmt", "yuv420p",
+        ]
+    elif enc == "h264_videotoolbox":
+        # VideoToolbox: -q:v (1-100 scale, ~70-75 corresponds to crf 18-20)
+        vt_q = max(30, min(95, int(100 - config.crf * 1.5)))
+        return [
+            "-c:v", "h264_videotoolbox",
+            "-q:v", str(vt_q),
+            "-pix_fmt", "yuv420p",
+        ]
+    elif enc == "h264_qsv":
+        # Intel QuickSync
+        return [
+            "-c:v", "h264_qsv",
+            "-global_quality", str(config.crf),
+            "-preset", config.preset,
+            "-pix_fmt", "nv12",
+        ]
+    else:
+        # libx264 CPU fallback
+        args = ["-c:v", "libx264", "-preset", config.preset, "-crf", str(config.crf)]
+        if is_still:
+            args.extend(["-tune", "stillimage"])
+        args.extend(["-pix_fmt", "yuv420p"])
+        return args
+
+
 def build_image_clip_command(
     src: str, dst: str, canvas_w: int, canvas_h: int, duration: float, config: TranscodeConfig
 ) -> list[str]:
     vf = _image_filter(canvas_w, canvas_h, config)
+    enc_flags = get_encoder_flags(config.encoder, config, is_still=True)
     return [
         "ffmpeg", "-y",
         "-loop", "1", "-i", src,
         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
         "-vf", vf,
         "-t", str(duration), "-r", str(config.fps),
-        "-c:v", "libx264", "-preset", config.preset, "-crf", str(config.crf),
-        "-pix_fmt", "yuv420p",
+        *enc_flags,
         "-c:a", "aac", "-b:a", "128k", "-shortest",
         dst,
     ]
@@ -131,12 +230,12 @@ def build_video_clip_command(
     src: str, dst: str, canvas_w: int, canvas_h: int, config: TranscodeConfig
 ) -> list[str]:
     vf = _scale_pad_filter(canvas_w, canvas_h)
+    enc_flags = get_encoder_flags(config.encoder, config, is_still=False)
     return [
         "ffmpeg", "-y",
         "-i", src,
         "-vf", vf, "-r", str(config.fps),
-        "-c:v", "libx264", "-preset", config.preset, "-crf", str(config.crf),
-        "-pix_fmt", "yuv420p",
+        *enc_flags,
         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "128k",
         dst,
     ]
@@ -151,12 +250,13 @@ def build_photos_concat_command(
         f"fps={config.fps},format=yuv420p"
     )
     gop = max(1, config.fps // 2)
+    enc_flags = get_encoder_flags(config.encoder, config, is_still=True)
     return [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", list_path,
         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
         "-vf", vf,
-        "-c:v", "libx264", "-preset", config.preset, "-tune", "stillimage", "-crf", str(config.crf),
+        *enc_flags,
         "-bf", "2", "-g", str(gop), "-movflags", "+faststart",
         "-c:a", "aac", "-b:a", "128k", "-shortest",
         dst,

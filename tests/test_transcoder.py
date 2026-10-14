@@ -38,7 +38,7 @@ class TestTargetResolution:
 
 class TestCommandBuilding:
     def test_image_command_static(self):
-        cfg = TranscodeConfig()
+        cfg = TranscodeConfig(encoder="libx264")
         cmd = build_image_clip_command("a.jpg", "out.mp4", 640, 480, 3.0, cfg)
         joined = " ".join(cmd)
         assert "-loop" in cmd and "1" in cmd
@@ -48,13 +48,44 @@ class TestCommandBuilding:
         assert "libx264" in cmd and "yuv420p" in cmd
         assert "aac" in cmd and "-crf" in cmd and "18" in cmd
 
+    def test_image_command_nvenc(self):
+        cfg = TranscodeConfig(encoder="h264_nvenc")
+        # Monkeypatch probe_encoder to pretend nvenc is present
+        from tubetape import transcoder
+        orig_probe = transcoder._PROBED_ENCODERS.get("h264_nvenc")
+        transcoder._PROBED_ENCODERS["h264_nvenc"] = True
+        try:
+            cmd = build_image_clip_command("a.jpg", "out.mp4", 640, 480, 3.0, cfg)
+            assert "h264_nvenc" in cmd
+            assert "-cq:v" in cmd and "18" in cmd
+        finally:
+            if orig_probe is not None:
+                transcoder._PROBED_ENCODERS["h264_nvenc"] = orig_probe
+            else:
+                transcoder._PROBED_ENCODERS.pop("h264_nvenc", None)
+
+    def test_image_command_videotoolbox(self):
+        cfg = TranscodeConfig(encoder="h264_videotoolbox")
+        from tubetape import transcoder
+        orig_probe = transcoder._PROBED_ENCODERS.get("h264_videotoolbox")
+        transcoder._PROBED_ENCODERS["h264_videotoolbox"] = True
+        try:
+            cmd = build_image_clip_command("a.jpg", "out.mp4", 640, 480, 3.0, cfg)
+            assert "h264_videotoolbox" in cmd
+            assert "-q:v" in cmd
+        finally:
+            if orig_probe is not None:
+                transcoder._PROBED_ENCODERS["h264_videotoolbox"] = orig_probe
+            else:
+                transcoder._PROBED_ENCODERS.pop("h264_videotoolbox", None)
+
     def test_image_command_ken_burns(self):
-        cfg = TranscodeConfig(ken_burns=True)
+        cfg = TranscodeConfig(ken_burns=True, encoder="libx264")
         cmd = build_image_clip_command("a.jpg", "out.mp4", 640, 480, 3.0, cfg)
         assert any("zoompan" in part for part in cmd)
 
     def test_video_command(self):
-        cfg = TranscodeConfig()
+        cfg = TranscodeConfig(encoder="libx264")
         cmd = build_video_clip_command("a.mp4", "out.mp4", 640, 480, cfg)
         joined = " ".join(cmd)
         assert "scale=640:480" in joined
@@ -344,7 +375,7 @@ class TestResumableTranscoding:
             real_run(cmd, *args, **kwargs)
 
         monkeypatch.setattr(transcoder, "run_ffmpeg", tracking_run)
-        res_path, chapters = transcode_segment([f1, f2], str(out), TranscodeConfig())
+        res_path, chapters = transcode_segment([f1, f2], str(out), TranscodeConfig(encoder="libx264"))
         assert res_path == str(out)
         assert out.exists()
         # Pure photos must only invoke FFmpeg ONCE (single-pass concat demuxer)!

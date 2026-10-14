@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](pyproject.toml)
 [![Docker: chet2026/tubetape](https://img.shields.io/badge/Docker-chet2026%2Ftubetape-blue.svg)](https://hub.docker.com/r/chet2026/tubetape)
-[![Version: 1.5.1](https://img.shields.io/badge/Version-1.5.1-orange.svg)](pyproject.toml)
+[![Version: 1.5.2](https://img.shields.io/badge/Version-1.5.2-orange.svg)](pyproject.toml)
 
 ---
 
@@ -464,6 +464,7 @@ TubeTape 提供丰富而细致的配置项，满足从极客玩家到轻量挂�
 | `--canvas-mode` | 枚举 | `max` | ⚠️ **是** | 分段画布分辨率策略：<br>• `max`（推荐）：取该分段内所有素材的最大包围盒，确保高分辨率素材绝不降采样；<br>• `first`：取分段内第一张素材的分辨率。 |
 | `--fps` | 整数 | `30` | ⚠️ **是** | 输出视频帧率。静态相册默认 30FPS（YouTube 官方标准帧率，兼顾流畅度与秒级极速编码）。 |
 | `--x264-preset` | 枚举 | `fast` | ⚠️ **是** | x264 编码效率预设：默认 `fast`，在静态相册中可达到近百倍编码提速，同时完整保留关键帧细节。 |
+| `--encoder` | 枚举 | `auto` | 否 | **视频编码器（GPU 硬件加速）**：<br>• `auto`（推荐）：自动探测并选用最佳硬件加速（NVIDIA `h264_nvenc` $\to$ Apple `h264_videotoolbox` $\to$ Intel `h264_qsv` $\to$ CPU `libx264`）；<br>• `h264_nvenc`：强制使用 NVIDIA 独显加速；<br>• `h264_videotoolbox`：强制使用 Mac 硬件加速；<br>• `h264_qsv`：强制使用 Intel 核显加速；<br>• `libx264`：强制使用 CPU 通用软编。 |
 | `--ken-burns` | 开关 | `False` | ⚠️ **是** | 为静态照片启用 Ken Burns 电影感平移缩放镜头动效。开启后静态照片呈现动态推拉效果。 |
 
 ---

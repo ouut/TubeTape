@@ -178,6 +178,7 @@ class AppCoordinator:
                 "short_video_threshold": float(getattr(a, "short_video_threshold", 300.0)),
                 "ignore_live_photos": bool(getattr(a, "ignore_live_photos", True)),
                 "min_video_duration": float(getattr(a, "min_video_duration", 2.0)),
+                "encoder": str(getattr(a, "encoder", "auto")),
             },
             "fingerprint_params": list(FINGERPRINT_PARAMS),
         }
@@ -304,6 +305,8 @@ class AppCoordinator:
                 a.min_video_duration = val
             elif k == "ignore_live_photos":
                 a.ignore_live_photos = bool(v)
+            elif k == "encoder":
+                a.encoder = str(v).strip().lower()
 
     def is_task_running(self) -> bool:
         return self.current_task is not None
@@ -437,6 +440,7 @@ class AppCoordinator:
                     image_duration=self.args.image_duration,
                     fps=self.args.fps,
                     preset=self.args.x264_preset,
+                    encoder=getattr(self.args, "encoder", "auto"),
                 )
 
                 is_single_vid = len(files) == 1 and files[0].type == FILE_TYPE_VIDEO

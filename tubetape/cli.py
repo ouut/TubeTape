@@ -134,6 +134,16 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: fast)",
     )
     parser.add_argument(
+        "--encoder",
+        choices=["auto", "libx264", "h264_nvenc", "h264_videotoolbox", "h264_qsv"],
+        default="auto",
+        help=(
+            "video encoder (default: auto). Automatically detects and selects "
+            "hardware acceleration: NVIDIA (h264_nvenc) -> Apple (h264_videotoolbox) "
+            "-> Intel (h264_qsv) -> CPU (libx264)"
+        ),
+    )
+    parser.add_argument(
         "--ken-burns",
         action="store_true",
         help="enable Ken Burns (pan/zoom) effect on images (default: off)",
@@ -655,6 +665,7 @@ def _run_pipeline_impl(
         image_duration=args.image_duration,
         fps=args.fps,
         preset=args.x264_preset,
+        encoder=getattr(args, "encoder", "auto"),
     )
 
     segments_dir = getattr(args, "segments_dir", None) or os.path.join(os.path.dirname(args.db), "uploaded_segments")
