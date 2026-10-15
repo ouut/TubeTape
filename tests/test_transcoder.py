@@ -421,6 +421,13 @@ class TestResumableTranscoding:
         assert "\\" not in safe
         assert "来自：iPad" in safe
 
+    def test_all_modules_compile_cleanly(self):
+        import compileall
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+        res = compileall.compile_dir(str(root / "tubetape"), quiet=1, force=True)
+        assert res is True
+
     def test_image_fallback_retry_on_ffmpeg_failure(self, tmp_path, monkeypatch):
         img_path = tmp_path / "fail_first.jpg"
         make_png(img_path, size=(64, 48))

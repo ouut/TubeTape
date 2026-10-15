@@ -48,6 +48,7 @@ def build(name: str) -> None:
         "--noconfirm",
         "--collect-all", "tzdata",
         "--collect-all", "googleapiclient",
+        "--collect-all", "tubetape",
         str(entry),
     ]
 

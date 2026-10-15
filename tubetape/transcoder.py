@@ -447,7 +447,8 @@ def _safe_ffmpeg_video_path(path: str) -> str:
     """
     abs_p = os.path.abspath(path)
     if (sys.platform == "win32" or os.name == "nt") and "：" in abs_p:
-        return f"file:{abs_p.replace('\\', '/')}"
+        norm_p = abs_p.replace("\\", "/")
+        return f"file:{norm_p}"
     return abs_p
 
 
