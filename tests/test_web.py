@@ -802,6 +802,56 @@ def test_web_upload_queue_and_progress_overlay(tmp_path):
         server.stop()
 
 
+def test_web_api_sync_youtube(tmp_path):
+    from unittest.mock import MagicMock
+    from tubetape.coordinator import AppCoordinator
+    from tubetape.db import Database
+
+    db_path = tmp_path / "tubetape.json"
+    db = Database(path=str(db_path))
+    db.upsert_segment("seg_s1", {
+        "title": "Segment Sync 1",
+        "file_ids": ["f1"],
+        "status": "sealed",
+        "youtube_video_id": None,
+    })
+    db.save()
+
+    mock_uploader = MagicMock()
+    mock_uploader.service = MagicMock()
+    coord = AppCoordinator(args=MagicMock(db=str(db_path), input=str(tmp_path)), db=db, uploader=mock_uploader)
+
+    from tubetape import coordinator
+    orig_fetch = coordinator.fetch_remote_catalog
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        coordinator.fetch_remote_catalog = lambda s: ({"seg_s1": "yt_remote_s1"}, {"yt_remote_s1"}, True)
+        web.set_app_coordinator(coord)
+        web.set_web_context(media_dir=str(tmp_path), db=db, db_path=str(db_path))
+
+        req = urllib.request.Request(
+            f"{base_url}/api/sync_youtube",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert data["stats"]["matched"] == 1
+            assert db.segments["seg_s1"]["youtube_video_id"] == "yt_remote_s1"
+    finally:
+        coordinator.fetch_remote_catalog = orig_fetch
+        server.stop()
+
+
+
 
 
 

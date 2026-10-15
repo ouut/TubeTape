@@ -1908,6 +1908,12 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
       color: #34d399;
     }
     .btn-scan:hover { background: rgba(16, 185, 129, 0.28); }
+    .btn-sync {
+      background: rgba(59, 130, 246, 0.15);
+      border: 1px solid rgba(59, 130, 246, 0.4);
+      color: #60a5fa;
+    }
+    .btn-sync:hover { background: rgba(59, 130, 246, 0.28); }
     .btn-action {
       padding: 3px 8px;
       border-radius: 4px;
@@ -2070,6 +2076,7 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="header-right">
       <button id="scan-btn" class="btn-top btn-scan" onclick="startScan()">🔄 开始全量扫描</button>
+      <button id="sync-btn" class="btn-top btn-sync" onclick="syncYoutube()" title="从 YouTube 频道拉取最新视频列表并双向对齐">☁️ 与 YouTube 同步</button>
       <button class="btn-top" onclick="openConfigModal()">⚙️ 参数配置</button>
       <a href="/" class="btn-gallery">📱 打开全屏画廊 (/)</a>
       <div class="status-badge">
@@ -2839,6 +2846,27 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function syncYoutube() {
+      const btn = document.getElementById('sync-btn');
+      btn.disabled = true;
+      btn.textContent = '⏳ 正在同步云端...';
+      try {
+        const res = await fetch('/api/sync_youtube', { method: 'POST' });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          alert('✅ ' + (d.message || '与 YouTube 同步完成'));
+          pollDashboard();
+        } else {
+          alert('❌ 同步失败: ' + (d.error || '未知错误'));
+        }
+      } catch (err) {
+        alert('❌ 请求失败: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '☁️ 与 YouTube 同步';
+      }
+    }
+
     async function rebuildSegment(id) {
       if (!confirm(`确定要重新构建分段 [${id.slice(0, 12)}] 吗？`)) return;
       try {
@@ -3152,6 +3180,15 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(200 if ok else 400, {"ok": ok, "message": msg})
             return
 
+        if path == "/api/sync_youtube":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            ok, msg, stats = coord.sync_youtube()
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg, "stats": stats})
+            return
+
         if path == "/api/segment/rebuild":
             coord = get_app_coordinator()
             if not coord:
@@ -3247,6 +3284,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
         # Route /log and /logs -> Dashboard & Live Log Stream
         if path in ("/log", "/logs"):
             self._send_html(200, _LOG_DASHBOARD_HTML)
+            return
+
+        # Route /api/sync_youtube
+        if path == "/api/sync_youtube":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            ok, msg, stats = coord.sync_youtube()
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg, "stats": stats})
             return
 
         # Route /api/status

@@ -18,7 +18,7 @@ from .chapters import build_segment_description, chapters_text
 from .db import SEGMENT_STATUS_FAILED, SEGMENT_STATUS_SEALED, Database
 from .planner import ScannedFile, plan
 from .rebuild import Rebuilder
-from .reconcile import fetch_remote_index
+from .reconcile import fetch_remote_catalog, fetch_remote_index, reconcile_database
 from .scanner import FILE_TYPE_VIDEO, VIDEO_EXTENSIONS, scan
 from .transcoder import TranscodeConfig, transcode_segment
 
@@ -661,3 +661,47 @@ class AppCoordinator:
         except Exception as exc:
             _logger.error("delete YouTube video %s failed: %s", video_id, exc, exc_info=True)
             return False, f"YouTube 视频删除失败: {exc}"
+
+    def sync_youtube(self) -> tuple[bool, str, dict[str, int]]:
+        """Perform two-way reconciliation with YouTube channel uploads."""
+        if not self.db:
+            return False, "数据库未初始化", {}
+        uploader = self.ensure_uploader()
+        if not uploader:
+            return False, "YouTube 凭据不可用，请先在控制台完成授权", {}
+
+        if not self.task_lock.acquire(blocking=False):
+            return False, f"已有任务正在运行中 ({self.current_task})", {}
+
+        self.current_task = "与 YouTube 同步"
+        try:
+            from . import web
+
+            _logger.info("manual YouTube sync triggered from dashboard")
+            web.set_web_status("syncing", "正在与 YouTube 同步已上传视频列表...")
+            remote_index, remote_video_ids, success = fetch_remote_catalog(uploader.service)
+            if not success and not remote_index:
+                web.set_web_status("error", "无法连接 YouTube 获取视频列表")
+                return False, "无法从 YouTube 获取视频列表，请检查网络或授权", {}
+
+            planned = web._server_state.get("planned_segments", [])
+            vid_ids_for_check = remote_video_ids if success else None
+            stats = reconcile_database(self.db, remote_index, vid_ids_for_check, planned_segments=planned)
+            m = stats.get("matched", 0)
+            d = stats.get("deleted", 0)
+            msg = f"与 YouTube 同步完成（匹配到 {m} 个已上传分片，检测到 {d} 个云端已删除分片）"
+            _logger.info(msg)
+            web.set_web_status("idle", msg)
+            return True, msg, stats
+        except Exception as exc:
+            _logger.error("YouTube sync failed: %s", exc, exc_info=True)
+            try:
+                from . import web
+                web.set_web_status("error", f"与 YouTube 同步失败: {exc}")
+            except Exception:
+                pass
+            return False, f"与 YouTube 同步失败: {exc}", {}
+        finally:
+            self.current_task = None
+            self.task_lock.release()
+

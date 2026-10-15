@@ -155,3 +155,68 @@ class TestTitleSegmentId:
         ]
         index = fetch_remote_index(_FakeService("UU123", pages))
         assert index.get(sid) == "vid-123"
+
+
+class TestReconcileDatabase:
+    def test_reconcile_direction_1_matches_missing_video_id(self, tmp_path):
+        from tubetape.db import Database
+        from tubetape.reconcile import reconcile_database
+
+        db_path = tmp_path / "tubetape.json"
+        db = Database(path=str(db_path))
+        db.upsert_segment("seg_1", {
+            "title": "Segment 1",
+            "file_ids": ["f1"],
+            "status": "sealed",
+            "youtube_video_id": None,
+        })
+        db.save()
+
+        stats = reconcile_database(db, {"seg_1": "yt_vid_1"}, {"yt_vid_1"})
+        assert stats["matched"] == 1
+        assert stats["deleted"] == 0
+        assert db.segments["seg_1"]["youtube_video_id"] == "yt_vid_1"
+
+    def test_reconcile_direction_2_detects_deleted_video(self, tmp_path):
+        from tubetape.db import Database
+        from tubetape.reconcile import reconcile_database
+
+        db_path = tmp_path / "tubetape.json"
+        db = Database(path=str(db_path))
+        db.upsert_segment("seg_2", {
+            "title": "Segment 2",
+            "file_ids": ["f2"],
+            "status": "sealed",
+            "youtube_video_id": "yt_old_2",
+            "previous_video_ids": [],
+        })
+        db.save()
+
+        stats = reconcile_database(db, {}, {"yt_other_vid"})
+        assert stats["matched"] == 0
+        assert stats["deleted"] == 1
+        assert db.segments["seg_2"]["youtube_video_id"] is None
+        assert db.segments["seg_2"]["previous_video_ids"] == ["yt_old_2"]
+
+    def test_reconcile_planned_segments(self, tmp_path):
+        from tubetape.db import Database
+        from tubetape.planner import Segment
+        from tubetape.reconcile import reconcile_database
+
+        db_path = tmp_path / "tubetape.json"
+        db = Database(path=str(db_path))
+        planned = [
+            Segment(
+                file_ids=["f1"],
+                start_ts="2024-01-01T00:00:00Z",
+                end_ts="2024-01-01T00:10:00Z",
+                duration_seconds=600.0,
+                segment_id="sid_planned_12345678",
+                title="Planned 1",
+            )
+        ]
+
+        stats = reconcile_database(db, {"sid_planned_12345678": "yt_planned_vid"}, {"yt_planned_vid"}, planned_segments=planned)
+        assert stats["matched"] == 1
+        assert "sid_planned_12345678" in db.segments
+        assert db.segments["sid_planned_12345678"]["youtube_video_id"] == "yt_planned_vid"

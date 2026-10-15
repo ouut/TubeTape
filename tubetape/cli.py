@@ -18,7 +18,7 @@ from .coordinator import AppCoordinator
 from .log import get_logger, setup_logging
 from .planner import Segment, plan
 from .rebuild import Rebuilder
-from .reconcile import embed_segment_id, fetch_remote_index
+from .reconcile import embed_segment_id, fetch_remote_catalog, fetch_remote_index, reconcile_database
 from .scanner import FILE_TYPE_VIDEO, ScannedFile, ScanResult, scan
 from .transcoder import TranscodeConfig, transcode_segment
 from .ui import Reporter
@@ -656,6 +656,9 @@ def _run_pipeline_impl(
         remote_index = fetch_remote_index(uploader.service)
         if remote_index:
             reporter.status(f"found {len(remote_index)} segment(s) already on YouTube")
+        all_vids = getattr(remote_index, "all_video_ids", None)
+        success = getattr(remote_index, "success", True)
+        reconcile_database(db, remote_index, all_vids if success else None)
 
     config = TranscodeConfig(
         crf=args.crf,
