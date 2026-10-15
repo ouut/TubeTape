@@ -402,5 +402,58 @@ class TestResumableTranscoding:
         # No ffmpeg re-encode!
         assert len(called_cmds) == 0
 
+    def test_needs_image_staging(self, monkeypatch):
+        from tubetape.transcoder import _needs_image_staging
+        assert _needs_image_staging("/path/to/photo.heic") is True
+        assert _needs_image_staging("/path/to/animation.gif") is True
+        assert _needs_image_staging("/path/to/sticker.webp") is True
+
+        monkeypatch.setattr("sys.platform", "win32")
+        assert _needs_image_staging(r"F:\bone-ash\photos\来自：iPad\2016.jpg") is True
+        assert _needs_image_staging(r"F:\bone-ash\photos\ascii\2016.jpg") is False
+
+    def test_safe_ffmpeg_video_path(self, monkeypatch):
+        from tubetape.transcoder import _safe_ffmpeg_video_path
+        monkeypatch.setattr("sys.platform", "win32")
+        colon_path = "photos/来自：iPad/vid.mp4"
+        safe = _safe_ffmpeg_video_path(colon_path)
+        assert safe.startswith("file:")
+        assert "\\" not in safe
+        assert "来自：iPad" in safe
+
+    def test_image_fallback_retry_on_ffmpeg_failure(self, tmp_path, monkeypatch):
+        img_path = tmp_path / "fail_first.jpg"
+        make_png(img_path, size=(64, 48))
+        f = ScannedFile(
+            file_id="img_retry_1", abs_path=str(img_path), rel_path="fail_first.jpg",
+            name="fail_first.jpg", type=FILE_TYPE_IMAGE, size_bytes=100,
+            captured_epoch=10.0, duration_seconds=1.0, resolution="64x48",
+        )
+        out = tmp_path / "retry_seg.mp4"
+
+        attempts = []
+        real_run_ffmpeg = transcoder.run_ffmpeg
+
+        def mock_run_ffmpeg(cmd, *args, **kwargs):
+            attempts.append(cmd)
+            # Fail on first direct attempt with the raw .jpg
+            if len(attempts) == 1:
+                raise RuntimeError("ffmpeg failed (2880417800): Option loop not found.")
+            # Succeed on second attempt (which uses the staged .png) or concat
+            real_run_ffmpeg(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(transcoder, "run_ffmpeg", mock_run_ffmpeg)
+
+        res_path, chapters = transcode_segment([f], str(out), TranscodeConfig(ken_burns=True))
+        assert res_path == str(out)
+        assert out.exists()
+        # Attempt 1: direct ffmpeg (failed)
+        # Attempt 2: retry with staged PNG (succeeded)
+        # Attempt 3: concat
+        assert len(attempts) == 3
+        assert "src_0000" in " ".join(attempts[1])
+        assert attempts[1][-1].endswith(".tmp.mp4")
+
+
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -304,6 +305,8 @@ def run_ffmpeg(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
     except FileNotFoundError as exc:
@@ -402,14 +405,50 @@ def check_disk_space(path: str, required_bytes: int) -> None:
         raise OSError(f"insufficient disk space: {free} < {required_bytes} bytes")
 
 
-def _heif_to_png(src: str, dst: str) -> None:
-    """Convert a HEIC/HEIF image to PNG for ffmpeg (which usually can't decode HEIF).
+def _image_to_png(src: str, dst: str) -> None:
+    """Convert an image (HEIF, GIF, WebP, JPEG with non-standard EXIF, etc.) to RGB PNG for ffmpeg.
 
     Applies the EXIF orientation so portrait photos aren't rotated in the video.
+    Uses fast compression (compress_level=1) for rapid staging.
     """
     with Image.open(src) as img:
         img = ImageOps.exif_transpose(img)
-        img.convert("RGB").save(dst, "PNG")
+        img.convert("RGB").save(dst, "PNG", compress_level=1)
+
+
+_heif_to_png = _image_to_png
+
+
+def _needs_image_staging(path: str) -> bool:
+    """Check if an image should be converted to staging PNG before passing to ffmpeg.
+
+    Returns True if:
+    - Format is HEIF/HEIC (ffmpeg builds commonly lack a HEIC/HEIF decoder)
+    - Path contains fullwidth colon '：' or non-ASCII characters on Windows
+    - File extension is not standard JPEG or PNG (e.g. .webp, .gif, .bmp, .tiff)
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in HEIF_EXTENSIONS:
+        return True
+    if sys.platform == "win32" or os.name == "nt":
+        if "：" in path or any(ord(c) > 127 for c in path):
+            return True
+    if ext not in (".jpg", ".jpeg", ".png"):
+        return True
+    return False
+
+
+def _safe_ffmpeg_video_path(path: str) -> str:
+    """Prepare a video path safely for ffmpeg command line arguments.
+
+    On Windows, if a path contains fullwidth colon '：' or other special characters
+    after the drive letter, ffmpeg's URL parser may misinterpret it as a protocol.
+    Prepending 'file:' with forward slashes prevents protocol misdetection.
+    """
+    abs_p = os.path.abspath(path)
+    if (sys.platform == "win32" or os.name == "nt") and "：" in abs_p:
+        return f"file:{abs_p.replace('\\', '/')}"
+    return abs_p
 
 
 def transcode_segment(
@@ -521,23 +560,23 @@ def transcode_segment(
         with open(images_txt, "w", encoding="utf-8") as handle:
             for index, item in enumerate(files):
                 img_src = os.path.abspath(item.abs_path)
-                if os.path.splitext(item.abs_path)[1].lower() in HEIF_EXTENSIONS:
+                if _needs_image_staging(item.abs_path):
                     img_src = os.path.join(staging_dir, f"src_{index:04d}_{item.file_id[:12]}.png")
                     if not os.path.isfile(img_src) or os.path.getsize(img_src) == 0:
-                        _logger.info("converting HEIF image %s to PNG for ffmpeg", item.rel_path)
-                        _heif_to_png(item.abs_path, img_src)
+                        _logger.info("converting image %s to PNG for ffmpeg", item.rel_path)
+                        _image_to_png(item.abs_path, img_src)
                 dur = item.duration_seconds or config.image_duration
                 cur_cum += dur
                 cum_durations.append(cur_cum)
-                escaped = img_src.replace("'", "'\\''")
+                escaped = img_src.replace("\\", "/").replace("'", "'\\''")
                 handle.write(f"file '{escaped}'\n")
                 handle.write(f"duration {dur}\n")
             if files:
                 last_item = files[-1]
                 last_src = os.path.abspath(last_item.abs_path)
-                if os.path.splitext(last_item.abs_path)[1].lower() in HEIF_EXTENSIONS:
+                if _needs_image_staging(last_item.abs_path):
                     last_src = os.path.join(staging_dir, f"src_{len(files)-1:04d}_{last_item.file_id[:12]}.png")
-                escaped_last = last_src.replace("'", "'\\''")
+                escaped_last = last_src.replace("\\", "/").replace("'", "'\\''")
                 handle.write(f"file '{escaped_last}'\n")
 
         tmp_out = out_abs + ".tmp.mp4"
@@ -631,16 +670,17 @@ def transcode_segment(
             except OSError:
                 pass
 
+        staged_png_path = os.path.join(staging_dir, f"src_{index:04d}_{item.file_id[:12]}.png")
         if item.type == FILE_TYPE_IMAGE:
             img_src = item.abs_path
-            if os.path.splitext(item.abs_path)[1].lower() in HEIF_EXTENSIONS:
-                img_src = os.path.join(staging_dir, f"src_{index:04d}_{item.file_id[:12]}.png")
+            if _needs_image_staging(item.abs_path):
+                img_src = staged_png_path
                 if not os.path.isfile(img_src) or os.path.getsize(img_src) == 0:
                     _logger.info(
-                        "converting HEIF image %s to PNG for ffmpeg",
+                        "converting image %s to PNG for ffmpeg",
                         item.rel_path,
                     )
-                    _heif_to_png(item.abs_path, img_src)
+                    _image_to_png(item.abs_path, img_src)
             clip_dur = item.duration_seconds or config.image_duration
             cmd = build_image_clip_command(
                 img_src, tmp_clip_path, canvas_w, canvas_h,
@@ -648,7 +688,7 @@ def transcode_segment(
             )
         elif item.type == FILE_TYPE_VIDEO:
             clip_dur = item.duration_seconds
-            cmd = build_video_clip_command(item.abs_path, tmp_clip_path, canvas_w, canvas_h, config)
+            cmd = build_video_clip_command(_safe_ffmpeg_video_path(item.abs_path), tmp_clip_path, canvas_w, canvas_h, config)
         else:
             raise ValueError(f"unknown file type: {item.type!r}")
 
@@ -680,18 +720,51 @@ def transcode_segment(
                 on_progress=_on_clip_prog,
                 log_interval=15.0,
             )
+        except RuntimeError as exc:
+            # Auto-retry fallback for images: if ffmpeg failed on the direct image path/demuxer,
+            # normalize the image to RGB PNG via Pillow in staging_dir and retry!
+            if item.type == FILE_TYPE_IMAGE and img_src != staged_png_path:
+                _logger.warning(
+                    "[转码容错] ffmpeg直接处理图片 %s 失败 (%s)，正在通过 Pillow 标准化为 PNG 后重试...",
+                    item.rel_path,
+                    exc,
+                )
+                try:
+                    _image_to_png(item.abs_path, staged_png_path)
+                    retry_cmd = build_image_clip_command(
+                        staged_png_path, tmp_clip_path, canvas_w, canvas_h,
+                        clip_dur, config,
+                    )
+                    run_ffmpeg(
+                        retry_cmd,
+                        total_duration=clip_dur,
+                        desc=f"clip {index + 1}/{len(files)} ({item.name}) [retry]",
+                        on_progress=_on_clip_prog,
+                        log_interval=15.0,
+                    )
+                except Exception as retry_exc:
+                    _logger.error("image fallback retry also failed for %s: %s", item.rel_path, retry_exc)
+                    raise
+            else:
+                raise
         except TypeError as te:
             if "unexpected keyword argument" in str(te):
                 run_ffmpeg(cmd)
             else:
                 raise
         os.replace(tmp_clip_path, clip_path)
+        if os.path.isfile(staged_png_path):
+            try:
+                os.remove(staged_png_path)
+            except OSError:
+                pass
         clips.append(clip_path)
 
     list_path = os.path.join(staging_dir, "concat.txt")
     with open(list_path, "w", encoding="utf-8") as handle:
         for clip in clips:
-            handle.write(f"file '{clip}'\n")
+            clean_clip = clip.replace("\\", "/").replace("'", "'\\''")
+            handle.write(f"file '{clean_clip}'\n")
     _logger.debug("concatenating %d clip(s)", len(clips))
 
     tmp_out = out_abs + ".tmp.mp4"

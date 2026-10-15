@@ -302,6 +302,8 @@ def probe_video(path: str) -> dict:
                  "-show_format", "-show_streams", path],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
             )
             if proc.returncode == 0 and proc.stdout.strip():
@@ -326,6 +328,8 @@ def probe_video(path: str) -> dict:
             ["ffmpeg", "-hide_banner", "-i", path],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
