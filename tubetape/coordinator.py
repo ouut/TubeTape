@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Any
 
 from . import durations
@@ -483,9 +484,29 @@ class AppCoordinator:
 
                 if uploader:
                     web.set_web_status("uploading", f"正在上传 {title}")
+                    file_size = os.path.getsize(out_path) if os.path.isfile(out_path) else 0
+                    web.update_web_upload(segment_id, title=title, percent=0.0, uploaded_bytes=0, total_bytes=file_size)
+                    start_time = time.monotonic()
+
+                    def _rebuild_up_cb(pct: float, uploaded_b: int = 0, total_b: int = 0) -> None:
+                        pct_val = pct * 100.0
+                        now = time.monotonic()
+                        elapsed = max(0.001, now - start_time)
+                        speed_bps = uploaded_b / elapsed if uploaded_b > 0 else 0
+                        speed_str = f"{speed_bps / (1024 * 1024):.1f} MB/s" if speed_bps > 0 else "N/A"
+                        web.update_web_upload(
+                            segment_id,
+                            title=title,
+                            percent=pct_val,
+                            uploaded_bytes=uploaded_b,
+                            total_bytes=total_b or file_size,
+                            speed=speed_str,
+                        )
+                        web.set_web_status("uploading", f"正在上传 {title} ({pct_val:.1f}%) · {speed_str}")
+
                     old_vid = srec.get("youtube_video_id")
                     desc = build_segment_description(files, total_duration=srec.get("duration_seconds"))
-                    new_video_id = uploader.upload(out_path, title, desc, privacy=self.args.privacy)
+                    new_video_id = uploader.upload(out_path, title, desc, privacy=self.args.privacy, progress_callback=_rebuild_up_cb)
                     uploader.verify(new_video_id)
                     if old_vid:
                         try:
@@ -519,6 +540,7 @@ class AppCoordinator:
                 self.db.save()
                 web.set_web_status("error", f"重建失败: {exc}")
             finally:
+                web.clear_web_upload()
                 self.current_task = None
                 self.task_lock.release()
 
@@ -553,18 +575,41 @@ class AppCoordinator:
 
             try:
                 _logger.info("manual upload triggered for segment %s (%s)", segment_id, title)
-                web.set_web_status("uploading", f"正在上传 {title}")
+                file_size = os.path.getsize(local_path) if os.path.isfile(local_path) else 0
+                web.update_web_upload(segment_id, title=title, percent=0.0, uploaded_bytes=0, total_bytes=file_size)
+                web.set_web_status("uploading", f"正在上传 {title} (0.0%)")
+
+                start_time = time.monotonic()
+
+                def _upload_cb(pct: float, uploaded_b: int = 0, total_b: int = 0) -> None:
+                    pct_val = pct * 100.0
+                    now = time.monotonic()
+                    elapsed = max(0.001, now - start_time)
+                    speed_bps = uploaded_b / elapsed if uploaded_b > 0 else 0
+                    speed_str = f"{speed_bps / (1024 * 1024):.1f} MB/s" if speed_bps > 0 else "N/A"
+                    web.update_web_upload(
+                        segment_id,
+                        title=title,
+                        percent=pct_val,
+                        uploaded_bytes=uploaded_b,
+                        total_bytes=total_b or file_size,
+                        speed=speed_str,
+                    )
+                    web.set_web_status("uploading", f"正在上传 {title} ({pct_val:.1f}%) · {speed_str}")
+
                 file_ids = srec.get("file_ids", [])
                 files = [
                     ScannedFile.from_record(fid, self.db.files[fid], self.args.input)
                     for fid in file_ids if fid in self.db.files
                 ]
                 desc = build_segment_description(files, total_duration=srec.get("duration_seconds"))
-                video_id = uploader.upload(local_path, title, desc, privacy=self.args.privacy)
+                video_id = uploader.upload(local_path, title, desc, privacy=self.args.privacy, progress_callback=_upload_cb)
                 uploader.verify(video_id)
 
                 srec["youtube_video_id"] = video_id
                 srec["status"] = SEGMENT_STATUS_SEALED
+                if getattr(self.args, "keep_segments", 0) <= 0:
+                    srec["output_path"] = None
                 self.db.upsert_segment(segment_id, srec)
                 self.db.save()
 
@@ -576,6 +621,7 @@ class AppCoordinator:
                 _logger.error("segment %s upload failed: %s", segment_id, exc, exc_info=True)
                 web.set_web_status("error", f"上传失败: {exc}")
             finally:
+                web.clear_web_upload()
                 self.current_task = None
                 self.task_lock.release()
 

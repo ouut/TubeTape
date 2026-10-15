@@ -186,3 +186,81 @@ class TestAuth:
         assert auth.check_token_permissions(str(path)) is True
         os.chmod(path, 0o644)
         assert auth.check_token_permissions(str(path)) is False
+
+
+class TestUploadWorker:
+    def test_worker_successful_sequential_upload(self, tmp_path):
+        from tubetape.uploader import UploadWorker, UploadTask
+
+        f1 = tmp_path / "seg1.mp4"
+        f1.write_bytes(b"data1")
+        f2 = tmp_path / "seg2.mp4"
+        f2.write_bytes(b"data2")
+
+        uploaded = []
+
+        class MockUploader:
+            def upload(self, file_path, title, desc, privacy="private", playlist_id=None, progress_callback=None):
+                if progress_callback:
+                    progress_callback(0.5, 50, 100)
+                    progress_callback(1.0, 100, 100)
+                vid = f"yt-{os.path.basename(file_path)}"
+                uploaded.append((file_path, title, vid))
+                return vid
+
+        worker = UploadWorker(MockUploader())
+        assert worker.queued_ids == set()
+
+        completed = []
+        task1 = UploadTask("s1", "Seg 1", str(f1), "desc1", on_complete=lambda vid: completed.append(("s1", vid)))
+        task2 = UploadTask("s2", "Seg 2", str(f2), "desc2", on_complete=lambda vid: completed.append(("s2", vid)))
+
+        worker.enqueue(task1)
+        worker.enqueue(task2)
+
+        worker.wait_done()
+        worker.stop()
+
+        assert len(uploaded) == 2
+        assert completed == [("s1", "yt-seg1.mp4"), ("s2", "yt-seg2.mp4")]
+        assert worker.queued_ids == set()
+
+    def test_worker_quota_exhaustion_stops_further_uploads(self, tmp_path):
+        from tubetape.uploader import UploadWorker, UploadTask
+
+        f1 = tmp_path / "seg1.mp4"
+        f1.write_bytes(b"data1")
+        f2 = tmp_path / "seg2.mp4"
+        f2.write_bytes(b"data2")
+
+        class QuotaUploader:
+            def upload(self, *a, **kw):
+                raise QuotaExceededError("quota exceeded test")
+
+        worker = UploadWorker(QuotaUploader())
+        errors = []
+        task1 = UploadTask("s1", "Seg 1", str(f1), "desc1", on_error=lambda exc: errors.append(("s1", exc)))
+        task2 = UploadTask("s2", "Seg 2", str(f2), "desc2", on_error=lambda exc: errors.append(("s2", exc)))
+
+        worker.enqueue(task1)
+        worker.enqueue(task2)
+
+        worker.wait_done()
+        worker.stop()
+
+        assert worker.quota_error is not None
+        assert isinstance(worker.quota_error, QuotaExceededError)
+        assert len(errors) == 2
+
+
+class TestReporterUploadProgress:
+    def test_upload_progress_output(self, capsys):
+        from tubetape.ui import Reporter
+
+        rep = Reporter(tty=False)
+        rep.upload_progress("Seg Title", 45.5, uploaded_bytes=45500000, total_bytes=100000000, speed="2.5 MB/s")
+        captured = capsys.readouterr().out
+        assert "[上传中]" in captured
+        assert "Seg Title" in captured
+        assert "45.5%" in captured
+        assert "2.5 MB/s" in captured

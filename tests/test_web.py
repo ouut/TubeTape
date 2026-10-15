@@ -733,6 +733,75 @@ def test_gallery_dynamic_plan_fallback(tmp_path):
         server.stop()
 
 
+def test_web_upload_queue_and_progress_overlay(tmp_path):
+    from tubetape.db import Database
+
+    db_path = tmp_path / "tubetape.json"
+    db = Database(path=str(db_path))
+    db.upsert_segment("seg_1", {
+        "title": "Segment 1",
+        "file_ids": ["f1"],
+        "duration_seconds": 120.0,
+        "status": "sealed",
+        "output_path": str(tmp_path / "seg1.mp4"),
+        "youtube_video_id": None,
+    })
+    db.upsert_segment("seg_2", {
+        "title": "Segment 2",
+        "file_ids": ["f2"],
+        "duration_seconds": 150.0,
+        "status": "sealed",
+        "output_path": str(tmp_path / "seg2.mp4"),
+        "youtube_video_id": None,
+    })
+    db.save()
+
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        web.set_web_context(media_dir=str(tmp_path), db=db, db_path=str(db_path))
+
+        # 1. Initially both are sealed without youtube_video_id -> is_pending_upload
+        with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            segs = {s["segment_id"]: s for s in data["segments"]}
+            assert segs["seg_1"]["is_pending_upload"] is True
+            assert segs["seg_1"]["is_upload_queued"] is False
+            assert segs["seg_1"]["upload_progress"] is None
+
+        # 2. Set upload queue and update active upload progress
+        web.set_upload_queue(["seg_1", "seg_2"])
+        web.update_web_upload("seg_1", title="Segment 1", percent=42.5, uploaded_bytes=4250, total_bytes=10000, speed="1.2 MB/s")
+
+        with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["upload"]["segment_id"] == "seg_1"
+            assert data["upload"]["percent"] == 42.5
+            assert data["upload"]["speed"] == "1.2 MB/s"
+            assert data["upload_queue"] == ["seg_1", "seg_2"]
+
+            segs = {s["segment_id"]: s for s in data["segments"]}
+            assert segs["seg_1"]["status"] == "uploading"
+            assert segs["seg_1"]["upload_progress"]["percent"] == 42.5
+            assert segs["seg_2"]["is_upload_queued"] is True
+
+        # 3. Finish seg_1
+        web.finish_web_segment("seg_1", youtube_video_id="yt_vid_seg_1")
+        assert web.get_upload_queue() == ["seg_2"]
+        assert web._server_state["upload"]["segment_id"] is None
+
+    finally:
+        web.clear_web_upload()
+        web.set_upload_queue([])
+        server.stop()
+
+
 
 
 

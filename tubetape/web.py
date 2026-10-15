@@ -52,6 +52,15 @@ _server_state = {
         "fps": None,
         "speed": None,
     },
+    "upload": {
+        "segment_id": None,
+        "title": None,
+        "percent": 0.0,
+        "uploaded_bytes": 0,
+        "total_bytes": 0,
+        "speed": None,
+    },
+    "upload_queue": [],
     "planned_segments": [],
     "coordinator": None,
     "_file_cache": None,
@@ -162,6 +171,47 @@ def update_web_transcode(
     }
 
 
+def update_web_upload(
+    segment_id: str,
+    title: str,
+    percent: float,
+    uploaded_bytes: int = 0,
+    total_bytes: int = 0,
+    speed: str | None = None,
+) -> None:
+    """Update upload progress for real-time progress display in dashboard."""
+    _server_state["upload"] = {
+        "segment_id": segment_id,
+        "title": title,
+        "percent": max(0.0, min(100.0, float(percent))),
+        "uploaded_bytes": int(uploaded_bytes),
+        "total_bytes": int(total_bytes),
+        "speed": speed,
+    }
+
+
+def clear_web_upload() -> None:
+    """Clear active upload progress."""
+    _server_state["upload"] = {
+        "segment_id": None,
+        "title": None,
+        "percent": 0.0,
+        "uploaded_bytes": 0,
+        "total_bytes": 0,
+        "speed": None,
+    }
+
+
+def set_upload_queue(queue_sids: list[str]) -> None:
+    """Update list of segment_ids currently queued for upload."""
+    _server_state["upload_queue"] = list(queue_sids)
+
+
+def get_upload_queue() -> list[str]:
+    """Get list of segment_ids currently queued for upload."""
+    return list(_server_state.get("upload_queue", []))
+
+
 def finish_web_segment(segment_id: str, youtube_video_id: str | None = None) -> None:
     """Mark a segment as finished transcoding / uploading."""
     if _server_state["transcode"].get("segment_id") == segment_id:
@@ -172,6 +222,11 @@ def finish_web_segment(segment_id: str, youtube_video_id: str | None = None) -> 
             "total": 0,
             "current_file": None,
         }
+    if _server_state["upload"].get("segment_id") == segment_id:
+        clear_web_upload()
+    uq = _server_state.get("upload_queue", [])
+    if segment_id in uq:
+        _server_state["upload_queue"] = [sid for sid in uq if sid != segment_id]
 
 
 def set_web_oauth_session(session) -> None:
@@ -470,6 +525,26 @@ def _collect_segments() -> dict[str, dict]:
             "fps": cur_tc.get("fps"),
             "speed": cur_tc.get("speed"),
         }
+
+    # 5. Upload queue and active upload progress overlay
+    cur_up = _server_state.get("upload", {})
+    active_up_sid = cur_up.get("segment_id")
+    upload_q = set(_server_state.get("upload_queue", []))
+
+    for sid, seg in segments_dict.items():
+        is_sealed_without_yt = (seg.get("status") == "sealed" or seg.get("status") == "uploaded") and not seg.get("youtube_video_id")
+        seg["is_pending_upload"] = is_sealed_without_yt
+        seg["is_upload_queued"] = sid in upload_q
+        if active_up_sid and sid == active_up_sid:
+            seg["status"] = "uploading"
+            seg["upload_progress"] = {
+                "percent": cur_up.get("percent", 0.0),
+                "uploaded_bytes": cur_up.get("uploaded_bytes", 0),
+                "total_bytes": cur_up.get("total_bytes", 0),
+                "speed": cur_up.get("speed"),
+            }
+        else:
+            seg["upload_progress"] = None
 
     return segments_dict
 
@@ -1722,6 +1797,9 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
       font-weight: 600;
     }
     .badge-uploaded { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-pending-upload { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.35); }
+    .badge-queued-upload { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
+    .badge-uploading { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); }
     .badge-building { background: rgba(59, 130, 246, 0.15); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.3); }
     .badge-pending { background: rgba(161, 161, 170, 0.15); color: #d4d4d8; border: 1px solid rgba(161, 161, 170, 0.3); }
     .badge-failed { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.3); }
@@ -1749,6 +1827,9 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
       background: var(--blue);
       border-radius: 3px;
       transition: width 0.3s;
+    }
+    .progress-bar-fill-upload {
+      background: linear-gradient(90deg, #3b82f6, #10b981);
     }
 
     /* Log Stream Section */
@@ -1853,6 +1934,32 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
     .btn-action-upload { color: #86efac; }
     .btn-action-delete { color: #fca5a5; }
     .btn-action-delete:hover:not(:disabled) { background: rgba(239, 68, 68, 0.2); border-color: #ef4444; }
+    .btn-upload-progress {
+      position: relative;
+      overflow: hidden;
+      min-width: 80px;
+      text-align: center;
+      justify-content: center;
+      padding: 3px 6px;
+      border-color: rgba(16, 185, 129, 0.5);
+      background: #1c2621;
+    }
+    .btn-upload-progress-fill {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      background: rgba(16, 185, 129, 0.45);
+      transition: width 0.25s ease;
+      z-index: 1;
+    }
+    .btn-upload-progress-text {
+      position: relative;
+      z-index: 2;
+      font-weight: 600;
+      color: #6ee7b7;
+      font-size: 0.75rem;
+    }
 
     /* Modal */
     .modal-overlay {
@@ -2441,7 +2548,8 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
           }
 
           let taskDetail = d.task || '-';
-          if (d.transcode && d.transcode.total > 0 && (d.status === 'transcoding' || d.status === 'building')) {
+          let taskParts = [];
+          if (d.transcode && d.transcode.total > 0 && (d.status === 'transcoding' || d.status === 'building' || d.transcode.segment_id)) {
             const resumeTag = d.transcode.resumed ? '[⚡断点复用] ' : '';
             let fileProgText = '';
             if (typeof d.transcode.file_progress === 'number' && d.transcode.file_progress >= 0) {
@@ -2450,7 +2558,15 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
               if (d.transcode.speed) fileProgText += ` · ${d.transcode.speed}`;
               fileProgText += ']';
             }
-            taskDetail = `${resumeTag}${d.transcode.title || ''} (${d.transcode.done}/${d.transcode.total})${fileProgText}: ${d.transcode.current_file || ''}`;
+            taskParts.push(`⚡转码: ${resumeTag}${d.transcode.title || ''} (${d.transcode.done}/${d.transcode.total})${fileProgText}`);
+          }
+          if (d.upload && d.upload.segment_id) {
+            const upSpd = d.upload.speed ? ` · ${d.upload.speed}` : '';
+            const upMb = d.upload.uploaded_bytes && d.upload.total_bytes ? ` (${(d.upload.uploaded_bytes / 1048576).toFixed(1)}MB / ${(d.upload.total_bytes / 1048576).toFixed(1)}MB)` : '';
+            taskParts.push(`☁️上传: ${d.upload.title || ''} (${d.upload.percent.toFixed(1)}%${upMb}${upSpd})`);
+          }
+          if (taskParts.length > 0) {
+            taskDetail = taskParts.join(' | ');
           }
           document.getElementById('metric-task-sub').textContent = taskDetail;
 
@@ -2461,9 +2577,24 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
             tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #888;">暂无分段信息</td></tr>';
           } else {
             tbody.innerHTML = d.segments.map(seg => {
+              const upProg = seg.upload_progress || (d.upload && d.upload.segment_id === seg.segment_id ? d.upload : null);
+              const isUploading = !!(upProg && upProg.segment_id === seg.segment_id);
+              const isQueued = !isUploading && (seg.is_upload_queued || (d.upload_queue && d.upload_queue.includes(seg.segment_id)));
+
               let statusHtml = '';
-              if (seg.status === 'uploaded') {
+              if (seg.youtube_video_id) {
                 statusHtml = '<span class="badge badge-uploaded">✅ 已上传</span>';
+              } else if (isUploading) {
+                const pct = upProg.percent !== undefined ? upProg.percent : 0;
+                const spd = upProg.speed ? ` · ${escapeHtml(upProg.speed)}` : '';
+                statusHtml = `
+                  <div>
+                    <span class="badge badge-uploading">☁️ 正在上传 (${pct.toFixed(1)}%${spd})</span>
+                    <div class="progress-bar-wrap"><div class="progress-bar-fill progress-bar-fill-upload" style="width: ${pct}%"></div></div>
+                  </div>
+                `;
+              } else if (isQueued) {
+                statusHtml = '<span class="badge badge-queued-upload">⏳ 排队上传中</span>';
               } else if (seg.status === 'building') {
                 const prog = seg.progress || { done: 0, total: 1, current_file: '' };
                 const pct = prog.total > 0 ? Math.round((prog.done / prog.total) * 100) : 0;
@@ -2484,8 +2615,8 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
                 statusHtml = '<span class="badge badge-pending">⏳ 等待构建</span>';
               } else if (seg.status === 'failed') {
                 statusHtml = '<span class="badge badge-failed">❌ 构建失败</span>';
-              } else if (seg.status === 'sealed' && !seg.youtube_video_id) {
-                statusHtml = '<span class="badge badge-uploaded" style="color: #60a5fa; border-color: rgba(96,165,250,0.3); background: rgba(96,165,250,0.15);">📦 本地就绪</span>';
+              } else if (seg.is_pending_upload || seg.status === 'sealed') {
+                statusHtml = '<span class="badge badge-pending-upload">📦 本地就绪 · 待上传</span>';
               } else {
                 statusHtml = `<span class="badge badge-pending">${escapeHtml(seg.status)}</span>`;
               }
@@ -2495,10 +2626,29 @@ _LOG_DASHBOARD_HTML = """<!DOCTYPE html>
                 ytHtml = `<a href="https://youtu.be/${seg.youtube_video_id}" target="_blank" class="yt-link">▶️ 查看视频 (${seg.youtube_video_id})</a>`;
               }
 
+              let uploadBtnHtml = '';
+              if (seg.youtube_video_id) {
+                uploadBtnHtml = `<button class="btn-action btn-action-upload" disabled style="opacity: 0.5;" title="已上传至 YouTube">✅ 已上传</button>`;
+              } else if (isUploading) {
+                const pct = upProg.percent !== undefined ? upProg.percent : 0;
+                uploadBtnHtml = `
+                  <div class="btn-action btn-upload-progress" title="正在上传 ${pct.toFixed(1)}%">
+                    <div class="btn-upload-progress-fill" style="width: ${pct}%;"></div>
+                    <span class="btn-upload-progress-text">☁️ ${pct.toFixed(1)}%</span>
+                  </div>
+                `;
+              } else if (isQueued) {
+                uploadBtnHtml = `<button class="btn-action btn-action-upload" disabled style="opacity: 0.85; color: #fbbf24;" title="正在排队等待上传">⏳ 排队中</button>`;
+              } else {
+                const canUpload = seg.has_local_file || seg.is_pending_upload;
+                const tip = canUpload ? '上传该分片至 YouTube' : '本地 uploaded_segments/ 中未找到视频文件，需先重新构建';
+                uploadBtnHtml = `<button class="btn-action btn-action-upload" ${canUpload ? '' : 'disabled '}title="${tip}" onclick="uploadSegment('${seg.segment_id}')">☁️ 上传</button>`;
+              }
+
               let actionsHtml = `
                 <div style="display: flex; gap: 6px; align-items: center;">
-                  <button class="btn-action btn-action-rebuild" onclick="rebuildSegment('${seg.segment_id}')" title="强制重新转码构建该分片">🔨 重建</button>
-                  <button class="btn-action btn-action-upload" ${seg.has_local_file ? '' : 'disabled title="本地 uploaded_segments/ 中未找到视频文件，需先重新构建"'} onclick="uploadSegment('${seg.segment_id}')">☁️ 上传</button>
+                  <button class="btn-action btn-action-rebuild" ${isUploading ? 'disabled ' : ''}onclick="rebuildSegment('${seg.segment_id}')" title="强制重新转码构建该分片">🔨 重建</button>
+                  ${uploadBtnHtml}
                   <button class="btn-action btn-action-delete" ${seg.youtube_video_id ? '' : 'disabled title="未上传到 YouTube"'} onclick="deleteYoutubeVideo('${seg.segment_id}', '${seg.youtube_video_id || ''}')">🗑️ 删视频</button>
                 </div>
               `;
@@ -3623,6 +3773,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 "auth_url": session.auth_url if auth_required else None,
                 "scanner": _server_state["scanner"],
                 "transcode": cur_tc,
+                "upload": _server_state.get("upload", {}),
+                "upload_queue": _server_state.get("upload_queue", []),
                 "stats": {
                     "total_files": files_count,
                     "total_segments": len(segments_list),

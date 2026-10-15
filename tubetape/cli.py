@@ -671,174 +671,34 @@ def _run_pipeline_impl(
     segments_dir = getattr(args, "segments_dir", None) or os.path.join(os.path.dirname(args.db), "uploaded_segments")
     os.makedirs(segments_dir, exist_ok=True)
 
+    is_no_upload = getattr(args, "no_upload", False) or (uploader is None)
+    upload_worker = None
+    if not is_no_upload and uploader:
+        from .uploader import UploadTask, UploadWorker
+        upload_worker = UploadWorker(uploader, reporter=reporter)
+
     total_segments = len(segments_to_process)
-    for index, segment in enumerate(segments_to_process, start=1):
-        segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
-        is_single_vid = len(segment_files) == 1 and segment_files[0].type == FILE_TYPE_VIDEO
-        if is_single_vid:
-            ext = os.path.splitext(segment_files[0].abs_path)[1].lower() or ".mp4"
-            out_path = os.path.join(segments_dir, f"{segment.title}{ext}")
-        else:
-            out_path = os.path.join(segments_dir, f"{segment.title}.mp4")
+    try:
+        for index, segment in enumerate(segments_to_process, start=1):
+            segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
+            is_single_vid = len(segment_files) == 1 and segment_files[0].type == FILE_TYPE_VIDEO
+            if is_single_vid:
+                ext = os.path.splitext(segment_files[0].abs_path)[1].lower() or ".mp4"
+                out_path = os.path.join(segments_dir, f"{segment.title}{ext}")
+            else:
+                out_path = os.path.join(segments_dir, f"{segment.title}.mp4")
 
-        # Already on YouTube (e.g. after a lost db or restart): record locally and skip.
-        existing_video = remote_index.get(segment.segment_id) or remote_index.get(segment.segment_id[:16])
-        if existing_video:
-            reporter.status(
-                f"segment {segment.title} already on YouTube ({existing_video}); skipping"
-            )
-            _log.info(
-                "segment %s already uploaded as %s; recording and skipping",
-                segment.segment_id,
-                existing_video,
-            )
-            db.upsert_segment(
-                segment.segment_id,
-                {
-                    "title": segment.title,
-                    "file_ids": segment.file_ids,
-                    "range": [segment.start_ts, segment.end_ts],
-                    "duration_seconds": segment.duration_seconds,
-                    "output_path": None,
-                    "youtube_video_id": existing_video,
-                    "previous_video_ids": [],
-                    "status": SEGMENT_STATUS_SEALED,
-                    "chapters": [],
-                    "last_rebuilt_at": None,
-                    "attempts": 0,
-                    "error": None,
-                },
-            )
-            if segment.is_rebuild and segment.replaces_segment_id:
-                db.segments.pop(segment.replaces_segment_id, None)
-            db.save()
-            continue
-
-        _log.info(
-            "segment %d/%d: %s (%d files, %.1fs) -> %s",
-            index,
-            total_segments,
-            segment.title,
-            len(segment_files),
-            segment.duration_seconds,
-            out_path,
-        )
-
-        def transcode_fn(files, _out_path=out_path):
-            def progress(
-                done: int,
-                total: int,
-                item,
-                is_resumed: bool = False,
-                file_progress: float | None = None,
-                fps: float | None = None,
-                speed: str | None = None,
-            ) -> None:
-                if is_resumed:
-                    reporter.status(f"    [断点复用 {done}/{total}] {item.rel_path}")
-                elif file_progress is not None:
-                    spd_info = f" [速度 {speed}]" if speed and speed != "N/A" else ""
-                    fps_info = f" ({fps:.1f} fps)" if fps and fps > 0 else ""
-                    reporter.status(
-                        f"    transcode {done}/{total}: {item.rel_path} ({file_progress:.1f}%{spd_info}{fps_info})"
-                    )
-                else:
-                    reporter.status(f"    transcode {done}/{total}: {item.rel_path} ({item.type})")
-                web.update_web_transcode(
-                    segment_id=segment.segment_id,
-                    title=segment.title,
-                    done=done,
-                    total=total,
-                    current_file=item.rel_path,
-                    resumed=is_resumed,
-                    file_progress=file_progress,
-                    fps=fps,
-                    speed=speed,
-                )
-
-            return transcode_segment(files, _out_path, config, progress=progress)
-
-        try:
-            reporter.status(f"transcoding {segment.title} ...")
-            web.set_web_status("transcoding", f"正在转码 {segment.title}")
-            is_no_upload = getattr(args, "no_upload", False) or (uploader is None)
-            if segment.is_rebuild:
+            # Already on YouTube (e.g. after a lost db or restart): record locally and skip.
+            existing_video = remote_index.get(segment.segment_id) or remote_index.get(segment.segment_id[:16])
+            if existing_video:
                 reporter.status(
-                    f"rebuilding {segment.title} (replaces {segment.replaces_segment_id[:12]} ...) ..."
+                    f"segment {segment.title} already on YouTube ({existing_video}); skipping"
                 )
                 _log.info(
-                    "rebuild: replacing segment %s with %s",
-                    segment.replaces_segment_id,
+                    "segment %s already uploaded as %s; recording and skipping",
                     segment.segment_id,
+                    existing_video,
                 )
-                if not is_no_upload and uploader:
-                    rebuilder = Rebuilder(
-                        db,
-                        transcode_fn=transcode_fn,
-                        upload_fn=lambda out, title, desc: uploader.upload(
-                            out, title, desc, privacy=args.privacy
-                        ),
-                        verify_fn=uploader.verify,
-                        delete_fn=uploader.delete_video,
-                    )
-                    video_id = rebuilder.rebuild(
-                        segment.replaces_segment_id,
-                        segment,
-                        segment_files,
-                        title=segment.title,
-                    )
-                    _log.info("rebuild committed: new video id %s", video_id)
-                else:
-                    _, chapters = transcode_fn(segment_files)
-                    video_id = None
-                    saved_out_path = out_path if getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path) else None
-                    db.upsert_segment(
-                        segment.segment_id,
-                        {
-                            "title": segment.title,
-                            "file_ids": segment.file_ids,
-                            "range": [segment.start_ts, segment.end_ts],
-                            "duration_seconds": segment.duration_seconds,
-                            "output_path": saved_out_path,
-                            "youtube_video_id": None,
-                            "previous_video_ids": [],
-                            "status": SEGMENT_STATUS_SEALED,
-                            "chapters": chapters,
-                            "last_rebuilt_at": None,
-                            "attempts": 0,
-                            "error": None,
-                        },
-                    )
-                    if segment.replaces_segment_id:
-                        db.segments.pop(segment.replaces_segment_id, None)
-
-                if not is_no_upload:
-                    rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
-                web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
-            else:
-                _, chapters = transcode_fn(segment_files)
-                if not is_no_upload and uploader:
-                    reporter.status(f"uploading {segment.title} ...")
-                    web.set_web_status("uploading", f"正在上传 {segment.title}")
-                    description = build_segment_description(segment_files, total_duration=segment.duration_seconds)
-                    def _upload_cb(pct: float) -> None:
-                        web.set_web_status("uploading", f"正在上传 {segment.title} ({pct * 100:.1f}%)")
-
-                    video_id = uploader.upload(
-                        out_path,
-                        segment.title,
-                        description,
-                        privacy=args.privacy,
-                        progress_callback=_upload_cb,
-                    )
-                    _log.info("sealed segment %s -> video id %s", segment.segment_id, video_id)
-                else:
-                    video_id = None
-                    reporter.status(f"transcoded {segment.title} (saved locally to {out_path})")
-                    _log.info("sealed segment %s locally (no-upload)", segment.segment_id)
-
-                saved_out_path = out_path if (is_no_upload or (getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path))) else None
-                srec = db.segments.get(segment.segment_id, {})
                 db.upsert_segment(
                     segment.segment_id,
                     {
@@ -846,36 +706,324 @@ def _run_pipeline_impl(
                         "file_ids": segment.file_ids,
                         "range": [segment.start_ts, segment.end_ts],
                         "duration_seconds": segment.duration_seconds,
-                        "output_path": saved_out_path,
-                        "youtube_video_id": video_id,
-                        "previous_video_ids": srec.get("previous_video_ids", []),
+                        "output_path": None,
+                        "youtube_video_id": existing_video,
+                        "previous_video_ids": [],
                         "status": SEGMENT_STATUS_SEALED,
-                        "chapters": chapters if chapters else srec.get("chapters", []),
-                        "last_rebuilt_at": srec.get("last_rebuilt_at"),
-                        "attempts": srec.get("attempts", 0),
+                        "chapters": [],
+                        "last_rebuilt_at": None,
+                        "attempts": 0,
                         "error": None,
                     },
                 )
-                if not is_no_upload:
-                    rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
-                web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
-        except QuotaExceededError as exc:
-            reporter.status(
-                f"YouTube quota exhausted; deferring remaining "
-                f"{total_segments - index + 1} segment(s) to a later retry"
-            )
-            _log.warning(
-                "quota exhausted while processing segment %s: %s", segment.segment_id, exc
-            )
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
-            db.save()
-            return _EXIT_QUOTA
+                if segment.is_rebuild and segment.replaces_segment_id:
+                    db.segments.pop(segment.replaces_segment_id, None)
+                db.save()
+                continue
 
-        db.save()
-        _log.debug("database saved to %s", db.path)
+            # Check if segment was already transcoded locally and sealed in db
+            srec = db.segments.get(segment.segment_id)
+            local_out = srec.get("output_path") if srec else None
+            has_existing_file = (local_out and os.path.isfile(local_out)) or os.path.isfile(out_path)
+            if (
+                srec
+                and not segment.is_rebuild
+                and has_existing_file
+                and not srec.get("youtube_video_id")
+            ):
+                target_out = local_out if (local_out and os.path.isfile(local_out)) else out_path
+                if upload_worker:
+                    reporter.status(f"segment {segment.title} already transcoded locally ({target_out}); queuing for upload")
+                    _log.info("segment %s already transcoded locally; queuing for upload", segment.segment_id)
+                    description = build_segment_description(segment_files, total_duration=segment.duration_seconds)
+
+                    def _make_callbacks(sid, tit, seg_out):
+                        def _done(vid: str):
+                            s = db.segments.get(sid, {})
+                            s["youtube_video_id"] = vid
+                            s["status"] = SEGMENT_STATUS_SEALED
+                            s["error"] = None
+                            if getattr(args, "keep_segments", 0) <= 0:
+                                s["output_path"] = None
+                            db.upsert_segment(sid, s)
+                            db.save()
+                            rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
+                            web.finish_web_segment(sid, youtube_video_id=vid)
+
+                        def _err(e: Exception):
+                            s = db.segments.get(sid, {})
+                            s["error"] = str(e)
+                            db.upsert_segment(sid, s)
+                            db.save()
+
+                        return _done, _err
+
+                    cb_done, cb_err = _make_callbacks(segment.segment_id, segment.title, target_out)
+                    upload_worker.enqueue(
+                        UploadTask(
+                            segment_id=segment.segment_id,
+                            title=segment.title,
+                            out_path=target_out,
+                            description=description,
+                            privacy=args.privacy,
+                            on_complete=cb_done,
+                            on_error=cb_err,
+                        )
+                    )
+                    continue
+
+            _log.info(
+                "segment %d/%d: %s (%d files, %.1fs) -> %s",
+                index,
+                total_segments,
+                segment.title,
+                len(segment_files),
+                segment.duration_seconds,
+                out_path,
+            )
+
+            def transcode_fn(files, _out_path=out_path):
+                def progress(
+                    done: int,
+                    total: int,
+                    item,
+                    is_resumed: bool = False,
+                    file_progress: float | None = None,
+                    fps: float | None = None,
+                    speed: str | None = None,
+                ) -> None:
+                    if is_resumed:
+                        reporter.status(f"    [断点复用 {done}/{total}] {item.rel_path}")
+                    elif file_progress is not None:
+                        spd_info = f" [速度 {speed}]" if speed and speed != "N/A" else ""
+                        fps_info = f" ({fps:.1f} fps)" if fps and fps > 0 else ""
+                        reporter.status(
+                            f"    transcode {done}/{total}: {item.rel_path} ({file_progress:.1f}%{spd_info}{fps_info})"
+                        )
+                    else:
+                        reporter.status(f"    transcode {done}/{total}: {item.rel_path} ({item.type})")
+                    web.update_web_transcode(
+                        segment_id=segment.segment_id,
+                        title=segment.title,
+                        done=done,
+                        total=total,
+                        current_file=item.rel_path,
+                        resumed=is_resumed,
+                        file_progress=file_progress,
+                        fps=fps,
+                        speed=speed,
+                    )
+
+                return transcode_segment(files, _out_path, config, progress=progress)
+
+            try:
+                reporter.status(f"transcoding {segment.title} ...")
+                web.set_web_status("transcoding", f"正在转码 {segment.title}")
+                if segment.is_rebuild:
+                    reporter.status(
+                        f"rebuilding {segment.title} (replaces {segment.replaces_segment_id[:12]} ...) ..."
+                    )
+                    _log.info(
+                        "rebuild: replacing segment %s with %s",
+                        segment.replaces_segment_id,
+                        segment.segment_id,
+                    )
+                    if upload_worker:
+                        upload_worker.wait_done()
+                    if not is_no_upload and uploader:
+                        rebuilder = Rebuilder(
+                            db,
+                            transcode_fn=transcode_fn,
+                            upload_fn=lambda out, title, desc: uploader.upload(
+                                out, title, desc, privacy=args.privacy
+                            ),
+                            verify_fn=uploader.verify,
+                            delete_fn=uploader.delete_video,
+                        )
+                        video_id = rebuilder.rebuild(
+                            segment.replaces_segment_id,
+                            segment,
+                            segment_files,
+                            title=segment.title,
+                        )
+                        _log.info("rebuild committed: new video id %s", video_id)
+                    else:
+                        _, chapters = transcode_fn(segment_files)
+                        video_id = None
+                        saved_out_path = out_path if getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path) else None
+                        db.upsert_segment(
+                            segment.segment_id,
+                            {
+                                "title": segment.title,
+                                "file_ids": segment.file_ids,
+                                "range": [segment.start_ts, segment.end_ts],
+                                "duration_seconds": segment.duration_seconds,
+                                "output_path": saved_out_path,
+                                "youtube_video_id": None,
+                                "previous_video_ids": [],
+                                "status": SEGMENT_STATUS_SEALED,
+                                "chapters": chapters,
+                                "last_rebuilt_at": None,
+                                "attempts": 0,
+                                "error": None,
+                            },
+                        )
+                        if segment.replaces_segment_id:
+                            db.segments.pop(segment.replaces_segment_id, None)
+
+                    if not is_no_upload:
+                        rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
+                    web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
+                else:
+                    _, chapters = transcode_fn(segment_files)
+                    if upload_worker:
+                        reporter.status(f"transcoded {segment.title}; queuing for background upload ...")
+                        _log.info("transcoded %s; queuing for background upload", segment.segment_id)
+                        saved_out_path = out_path
+                        srec = db.segments.get(segment.segment_id, {})
+                        db.upsert_segment(
+                            segment.segment_id,
+                            {
+                                "title": segment.title,
+                                "file_ids": segment.file_ids,
+                                "range": [segment.start_ts, segment.end_ts],
+                                "duration_seconds": segment.duration_seconds,
+                                "output_path": saved_out_path,
+                                "youtube_video_id": None,
+                                "previous_video_ids": srec.get("previous_video_ids", []),
+                                "status": SEGMENT_STATUS_SEALED,
+                                "chapters": chapters if chapters else srec.get("chapters", []),
+                                "last_rebuilt_at": srec.get("last_rebuilt_at"),
+                                "attempts": srec.get("attempts", 0),
+                                "error": None,
+                            },
+                        )
+                        db.save()
+
+                        description = build_segment_description(segment_files, total_duration=segment.duration_seconds)
+                        def _make_callbacks(sid, tit, seg_out):
+                            def _done(vid: str):
+                                s = db.segments.get(sid, {})
+                                s["youtube_video_id"] = vid
+                                s["status"] = SEGMENT_STATUS_SEALED
+                                s["error"] = None
+                                if getattr(args, "keep_segments", 0) <= 0:
+                                    s["output_path"] = None
+                                db.upsert_segment(sid, s)
+                                db.save()
+                                rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
+                                web.finish_web_segment(sid, youtube_video_id=vid)
+
+                            def _err(e: Exception):
+                                s = db.segments.get(sid, {})
+                                s["error"] = str(e)
+                                db.upsert_segment(sid, s)
+                                db.save()
+
+                            return _done, _err
+
+                        cb_done, cb_err = _make_callbacks(segment.segment_id, segment.title, out_path)
+                        upload_worker.enqueue(
+                            UploadTask(
+                                segment_id=segment.segment_id,
+                                title=segment.title,
+                                out_path=out_path,
+                                description=description,
+                                privacy=args.privacy,
+                                on_complete=cb_done,
+                                on_error=cb_err,
+                            )
+                        )
+                    elif not is_no_upload and uploader:
+                        reporter.status(f"uploading {segment.title} ...")
+                        web.set_web_status("uploading", f"正在上传 {segment.title}")
+                        description = build_segment_description(segment_files, total_duration=segment.duration_seconds)
+                        def _upload_cb(pct: float) -> None:
+                            web.set_web_status("uploading", f"正在上传 {segment.title} ({pct * 100:.1f}%)")
+
+                        video_id = uploader.upload(
+                            out_path,
+                            segment.title,
+                            description,
+                            privacy=args.privacy,
+                            progress_callback=_upload_cb,
+                        )
+                        _log.info("sealed segment %s -> video id %s", segment.segment_id, video_id)
+                        saved_out_path = out_path if (getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path)) else None
+                        srec = db.segments.get(segment.segment_id, {})
+                        db.upsert_segment(
+                            segment.segment_id,
+                            {
+                                "title": segment.title,
+                                "file_ids": segment.file_ids,
+                                "range": [segment.start_ts, segment.end_ts],
+                                "duration_seconds": segment.duration_seconds,
+                                "output_path": saved_out_path,
+                                "youtube_video_id": video_id,
+                                "previous_video_ids": srec.get("previous_video_ids", []),
+                                "status": SEGMENT_STATUS_SEALED,
+                                "chapters": chapters if chapters else srec.get("chapters", []),
+                                "last_rebuilt_at": srec.get("last_rebuilt_at"),
+                                "attempts": srec.get("attempts", 0),
+                                "error": None,
+                            },
+                        )
+                        rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
+                        web.finish_web_segment(segment.segment_id, youtube_video_id=video_id)
+                    else:
+                        video_id = None
+                        reporter.status(f"transcoded {segment.title} (saved locally to {out_path})")
+                        _log.info("sealed segment %s locally (no-upload)", segment.segment_id)
+                        saved_out_path = out_path
+                        srec = db.segments.get(segment.segment_id, {})
+                        db.upsert_segment(
+                            segment.segment_id,
+                            {
+                                "title": segment.title,
+                                "file_ids": segment.file_ids,
+                                "range": [segment.start_ts, segment.end_ts],
+                                "duration_seconds": segment.duration_seconds,
+                                "output_path": saved_out_path,
+                                "youtube_video_id": None,
+                                "previous_video_ids": srec.get("previous_video_ids", []),
+                                "status": SEGMENT_STATUS_SEALED,
+                                "chapters": chapters if chapters else srec.get("chapters", []),
+                                "last_rebuilt_at": srec.get("last_rebuilt_at"),
+                                "attempts": srec.get("attempts", 0),
+                                "error": None,
+                            },
+                        )
+                        web.finish_web_segment(segment.segment_id, youtube_video_id=None)
+            except QuotaExceededError as exc:
+                reporter.status(
+                    f"YouTube quota exhausted; deferring remaining "
+                    f"{total_segments - index + 1} segment(s) to a later retry"
+                )
+                _log.warning(
+                    "quota exhausted while processing segment %s: %s", segment.segment_id, exc
+                )
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+                db.save()
+                return _EXIT_QUOTA
+
+            db.save()
+            _log.debug("database saved to %s", db.path)
+
+        if upload_worker:
+            reporter.status("transcoding complete; waiting for background upload(s) to finish ...")
+            _log.info("transcoding complete; waiting for background upload worker to drain")
+            upload_worker.wait_done()
+            if upload_worker.quota_error is not None:
+                reporter.status("YouTube quota exhausted; deferring remaining upload(s) to next run")
+                _log.warning("quota exhausted during background upload: %s", upload_worker.quota_error)
+                db.save()
+                return _EXIT_QUOTA
+    finally:
+        if upload_worker:
+            upload_worker.stop()
 
     db.save()
     web.set_web_status("watching" if args.watch else "done", "常驻监听中" if args.watch else "已完成")
