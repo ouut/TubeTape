@@ -751,8 +751,99 @@ class TestKeepSegments:
         db_after = Database.load(str(db_path))
         assert db_after.segments["seg_pending"]["status"] == SEGMENT_STATUS_SEALED
 
+    def test_coordinator_update_config_terminates_old_thread_and_restarts(self, tmp_path, monkeypatch):
+        import time
+        import threading
+        from tubetape import cli
+        from tubetape.coordinator import AppCoordinator
+        from tubetape.db import Database
+
+        db_path = tmp_path / "tubetape.json"
+        db = Database(path=str(db_path))
+        db.save()
+
+        args = cli.parse_args([
+            "--no-upload",
+            "--no-watch",
+            "--input", str(tmp_path),
+            "--db", str(db_path),
+            "--segment-duration", "1200s",
+        ])
+        coord = AppCoordinator(args, db=db)
+        setattr(args, "_coordinator", coord)
+
+        old_thread_ran = threading.Event()
+        old_thread_cancelled = threading.Event()
+
+        # Simulate a running pipeline worker thread
+        def fake_worker():
+            coord.enter_pipeline(threading.current_thread())
+            old_thread_ran.set()
+            try:
+                while not coord.is_cancelled():
+                    time.sleep(0.05)
+                old_thread_cancelled.set()
+            finally:
+                coord.exit_pipeline(threading.current_thread())
+
+        old_t = threading.Thread(target=fake_worker, name="OldWorker", daemon=True)
+        old_t.start()
+        assert old_thread_ran.wait(timeout=2.0)
+        assert coord.is_pipeline_active()
+
+        # Mock run_pipeline for the restarted pipeline so it doesn't do a full disk run
+        new_pipeline_ran = threading.Event()
+
+        def fake_run_pipeline(a, force_scan=False):
+            assert a.segment_duration == 600.0
+            new_pipeline_ran.set()
+            return 0
+
+        monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+        # Update configuration and verify restart
+        res = coord.update_config({"segment_duration": 600.0})
+        assert res["config"]["segment_duration"] == 600.0
+
+        # Verify old thread was cancelled and completed
+        assert old_thread_cancelled.wait(timeout=2.0)
+        old_t.join(timeout=2.0)
+        assert not old_t.is_alive()
+
+        # Verify new pipeline executed with new configuration
+        assert new_pipeline_ran.wait(timeout=3.0)
+
+    def test_coordinator_cancel_current_task_terminates_active_ffmpeg(self, tmp_path):
+        import subprocess
+        from tubetape import cli
+        from tubetape.coordinator import AppCoordinator
+        from tubetape.transcoder import _active_ffmpeg_procs, _ffmpeg_proc_lock
+
+        args = cli.parse_args([
+            "--no-upload",
+            "--no-watch",
+            "--input", str(tmp_path),
+            "--db", str(tmp_path / "tubetape.json"),
+        ])
+        coord = AppCoordinator(args)
+
+        # Spawn a long-running dummy process
+        dummy_proc = subprocess.Popen(["sleep", "60"])
+        with _ffmpeg_proc_lock:
+            _active_ffmpeg_procs.add(dummy_proc)
+
+        assert dummy_proc.poll() is None
+
+        # Call cancel_current_task and verify process was killed
+        coord.cancel_current_task(timeout=2.0)
+
+        assert dummy_proc.poll() is not None
+        with _ffmpeg_proc_lock:
+            assert dummy_proc not in _active_ffmpeg_procs
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
 
 

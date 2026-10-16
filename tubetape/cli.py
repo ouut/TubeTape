@@ -418,6 +418,8 @@ def run_pipeline(
     reporter: Reporter | None = None,
     force_scan: bool = False,
 ) -> int:
+    import threading
+
     reporter = reporter or Reporter()
 
     coordinator = _get_matched_coordinator(args)
@@ -427,6 +429,12 @@ def run_pipeline(
         db = Database.load(args.db)
         if coordinator:
             coordinator.db = db
+
+    if coordinator:
+        if coordinator.is_cancelled():
+            _log.info("pipeline start aborted: coordinator is cancelled")
+            return _EXIT_OK
+        coordinator.enter_pipeline(threading.current_thread())
 
     try:
         return _run_pipeline_impl(args, reporter, force_scan, db)
@@ -438,6 +446,14 @@ def run_pipeline(
             except Exception as e:
                 _log.warning("failed to save database on interrupt: %s", e)
         raise
+    except Exception as exc:
+        if coordinator and coordinator.is_cancelled():
+            _log.info("pipeline execution cancelled: %s", exc)
+            return _EXIT_OK
+        raise
+    finally:
+        if coordinator:
+            coordinator.exit_pipeline(threading.current_thread())
 
 
 def _run_pipeline_impl(
@@ -507,6 +523,8 @@ def _run_pipeline_impl(
     on_file = None if args.dry_run else _file_persister(db)
 
     def _scan_progress(done: int, total: int, item, mode: str, retained: int) -> None:
+        if coordinator and coordinator.is_cancelled():
+            raise RuntimeError("scan cancelled by coordinator")
         reporter.status(f"scanning [{done}/{total}]: {item.rel_path}")
         web.update_web_scanner(
             is_scanning=True,
@@ -531,6 +549,10 @@ def _run_pipeline_impl(
     )
     if on_file is not None and hasattr(on_file, "flush"):
         on_file.flush()
+
+    if coordinator and coordinator.is_cancelled():
+        _log.info("pipeline execution cancelled after scanning")
+        return _EXIT_OK
 
     web.update_web_scanner(
         is_scanning=False,
@@ -580,6 +602,9 @@ def _run_pipeline_impl(
         ignore_live_photos=getattr(args, "ignore_live_photos", True),
         min_video_duration=getattr(args, "min_video_duration", 2.0),
     )
+    if coordinator and coordinator.is_cancelled():
+        _log.info("pipeline execution cancelled after planning")
+        return _EXIT_OK
     web.set_web_planned_segments(plan_result.segments)
     _log.info(
         "plan complete: %d segment(s) to process, %d skipped (unchanged), %d pending (held for flush)",
@@ -784,10 +809,15 @@ def _run_pipeline_impl(
     if not is_no_upload and uploader:
         from .uploader import UploadTask, UploadWorker
         upload_worker = UploadWorker(uploader, reporter=reporter)
+        if coordinator:
+            coordinator._active_upload_worker = upload_worker
 
     total_segments = len(segments_to_process)
     try:
         for index, segment in enumerate(segments_to_process, start=1):
+            if coordinator and coordinator.is_cancelled():
+                _log.info("pipeline execution cancelled; exiting segment loop at %d/%d", index, total_segments)
+                break
             try:
                 from . import web
                 if web.is_transcode_paused():
@@ -795,6 +825,9 @@ def _run_pipeline_impl(
                     web.wait_if_transcode_paused()
             except Exception:
                 pass
+            if coordinator and coordinator.is_cancelled():
+                _log.info("pipeline execution cancelled before processing segment %s", segment.title)
+                break
             srec = db.segments.get(segment.segment_id)
             excluded_ids = set(srec.get("excluded_file_ids", [])) if srec else set()
             segment_files = []
@@ -1151,15 +1184,21 @@ def _run_pipeline_impl(
             _log.debug("database saved to %s", db.path)
 
         if upload_worker:
-            reporter.status("transcoding complete; waiting for background upload(s) to finish ...")
-            _log.info("transcoding complete; waiting for background upload worker to drain")
-            upload_worker.wait_done()
-            if upload_worker.quota_error is not None:
-                reporter.status("YouTube quota exhausted; deferring remaining upload(s) to next run")
-                _log.warning("quota exhausted during background upload: %s", upload_worker.quota_error)
-                db.save()
-                return _EXIT_QUOTA
+            if coordinator and coordinator.is_cancelled():
+                _log.info("pipeline cancelled; skipping wait for background upload worker")
+                upload_worker.stop()
+            else:
+                reporter.status("transcoding complete; waiting for background upload(s) to finish ...")
+                _log.info("transcoding complete; waiting for background upload worker to drain")
+                upload_worker.wait_done()
+                if upload_worker.quota_error is not None:
+                    reporter.status("YouTube quota exhausted; deferring remaining upload(s) to next run")
+                    _log.warning("quota exhausted during background upload: %s", upload_worker.quota_error)
+                    db.save()
+                    return _EXIT_QUOTA
     finally:
+        if coordinator and coordinator._active_upload_worker is upload_worker:
+            coordinator._active_upload_worker = None
         if upload_worker:
             upload_worker.stop()
 
@@ -1255,6 +1294,10 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
 
             # Quota backoff: retry once the backoff has elapsed.
             if quota_retry_at and now >= quota_retry_at:
+                coord = _get_matched_coordinator(args)
+                if coord and (coord.is_pipeline_active() or coord.is_task_running()):
+                    time.sleep(1.0)
+                    continue
                 quota_retry_at = 0.0
                 reporter.status("quota backoff elapsed; retrying ...")
                 _log.info("quota backoff elapsed; re-running pipeline")
@@ -1268,6 +1311,10 @@ def run_watch(args: argparse.Namespace, reporter: Reporter | None = None) -> int
 
             # Process new files after the quiet period (debounce).
             if has_changes and now - last_change >= args.quiet_period:
+                coord = _get_matched_coordinator(args)
+                if coord and (coord.is_pipeline_active() or coord.is_task_running()):
+                    time.sleep(1.0)
+                    continue
                 reporter.status("quiet period elapsed; re-processing ...")
                 _log.info("quiet period (%.1fs) elapsed; re-running pipeline", args.quiet_period)
                 status = run_pipeline(args, reporter, force_scan=False)

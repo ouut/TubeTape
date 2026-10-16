@@ -291,6 +291,28 @@ def _format_clock(seconds: float | None) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+_active_ffmpeg_procs: set[subprocess.Popen] = set()
+_ffmpeg_proc_lock = threading.Lock()
+
+
+def terminate_active_ffmpeg() -> None:
+    """Terminate all currently executing ffmpeg subprocesses."""
+    global _active_ffmpeg_procs
+    with _ffmpeg_proc_lock:
+        for proc in list(_active_ffmpeg_procs):
+            try:
+                if proc.poll() is None:
+                    _logger.info("terminating active ffmpeg process (PID %s)", proc.pid)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            except Exception as exc:
+                _logger.debug("error terminating ffmpeg: %s", exc)
+        _active_ffmpeg_procs.clear()
+
+
 def run_ffmpeg(
     cmd: list[str],
     total_duration: float | None = None,
@@ -299,6 +321,7 @@ def run_ffmpeg(
     log_interval: float = 15.0,
     timeout: float = 3600.0,
 ) -> None:
+    global _active_ffmpeg_procs
     _logger.debug("ffmpeg command: %s", " ".join(cmd))
     start = time.monotonic()
 
@@ -320,6 +343,8 @@ def run_ffmpeg(
             errors="replace",
             bufsize=1,
         )
+        with _ffmpeg_proc_lock:
+            _active_ffmpeg_procs.add(proc)
     except FileNotFoundError as exc:
         _logger.error("ffmpeg not found: %s", exc)
         raise RuntimeError(f"ffmpeg not found: {exc}") from exc
@@ -362,6 +387,16 @@ def run_ffmpeg(
                     except ValueError:
                         pass
                 elif k == "progress":
+                    try:
+                        from . import web
+                        coord = web.get_app_coordinator()
+                        if coord and coord.is_cancelled():
+                            _logger.info("pipeline cancellation detected; terminating ffmpeg")
+                            proc.terminate()
+                            raise RuntimeError("ffmpeg cancelled by coordinator")
+                    except Exception as ce:
+                        if "ffmpeg cancelled" in str(ce):
+                            raise
                     now = time.monotonic()
                     if v == "continue" and now - last_log_time >= log_interval:
                         last_log_time = now
@@ -390,9 +425,13 @@ def run_ffmpeg(
         proc.wait(timeout=max(60.0, timeout))
     except (subprocess.TimeoutExpired, Exception) as exc:
         proc.kill()
+        if "ffmpeg cancelled" in str(exc):
+            raise
         _logger.error("ffmpeg command failed or timed out after %.1fs: %s", time.monotonic() - start, exc)
         raise RuntimeError(f"ffmpeg failed: {exc}") from exc
     finally:
+        with _ffmpeg_proc_lock:
+            _active_ffmpeg_procs.discard(proc)
         err_thread.join(timeout=1.0)
 
     duration = time.monotonic() - start
@@ -658,11 +697,16 @@ def transcode_segment(
     for index, item in enumerate(files):
         try:
             from . import web
+            coord = web.get_app_coordinator()
+            if coord and coord.is_cancelled():
+                _logger.info("transcode cancelled by coordinator before clip %d", index + 1)
+                raise RuntimeError("transcode cancelled by coordinator")
             if web.is_transcode_paused():
                 _logger.info("transcode is paused; waiting before clip %d/%d (%s)...", index + 1, len(files), item.name)
                 web.wait_if_transcode_paused()
-        except Exception:
-            pass
+        except Exception as ce:
+            if "cancelled by coordinator" in str(ce):
+                raise
 
         clip_name = f"clip_{index:04d}_{item.file_id[:12]}.mp4"
         clip_path = os.path.join(staging_dir, clip_name)
@@ -748,6 +792,8 @@ def transcode_segment(
                 log_interval=15.0,
             )
         except RuntimeError as exc:
+            if "cancelled" in str(exc):
+                raise
             # Auto-retry fallback for images: if ffmpeg failed on the direct image path/demuxer,
             # normalize the image to RGB PNG via Pillow in staging_dir and retry!
             if item.type == FILE_TYPE_IMAGE and img_src != staged_png_path:
@@ -786,6 +832,15 @@ def transcode_segment(
             except OSError:
                 pass
         clips.append(clip_path)
+
+    try:
+        from . import web
+        coord = web.get_app_coordinator()
+        if coord and coord.is_cancelled():
+            raise RuntimeError("transcode cancelled by coordinator")
+    except Exception as ce:
+        if "cancelled by coordinator" in str(ce):
+            raise
 
     list_path = os.path.join(staging_dir, "concat.txt")
     with open(list_path, "w", encoding="utf-8") as handle:

@@ -88,12 +88,88 @@ class AppCoordinator:
         self.uploader = uploader
         self.task_lock = threading.Lock()
         self.current_task: str | None = None
+        self._cancel_event = threading.Event()
+        self._active_worker_thread: threading.Thread | None = None
+        self._active_upload_worker = None
+        self._pipeline_active = False
+        self._pipeline_cond = threading.Condition()
         self._db_path = getattr(args, "db", None)
         self.segments_dir = (
             getattr(args, "segments_dir", None)
             or (os.path.join(os.path.dirname(args.db), "uploaded_segments") if getattr(args, "db", None) else "uploaded_segments")
         )
         os.makedirs(self.segments_dir, exist_ok=True)
+
+    def enter_pipeline(self, thread: threading.Thread | None = None) -> None:
+        """Register that a pipeline has started execution."""
+        with self._pipeline_cond:
+            self._pipeline_active = True
+            if thread is not None:
+                self._active_worker_thread = thread
+            self._pipeline_cond.notify_all()
+
+    def exit_pipeline(self, thread: threading.Thread | None = None) -> None:
+        """Register that a pipeline has completed execution."""
+        with self._pipeline_cond:
+            self._pipeline_active = False
+            if thread is None or self._active_worker_thread is thread:
+                self._active_worker_thread = None
+            self._pipeline_cond.notify_all()
+
+    def is_pipeline_active(self) -> bool:
+        """Return True if a pipeline is currently executing."""
+        with self._pipeline_cond:
+            return self._pipeline_active
+
+    def is_cancelled(self) -> bool:
+        """Check whether the active task has been signalled to cancel."""
+        return self._cancel_event.is_set()
+
+    def cancel_current_task(self, timeout: float = 6.0) -> bool:
+        """Signal any active task, pipeline, ffmpeg process, and upload worker to stop."""
+        self._cancel_event.set()
+
+        # 1. Terminate any active ffmpeg process immediately
+        from .transcoder import terminate_active_ffmpeg
+
+        terminate_active_ffmpeg()
+
+        # 2. Stop active upload worker if any
+        if self._active_upload_worker is not None:
+            try:
+                self._active_upload_worker.stop()
+            except Exception as exc:
+                _logger.debug("error stopping upload worker: %s", exc)
+            self._active_upload_worker = None
+
+        # 3. Wait for active pipeline / worker to stop
+        with self._pipeline_cond:
+            start_wait = time.monotonic()
+            while self._pipeline_active and (time.monotonic() - start_wait < timeout):
+                remaining = timeout - (time.monotonic() - start_wait)
+                self._pipeline_cond.wait(timeout=max(0.05, remaining))
+
+            target_thread = self._active_worker_thread
+            if (
+                target_thread
+                and target_thread.is_alive()
+                and target_thread is not threading.current_thread()
+                and target_thread is not threading.main_thread()
+            ):
+                remaining = max(0.1, timeout - (time.monotonic() - start_wait))
+                target_thread.join(timeout=remaining)
+
+            stopped = not self._pipeline_active and (
+                not target_thread
+                or not target_thread.is_alive()
+                or target_thread is threading.main_thread()
+            )
+            if stopped:
+                self._cancel_event.clear()
+                return True
+            else:
+                _logger.warning("cancel_current_task timed out after %.1fs", timeout)
+                return False
 
     def load_saved_config(self) -> dict:
         """Load configuration overrides from tubetape.json database."""
@@ -218,9 +294,21 @@ class AppCoordinator:
         return self.get_config()
 
     def restart_pipeline(self) -> tuple[bool, str]:
-        """Re-run pipeline in background with updated configuration."""
-        if not self.task_lock.acquire(blocking=False):
-            return False, f"已有任务正在运行中 ({self.current_task})，新配置已落盘，待当前任务结束后生效"
+        """Re-run pipeline in background with updated configuration, stopping any running tasks cleanly."""
+        _logger.info("requesting pipeline restart with updated configuration...")
+        self.cancel_current_task(timeout=6.0)
+
+        # Wait briefly if needed for previous task to finish finally cleanup
+        start_wait = time.monotonic()
+        acquired = False
+        while time.monotonic() - start_wait < 5.0:
+            if self.task_lock.acquire(blocking=False):
+                acquired = True
+                break
+            time.sleep(0.1)
+
+        if not acquired:
+            return False, f"无法停止已有任务 ({self.current_task})，新配置已保存至数据库"
 
         self.current_task = "应用新配置并重新构建"
 
@@ -232,13 +320,25 @@ class AppCoordinator:
                 web.set_web_status("scanning", "配置已更新，正在按新配置重新核对并运行...")
                 cli.run_pipeline(self.args, force_scan=False)
             except Exception as exc:
-                _logger.error("pipeline re-run failed: %s", exc, exc_info=True)
-                web.set_web_status("error", f"重新运行出错: {exc}")
+                if self.is_cancelled():
+                    _logger.info("restarted pipeline was cancelled")
+                else:
+                    _logger.error("pipeline re-run failed: %s", exc, exc_info=True)
+                    web.set_web_status("error", f"重新运行出错: {exc}")
             finally:
+                with self._pipeline_cond:
+                    if self._active_worker_thread is threading.current_thread():
+                        self._active_worker_thread = None
                 self.current_task = None
-                self.task_lock.release()
+                try:
+                    self.task_lock.release()
+                except RuntimeError:
+                    pass
 
-        threading.Thread(target=_worker, daemon=True).start()
+        t = threading.Thread(target=_worker, name="ConfigRestartWorker", daemon=True)
+        with self._pipeline_cond:
+            self._active_worker_thread = t
+        t.start()
         return True, "已按照新配置重新启动流水线"
 
     def _apply_dict_to_args(self, updates: dict[str, Any]) -> None:
@@ -474,10 +574,18 @@ class AppCoordinator:
                 _logger.error("scan pipeline failed: %s", exc, exc_info=True)
                 web.set_web_status("error", f"扫描任务出错: {exc}")
             finally:
+                with self._pipeline_cond:
+                    if self._active_worker_thread is threading.current_thread():
+                        self._active_worker_thread = None
                 self.current_task = None
-                self.task_lock.release()
+                try:
+                    self.task_lock.release()
+                except RuntimeError:
+                    pass
 
         t = threading.Thread(target=_worker, name="ManualScanWorker", daemon=True)
+        with self._pipeline_cond:
+            self._active_worker_thread = t
         t.start()
         return True, "全量扫描任务已在后台启动"
 
@@ -633,10 +741,18 @@ class AppCoordinator:
                 web.set_web_status("error", f"重建失败: {exc}")
             finally:
                 web.clear_web_upload()
+                with self._pipeline_cond:
+                    if self._active_worker_thread is threading.current_thread():
+                        self._active_worker_thread = None
                 self.current_task = None
-                self.task_lock.release()
+                try:
+                    self.task_lock.release()
+                except RuntimeError:
+                    pass
 
         t = threading.Thread(target=_worker, name=f"Rebuild-{segment_id[:8]}", daemon=True)
+        with self._pipeline_cond:
+            self._active_worker_thread = t
         t.start()
         return True, f"分段 {title} 重新构建任务已在后台启动"
 
@@ -718,10 +834,18 @@ class AppCoordinator:
                 web.set_web_status("error", f"上传失败: {exc}")
             finally:
                 web.clear_web_upload()
+                with self._pipeline_cond:
+                    if self._active_worker_thread is threading.current_thread():
+                        self._active_worker_thread = None
                 self.current_task = None
-                self.task_lock.release()
+                try:
+                    self.task_lock.release()
+                except RuntimeError:
+                    pass
 
         t = threading.Thread(target=_worker, name=f"Upload-{segment_id[:8]}", daemon=True)
+        with self._pipeline_cond:
+            self._active_worker_thread = t
         t.start()
         return True, f"分段 {title} 上传任务已在后台启动"
 
@@ -1266,10 +1390,19 @@ class AppCoordinator:
                 _logger.error("force_replan failed: %s", exc, exc_info=True)
                 web.set_web_status("error", f"重新规划出错: {exc}")
             finally:
+                with self._pipeline_cond:
+                    if self._active_worker_thread is threading.current_thread():
+                        self._active_worker_thread = None
                 self.current_task = None
-                self.task_lock.release()
+                try:
+                    self.task_lock.release()
+                except RuntimeError:
+                    pass
 
-        threading.Thread(target=_worker, daemon=True).start()
+        t = threading.Thread(target=_worker, name="ForceReplanWorker", daemon=True)
+        with self._pipeline_cond:
+            self._active_worker_thread = t
+        t.start()
         return True, "强制重新规划任务已启动"
 
 
