@@ -67,6 +67,7 @@ _server_state = {
         "file_progress": None,
         "fps": None,
         "speed": None,
+        "encoder": None,
         "is_paused": False,
     },
     "upload": {
@@ -202,6 +203,7 @@ def update_web_transcode(
     file_progress: float | None = None,
     fps: float | None = None,
     speed: str | None = None,
+    encoder: str | None = None,
 ) -> None:
     _server_state["transcode"] = {
         "segment_id": segment_id,
@@ -213,6 +215,7 @@ def update_web_transcode(
         "file_progress": file_progress,
         "fps": fps,
         "speed": speed,
+        "encoder": encoder or _server_state["transcode"].get("encoder"),
         "is_paused": is_transcode_paused(),
     }
 
@@ -229,6 +232,7 @@ def finish_web_segment(segment_id: str, youtube_video_id: str | None = None) -> 
             "file_progress": None,
             "fps": None,
             "speed": None,
+            "encoder": None,
             "is_paused": is_transcode_paused(),
         }
     if _server_state["upload"].get("segment_id") == segment_id:

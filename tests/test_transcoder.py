@@ -91,6 +91,22 @@ class TestCommandBuilding:
         assert "scale=640:480" in joined
         assert "libx264" in cmd and "aac" in cmd and "-ar" in cmd and "48000" in cmd
 
+    def test_video_command_hwaccel(self):
+        cfg = TranscodeConfig(encoder="h264_nvenc")
+        from tubetape import transcoder
+        orig_probe = transcoder._PROBED_ENCODERS.get("h264_nvenc")
+        transcoder._PROBED_ENCODERS["h264_nvenc"] = True
+        try:
+            cmd = build_video_clip_command("a.mp4", "out.mp4", 640, 480, cfg)
+            joined = " ".join(cmd)
+            assert "-hwaccel auto" in joined
+            assert "h264_nvenc" in cmd
+        finally:
+            if orig_probe is not None:
+                transcoder._PROBED_ENCODERS["h264_nvenc"] = orig_probe
+            else:
+                transcoder._PROBED_ENCODERS.pop("h264_nvenc", None)
+
     def test_concat_command(self):
         cmd = build_concat_command("list.txt", "out.mp4")
         assert cmd[0] == "ffmpeg"

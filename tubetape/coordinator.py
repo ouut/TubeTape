@@ -21,7 +21,7 @@ from .planner import ScannedFile, _make_segment, greedy_pack, plan
 from .rebuild import Rebuilder
 from .reconcile import fetch_remote_catalog, fetch_remote_index, reconcile_database
 from .scanner import FILE_TYPE_VIDEO, VIDEO_EXTENSIONS, scan
-from .transcoder import TranscodeConfig, transcode_segment
+from .transcoder import TranscodeConfig, resolve_encoder, transcode_segment
 
 _logger = logging.getLogger("tubetape.coordinator")
 
@@ -562,6 +562,7 @@ class AppCoordinator:
                             file_progress=file_progress,
                             fps=fps,
                             speed=speed,
+                            encoder=resolve_encoder(config.encoder),
                         )
 
                     return transcode_segment(flist, _out, config, progress=progress)
@@ -1002,6 +1003,7 @@ class AppCoordinator:
                     "current_file": transcode_state.get("current_file", ""),
                     "total_files": transcode_state.get("total_files", 0),
                     "done_files": transcode_state.get("done_files", 0),
+                    "encoder": transcode_state.get("encoder"),
                     "is_paused": bool(transcode_state.get("is_paused", False)),
                 }
 

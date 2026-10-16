@@ -369,6 +369,11 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             ? `<button class="btn btn-sm btn-emerald" onclick="toggleTranscodePause(false)">▶️ 继续转码</button>`
             : `<button class="btn btn-sm btn-amber" onclick="toggleTranscodePause(true)">⏸️ 暂停转码</button>`;
           const barStyle = isPaused ? 'background: #94a3b8;' : 'background: linear-gradient(90deg, #f59e0b, #fbbf24);';
+          let encTag = '';
+          if (t.encoder) {
+            const isHw = ['nvenc', 'videotoolbox', 'qsv'].some(k => t.encoder.includes(k));
+            encTag = ` · 编码器: <span style="color: ${isHw ? '#34d399' : '#f87171'}; font-weight: 500;">${t.encoder}${isHw ? ' ⚡(硬件加速)' : ' (CPU软编)'}</span>`;
+          }
 
           taskCards.push(`
             <div class="task-indicator" style="margin-bottom: 12px; align-items: flex-start;">
@@ -382,7 +387,7 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                     ${btn}
                   </div>
                 </div>
-                <div class="task-meta">切片进度: ${t.done} / ${t.total} (${pct}%) · ${t.current_file || ''}</div>
+                <div class="task-meta">切片进度: ${t.done} / ${t.total} (${pct}%) · ${t.current_file || ''}${encTag}</div>
                 <div class="prog-track" style="margin-top: 8px;">
                   <div class="prog-bar" style="width: ${pct}%; ${barStyle}"></div>
                 </div>

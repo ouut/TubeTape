@@ -121,16 +121,23 @@ def probe_encoder(name: str) -> bool:
     if name in _PROBED_ENCODERS:
         return _PROBED_ENCODERS[name]
 
+    pix_fmt = "nv12" if name == "h264_qsv" else "yuv420p"
     cmd = [
         "ffmpeg", "-y",
-        "-f", "lavfi", "-i", "color=s=64x64:d=0.04",
+        "-f", "lavfi", "-i", "color=s=128x128:d=0.04",
         "-c:v", name,
+        "-pix_fmt", pix_fmt,
         "-f", "null", "-",
     ]
     try:
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6.0)
         ok = (res.returncode == 0)
-    except Exception:
+        if not ok:
+            err_lines = res.stderr.decode("utf-8", errors="replace").strip().splitlines()
+            last_err = err_lines[-1] if err_lines else f"exit code {res.returncode}"
+            _logger.debug("encoder probe for %s failed: %s", name, last_err)
+    except Exception as exc:
+        _logger.debug("encoder probe for %s timed out or errored: %s", name, exc)
         ok = False
     _PROBED_ENCODERS[name] = ok
     return ok
@@ -231,15 +238,19 @@ def build_video_clip_command(
     src: str, dst: str, canvas_w: int, canvas_h: int, config: TranscodeConfig
 ) -> list[str]:
     vf = _scale_pad_filter(canvas_w, canvas_h)
-    enc_flags = get_encoder_flags(config.encoder, config, is_still=False)
-    return [
-        "ffmpeg", "-y",
+    enc = resolve_encoder(config.encoder)
+    enc_flags = get_encoder_flags(enc, config, is_still=False)
+    cmd = ["ffmpeg", "-y"]
+    if enc in ("h264_nvenc", "h264_videotoolbox", "h264_qsv"):
+        cmd.extend(["-hwaccel", "auto"])
+    cmd.extend([
         "-i", src,
         "-vf", vf, "-r", str(config.fps),
         *enc_flags,
         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "128k",
         dst,
-    ]
+    ])
+    return cmd
 
 
 def build_photos_concat_command(

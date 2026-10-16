@@ -20,7 +20,7 @@ from .planner import Segment, plan
 from .rebuild import Rebuilder
 from .reconcile import embed_segment_id, fetch_remote_catalog, fetch_remote_index, reconcile_database
 from .scanner import FILE_TYPE_VIDEO, ScannedFile, ScanResult, scan
-from .transcoder import TranscodeConfig, transcode_segment
+from .transcoder import TranscodeConfig, resolve_encoder, transcode_segment
 from .ui import Reporter
 from .uploader import QuotaExceededError
 
@@ -772,6 +772,10 @@ def _run_pipeline_impl(
         encoder=getattr(args, "encoder", "auto"),
     )
 
+    active_encoder = resolve_encoder(config.encoder)
+    reporter.status(f"video encoder: {active_encoder}")
+    _log.info("video encoder active: %s (config: %s)", active_encoder, config.encoder)
+
     segments_dir = getattr(args, "segments_dir", None) or os.path.join(os.path.dirname(args.db), "uploaded_segments")
     os.makedirs(segments_dir, exist_ok=True)
 
@@ -951,6 +955,7 @@ def _run_pipeline_impl(
                         file_progress=file_progress,
                         fps=fps,
                         speed=speed,
+                        encoder=active_encoder,
                     )
 
                 return transcode_segment(files, _out_path, config, progress=progress)

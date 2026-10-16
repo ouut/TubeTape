@@ -302,7 +302,7 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
                 ${seg.transcode_progress ? `
                   <div style="margin: 8px 0 0 26px; font-size: 0.75rem; color: #93c5fd;" onclick="event.stopPropagation()">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 3px;">
-                      <span>${seg.transcode_progress.is_paused ? '⏸️ 构建已暂停: ' : '⚡ 正在构建: '}${seg.transcode_progress.current_file || ''}</span>
+                      <span>${seg.transcode_progress.is_paused ? '⏸️ 构建已暂停: ' : '⚡ 正在构建: '}${seg.transcode_progress.current_file || ''}${seg.transcode_progress.encoder ? ` (${seg.transcode_progress.encoder})` : ''}</span>
                       <div style="display:flex; align-items:center; gap: 8px;">
                         <span>${seg.transcode_progress.done_files || 0} / ${seg.transcode_progress.total_files || 0} (${Math.round(seg.transcode_progress.percent)}%)</span>
                         <button class="btn btn-sm ${seg.transcode_progress.is_paused ? 'btn-emerald' : 'btn-amber'}" style="padding: 1px 6px; font-size: 0.7rem;" onclick="toggleTranscodePause(${!seg.transcode_progress.is_paused})">
