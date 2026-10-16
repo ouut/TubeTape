@@ -6,6 +6,7 @@ and dynamic runtime configuration with persistence to tubetape.json.
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import os
@@ -618,6 +619,10 @@ class AppCoordinator:
         t.start()
         return True, f"分段 {title} 重新构建任务已在后台启动"
 
+    def trigger_rebuild(self, segment_id: str) -> tuple[bool, str]:
+        """Trigger rebuilding a single segment from its component files (alias for rebuild_segment)."""
+        return self.rebuild_segment(segment_id)
+
     def upload_segment(self, segment_id: str) -> tuple[bool, str]:
         """Upload a locally existing segment video file to YouTube."""
         if not self.db:
@@ -884,9 +889,10 @@ class AppCoordinator:
             if fid not in assigned_file_ids:
                 cap = frec.get("captured_at_utc", "")
                 if cap:
-                    unassigned_files.append((str(cap), fid, frec))
+                    unassigned_files.append((str(cap)[:19], fid, frec))
 
         unassigned_files.sort(key=lambda x: x[0])
+        unassigned_keys = [x[0] for x in unassigned_files]
 
         res = []
         for sid, srec in self.db.segments.items():
@@ -923,19 +929,19 @@ class AppCoordinator:
             if start_ts and end_ts:
                 s_bound = str(start_ts)[:19]
                 e_bound = str(end_ts)[:19]
-                for cap, fid, frec in unassigned_files:
-                    c_ts = cap[:19]
-                    if s_bound <= c_ts <= e_bound:
-                        candidates.append({
-                            "file_id": fid,
-                            "path": frec.get("path", ""),
-                            "name": frec.get("name") or os.path.basename(frec.get("path", "")),
-                            "type": frec.get("type", "image"),
-                            "duration_seconds": frec.get("duration_seconds", 3.0),
-                            "resolution": frec.get("resolution", ""),
-                            "size_bytes": frec.get("size_bytes", 0),
-                            "captured_at_utc": frec.get("captured_at_utc", ""),
-                        })
+                left = bisect.bisect_left(unassigned_keys, s_bound)
+                right = bisect.bisect_right(unassigned_keys, e_bound)
+                for _, fid, frec in unassigned_files[left:right]:
+                    candidates.append({
+                        "file_id": fid,
+                        "path": frec.get("path", ""),
+                        "name": frec.get("name") or os.path.basename(frec.get("path", "")),
+                        "type": frec.get("type", "image"),
+                        "duration_seconds": frec.get("duration_seconds", 3.0),
+                        "resolution": frec.get("resolution", ""),
+                        "size_bytes": frec.get("size_bytes", 0),
+                        "captured_at_utc": frec.get("captured_at_utc", ""),
+                    })
 
             local_path = self.find_local_segment_file(sid, title)
             has_local = bool(local_path and os.path.isfile(local_path))

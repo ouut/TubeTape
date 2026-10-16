@@ -15,6 +15,7 @@ import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -547,22 +548,38 @@ class _RequestHandler(BaseHTTPRequestHandler):
         pass
 
     def _send_html(self, status: int, content: str) -> None:
-        data = content.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            data = content.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except OSError as e:
+            if getattr(e, "winerror", None) in (10053, 10054) or getattr(e, "errno", None) in (32, 104):
+                pass
+            else:
+                raise
 
     def _send_json(self, status: int, data: dict | list) -> None:
-        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except OSError as e:
+            if getattr(e, "winerror", None) in (10053, 10054) or getattr(e, "errno", None) in (32, 104):
+                pass
+            else:
+                raise
 
     def _send_error_json(self, status: int, message: str) -> None:
         self._send_json(status, {"error": message})
@@ -632,7 +649,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
             if not seg_id:
                 self._send_json(400, {"ok": False, "error": "缺少参数: segment_id"})
                 return
-            ok, msg = coord.trigger_rebuild(seg_id)
+            if hasattr(coord, "trigger_rebuild"):
+                ok, msg = coord.trigger_rebuild(seg_id)
+            else:
+                ok, msg = coord.rebuild_segment(seg_id)
             self._send_json(200 if ok else 400, {"ok": ok, "message": msg})
             return
 
@@ -1479,6 +1499,24 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self._send_html(200, html)
 
 
+class _TubeTapeHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address) -> None:
+        exc_type, exc_val, _ = sys.exc_info()
+        if exc_type and (
+            issubclass(exc_type, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError))
+            or (
+                issubclass(exc_type, OSError)
+                and (
+                    getattr(exc_val, "winerror", None) in (10053, 10054)
+                    or getattr(exc_val, "errno", None) in (32, 104)
+                )
+            )
+        ):
+            _logger.debug("client disconnected: %s (%s)", client_address, exc_val)
+            return
+        super().handle_error(request, client_address)
+
+
 class WebServer:
     def __init__(
         self,
@@ -1505,7 +1543,7 @@ class WebServer:
             return
 
         try:
-            server = ThreadingHTTPServer((self.host, self.requested_port), _RequestHandler)
+            server = _TubeTapeHTTPServer((self.host, self.requested_port), _RequestHandler)
             actual_port = server.server_port
             self.port = actual_port
             _server_state["port"] = actual_port

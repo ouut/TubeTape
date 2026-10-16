@@ -1060,6 +1060,84 @@ def test_segment_delete_local_and_split_and_logs_pagination(tmp_path):
         server.stop()
 
 
+def test_segment_rebuild_endpoint(tmp_path, monkeypatch):
+    import json
+    import urllib.request
+    from tubetape.coordinator import AppCoordinator
+    from tubetape.db import Database
+    from tubetape.web import WebServer, set_app_coordinator
+
+    db_file = tmp_path / "db.json"
+    db = Database(path=str(db_file))
+    db.segments["seg_rb"] = {
+        "title": "20240101 Test",
+        "file_ids": [],
+        "status": "sealed",
+    }
+    db.save()
+
+    class FakeArgs:
+        input = str(tmp_path)
+        segments_dir = str(tmp_path / "segments")
+        keep_segments = 0
+        no_upload = True
+
+    coord = AppCoordinator(FakeArgs(), db=db)
+    rebuild_called = []
+    monkeypatch.setattr(coord, "rebuild_segment", lambda seg_id: rebuild_called.append(seg_id) or (True, "rebuild started"))
+
+    server = WebServer(host="127.0.0.1", port=0, db_path=str(db_file))
+    server.start()
+    set_app_coordinator(coord)
+    base_url = f"http://127.0.0.1:{server.port}"
+
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/api/segment/rebuild?id=seg_rb",
+            data=b"",
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert rebuild_called == ["seg_rb"]
+    finally:
+        server.stop()
+
+
+def test_client_disconnect_handling():
+    from tubetape.web import _RequestHandler, _TubeTapeHTTPServer
+
+    class FakeWFile:
+        def write(self, data):
+            raise ConnectionAbortedError(10053, "An established connection was aborted")
+
+    class FakeHandler:
+        def __init__(self):
+            self.wfile = FakeWFile()
+        def send_response(self, code):
+            pass
+        def send_header(self, k, v):
+            pass
+        def end_headers(self):
+            pass
+
+    handler = FakeHandler()
+    # Should not raise ConnectionAbortedError
+    _RequestHandler._send_json(handler, 200, {"status": "ok"})
+    _RequestHandler._send_html(handler, 200, "<html></html>")
+
+    # Test server handle_error with ConnectionAbortedError
+    import sys
+    server = _TubeTapeHTTPServer.__new__(_TubeTapeHTTPServer)
+    try:
+        raise ConnectionAbortedError(10053, "aborted")
+    except ConnectionAbortedError:
+        # Should cleanly return without calling super().handle_error
+        server.handle_error(None, ("127.0.0.1", 12345))
+
+
 def test_all_html_templates_js_syntax():
     import re
     import shutil

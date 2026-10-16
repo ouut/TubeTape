@@ -20,8 +20,27 @@ def is_media_path(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in MEDIA_EXTENSIONS
 
 
-class _MediaFileHandler:
+try:
+    from watchdog.events import FileSystemEventHandler
+except ImportError:
+    class FileSystemEventHandler:  # type: ignore[no-redef]
+        def dispatch(self, event) -> None:
+            event_type = getattr(event, "event_type", None)
+            if event_type == "created":
+                self.on_created(event)
+            elif event_type == "moved":
+                self.on_moved(event)
+
+        def on_created(self, event) -> None:
+            pass
+
+        def on_moved(self, event) -> None:
+            pass
+
+
+class _MediaFileHandler(FileSystemEventHandler):
     def __init__(self, callback: Callable[[str], None]):
+        super().__init__()
         self.callback = callback
 
     def on_created(self, event) -> None:

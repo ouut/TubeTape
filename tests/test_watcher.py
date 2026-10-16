@@ -76,6 +76,24 @@ class TestMediaFileHandler:
         handler.on_moved(Event())
         assert seen == []
 
+    def test_has_dispatch_method(self):
+        handler = _MediaFileHandler(lambda path: None)
+        assert hasattr(handler, "dispatch")
+        assert callable(handler.dispatch)
+
+    def test_dispatch_created_and_moved(self):
+        from watchdog.events import FileCreatedEvent, FileMovedEvent, FileModifiedEvent
+
+        seen = []
+        handler = _MediaFileHandler(seen.append)
+
+        handler.dispatch(FileCreatedEvent("/x/photo.jpg"))
+        handler.dispatch(FileMovedEvent("/x/tmp.download", "/x/final.mp4"))
+        handler.dispatch(FileModifiedEvent("/x/modified.jpg"))  # no-op
+        handler.dispatch(FileCreatedEvent("/x/notes.txt"))  # ignored
+
+        assert seen == ["/x/photo.jpg", "/x/final.mp4"]
+
 
 class TestMtimeScanner:
     def test_steady_state_is_quiet(self, tmp_path):
