@@ -234,7 +234,7 @@ def render_view_html() -> str:
 
     async function loadGalleryData() {
       try {
-        const res = await fetch('/api/segments');
+        const res = await fetch('/api/segments?include_files=1');
         if (!res.ok) throw new Error('拉取分段失败');
         const data = await res.json();
         segments = data.segments || [];

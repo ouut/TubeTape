@@ -196,10 +196,27 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
         const res = await fetch('/api/segments');
         if (!res.ok) throw new Error('拉取失败 (HTTP ' + res.status + ')');
         const d = await res.json();
-        allSegments = d.segments || [];
+        const incoming = d.segments || [];
+        const oldMap = new Map(allSegments.map(s => [s.segment_id, s]));
+        allSegments = incoming.map(newSeg => {
+          const old = oldMap.get(newSeg.segment_id);
+          if (old && old._files_loaded) {
+            newSeg.files = old.files;
+            newSeg.candidate_files = old.candidate_files;
+            newSeg.active_files_count = old.active_files_count;
+            newSeg._files_loaded = true;
+          }
+          return newSeg;
+        });
         const badge = document.getElementById('seg-summary-badge');
         if (badge) badge.textContent = `共 ${allSegments.length} 个分段`;
         renderSegmentsList();
+        expandedSegments.forEach(segId => {
+          const s = allSegments.find(x => x.segment_id === segId);
+          if (s && !s._files_loaded && !s._files_loading) {
+            loadSegmentFiles(segId);
+          }
+        });
       } catch (err) {
         console.error('loadSegments error:', err);
         const c = document.getElementById('segments-container');
@@ -234,7 +251,8 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
           const isExp = expandedSegments.has(seg.segment_id);
           const candidates = seg.candidate_files || [];
           const files = seg.files || [];
-          const activeCount = seg.active_files_count ?? files.filter(f => !f.is_excluded).length;
+          const totalCount = seg.total_files ?? seg.file_count ?? files.length;
+          const activeCount = seg.active_files_count ?? (seg._files_loaded ? files.filter(f => !f.is_excluded).length : totalCount);
 
           // Local status badge
           let localBadge = '';
@@ -272,7 +290,7 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
                   ${oversizedBadge}
                 </div>
                 <div class="seg-time-range" style="margin-top: 4px; margin-left: 26px;">
-                  拍摄区间: ${seg.start_ts ? seg.start_ts.slice(0, 10) : '--'} ~ ${seg.end_ts ? seg.end_ts.slice(0, 10) : '--'} · 时长: ${Math.round(seg.duration_seconds || 0)}秒 · 有效文件: ${activeCount} / ${files.length}
+                  拍摄区间: ${seg.start_ts ? seg.start_ts.slice(0, 10) : '--'} ~ ${seg.end_ts ? seg.end_ts.slice(0, 10) : '--'} · 时长: ${Math.round(seg.duration_seconds || 0)}秒 · 有效文件: ${activeCount} / ${totalCount}
                 </div>
 
                 ${seg.transcode_progress ? `
@@ -317,72 +335,88 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
 
             <div id="detail-${seg.segment_id}" style="display: ${isExp ? 'block' : 'none'};">
-              ${candidates.length > 0 ? `
-                <div class="candidate-box">
-                  <div class="candidate-title">
-                    <span>✨ 发现 ${candidates.length} 个属于此时间段的新文件 (未分配分段)</span>
-                  </div>
-                  <div style="display: flex; flex-direction: column; gap: 8px;">
-                    ${candidates.map(cand => `
-                      <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(0,0,0,0.25); padding: 6px 12px; border-radius: 6px; font-size: 0.8rem;">
-                        <div style="display: flex; align-items: center; gap: 10px;">
-                          ${cand.type === 'video'
-                            ? '<div class="file-thumb" style="display:flex;align-items:center;justify-content:center;background:#1e293b;border-radius:4px;font-size:1.1rem;cursor:default;" title="视频文件">🎥</div>'
-                            : `<img class="file-thumb" src="/api/media/view?id=${encodeURIComponent(cand.file_id)}" loading="lazy">`
-                          }
-                          <div>
-                            <span style="font-weight: 600; color: #fff;">${cand.name}</span>
-                            <span style="color: var(--text-muted); margin-left: 8px;">${cand.captured_at_utc ? String(cand.captured_at_utc).slice(0, 19).replace('T', ' ') : '--'}</span>
+              ${!seg._files_loaded ? (
+                seg._files_loading
+                  ? `<div style="text-align: center; padding: 28px; color: var(--text-muted); font-size: 0.85rem;">
+                       <span class="task-spinner" style="display:inline-block; vertical-align:middle; width:16px; height:16px; border-width:2px; margin-right:8px; border-top-color: var(--blue);"></span>
+                       正在按需加载分段文件列表...
+                     </div>`
+                  : `<div style="text-align: center; padding: 24px; color: #f87171; font-size: 0.85rem;">
+                       ${seg._files_error || '文件列表尚未加载'}
+                       <button class="btn btn-sm btn-outline" style="margin-left: 10px;" onclick="loadSegmentFiles('${seg.segment_id}')">点击重试</button>
+                     </div>`
+              ) : `
+                ${candidates.length > 0 ? `
+                  <div class="candidate-box">
+                    <div class="candidate-title">
+                      <span>✨ 发现 ${candidates.length} 个属于此时间段的新文件 (未分配分段)</span>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 8px;">
+                      ${candidates.map(cand => `
+                        <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(0,0,0,0.25); padding: 6px 12px; border-radius: 6px; font-size: 0.8rem;">
+                          <div style="display: flex; align-items: center; gap: 10px;">
+                            ${cand.type === 'video'
+                              ? '<div class="file-thumb" style="display:flex;align-items:center;justify-content:center;background:#1e293b;border-radius:4px;font-size:1.1rem;cursor:default;" title="视频文件">🎥</div>'
+                              : `<img class="file-thumb" src="/api/media/view?id=${encodeURIComponent(cand.file_id)}" loading="lazy">`
+                            }
+                            <div>
+                              <span style="font-weight: 600; color: #fff;">${cand.name}</span>
+                              <span style="color: var(--text-muted); margin-left: 8px;">${cand.captured_at_utc ? String(cand.captured_at_utc).slice(0, 19).replace('T', ' ') : '--'}</span>
+                            </div>
                           </div>
+                          <button class="btn btn-sm btn-emerald" onclick="includeCandidateFile('${seg.segment_id}', '${cand.file_id}')">➕ 纳入此分段</button>
                         </div>
-                        <button class="btn btn-sm btn-emerald" onclick="includeCandidateFile('${seg.segment_id}', '${cand.file_id}')">➕ 纳入此分段</button>
-                      </div>
-                    `).join('')}
+                      `).join('')}
+                    </div>
                   </div>
-                </div>
-              ` : ''}
+                ` : ''}
 
-              <div class="file-table-container">
-                <table class="file-table">
-                  <thead>
-                    <tr>
-                      <th style="width: 50px;">构建</th>
-                      <th style="width: 60px;">预览</th>
-                      <th>文件名 / 路径</th>
-                      <th>类型</th>
-                      <th>拍摄时间</th>
-                      <th>规格 / 时长</th>
-                      <th>大小</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${files.map(f => `
-                      <tr class="${f.is_excluded ? 'excluded' : ''}">
-                        <td>
-                          <label class="toggle-switch">
-                            <input type="checkbox" ${!f.is_excluded ? 'checked' : ''} onchange="toggleFileExclusion('${seg.segment_id}', '${f.file_id}', !this.checked)">
-                            <span class="toggle-slider"></span>
-                          </label>
-                        </td>
-                        <td>
-                          ${f.type === 'video'
-                            ? '<div class="file-thumb" style="display:flex;align-items:center;justify-content:center;background:#1e293b;border-radius:4px;font-size:1.1rem;cursor:default;" title="视频文件">🎥</div>'
-                            : `<img class="file-thumb" src="/api/media/view?id=${encodeURIComponent(f.file_id)}" loading="lazy">`
-                          }
-                        </td>
-                        <td>
-                          <div style="font-weight: 500;">${f.name}</div>
-                          <div style="font-size: 0.72rem; color: var(--text-sub);">${f.path}</div>
-                        </td>
-                        <td>${f.type === 'video' ? '🎥 视频' : '📸 照片'}</td>
-                        <td>${f.captured_at_utc ? String(f.captured_at_utc).slice(0, 19).replace('T', ' ') : '--'}</td>
-                        <td>${f.type === 'video' ? Math.round(f.duration_seconds || 0) + 's' : (f.resolution || '--')}</td>
-                        <td>${(((f.size_bytes || 0)) / (1024*1024)).toFixed(1)} MB</td>
+                <div class="file-table-container">
+                  <table class="file-table">
+                    <thead>
+                      <tr>
+                        <th style="width: 50px;">构建</th>
+                        <th style="width: 60px;">预览</th>
+                        <th>文件名 / 路径</th>
+                        <th>类型</th>
+                        <th>拍摄时间</th>
+                        <th>规格 / 时长</th>
+                        <th>大小</th>
                       </tr>
-                    `).join('')}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      ${files.length === 0 ? `
+                        <tr>
+                          <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 20px;">此分段暂无关联文件</td>
+                        </tr>
+                      ` : files.map(f => `
+                        <tr class="${f.is_excluded ? 'excluded' : ''}">
+                          <td>
+                            <label class="toggle-switch">
+                              <input type="checkbox" ${!f.is_excluded ? 'checked' : ''} onchange="toggleFileExclusion('${seg.segment_id}', '${f.file_id}', !this.checked)">
+                              <span class="toggle-slider"></span>
+                            </label>
+                          </td>
+                          <td>
+                            ${f.type === 'video'
+                              ? '<div class="file-thumb" style="display:flex;align-items:center;justify-content:center;background:#1e293b;border-radius:4px;font-size:1.1rem;cursor:default;" title="视频文件">🎥</div>'
+                              : `<img class="file-thumb" src="/api/media/view?id=${encodeURIComponent(f.file_id)}" loading="lazy">`
+                            }
+                          </td>
+                          <td>
+                            <div style="font-weight: 500;">${f.name}</div>
+                            <div style="font-size: 0.72rem; color: var(--text-sub);">${f.path}</div>
+                          </td>
+                          <td>${f.type === 'video' ? '🎥 视频' : '📸 照片'}</td>
+                          <td>${f.captured_at_utc ? String(f.captured_at_utc).slice(0, 19).replace('T', ' ') : '--'}</td>
+                          <td>${f.type === 'video' ? Math.round(f.duration_seconds || 0) + 's' : (f.resolution || '--')}</td>
+                          <td>${(((f.size_bytes || 0)) / (1024*1024)).toFixed(1)} MB</td>
+                        </tr>
+                      `).join('')}
+                    </tbody>
+                  </table>
+                </div>
+              `}
             </div>
           </div>
         `;
@@ -392,11 +426,39 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    async function loadSegmentFiles(segId) {
+      const seg = allSegments.find(s => s.segment_id === segId);
+      if (!seg || seg._files_loading) return;
+      seg._files_loading = true;
+      seg._files_error = null;
+      renderSegmentsList();
+      try {
+        const res = await fetch(`/api/segment/items?id=${encodeURIComponent(segId)}`);
+        if (!res.ok) throw new Error('拉取失败 (HTTP ' + res.status + ')');
+        const d = await res.json();
+        seg.files = d.files || d.items || [];
+        seg.candidate_files = d.candidate_files || [];
+        seg.active_files_count = d.active_files_count ?? seg.files.filter(f => !f.is_excluded).length;
+        seg.total_files = d.total_files ?? seg.files.length;
+        seg._files_loaded = true;
+      } catch (err) {
+        console.error('loadSegmentFiles error:', err);
+        seg._files_error = err.message || '加载失败';
+      } finally {
+        seg._files_loading = false;
+        renderSegmentsList();
+      }
+    }
+
     function toggleExpand(segId) {
       if (expandedSegments.has(segId)) {
         expandedSegments.delete(segId);
       } else {
         expandedSegments.add(segId);
+        const seg = allSegments.find(s => s.segment_id === segId);
+        if (seg && !seg._files_loaded && !seg._files_loading) {
+          loadSegmentFiles(segId);
+        }
       }
       renderSegmentsList();
     }
@@ -415,6 +477,8 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
         const d = await res.json();
         if (res.ok && d.ok) {
           showToast(isExcluded ? '已排除该文件（不参与分片构建）' : '已重新包含该文件');
+          const s = allSegments.find(x => x.segment_id === segmentId);
+          if (s) { s._files_loaded = false; loadSegmentFiles(segmentId); }
           loadSegments();
         } else {
           showToast('❌ 更新失败: ' + (d.error || '未知错误'), true);
@@ -434,6 +498,8 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
         const d = await res.json();
         if (res.ok && d.ok) {
           showToast('✅ ' + (d.message || '文件已纳入分片'));
+          const s = allSegments.find(x => x.segment_id === segmentId);
+          if (s) { s._files_loaded = false; loadSegmentFiles(segmentId); }
           loadSegments();
         } else {
           showToast('❌ 操作失败: ' + (d.error || '未知错误'), true);

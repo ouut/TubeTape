@@ -848,8 +848,13 @@ class AppCoordinator:
             "uploaded_segments": uploaded_segments,
         }
 
-    def get_segments_view_data(self) -> list[dict]:
-        """Return rich segments list for Segments management page."""
+    def get_segments_view_data(self, include_files: bool = True) -> list[dict]:
+        """Return rich segments list for Segments management page.
+
+        If include_files is False, constituent files and candidates are omitted,
+        drastically reducing serialization and network overhead for large libraries.
+        Detailed files can be fetched on demand per segment via get_segment_files_data().
+        """
         if not self.db:
             return []
 
@@ -877,22 +882,24 @@ class AppCoordinator:
             except Exception as exc:
                 _logger.warning("could not auto-plan segments in get_segments_view_data: %s", exc)
 
-        # 1. Collect all currently assigned file_ids
-        assigned_file_ids = set()
-        for srec in self.db.segments.values():
-            for fid in srec.get("file_ids", []):
-                assigned_file_ids.add(fid)
-
-        # 2. Collect candidate unassigned files
         unassigned_files = []
-        for fid, frec in self.db.files.items():
-            if fid not in assigned_file_ids:
-                cap = frec.get("captured_at_utc", "")
-                if cap:
-                    unassigned_files.append((str(cap)[:19], fid, frec))
+        unassigned_keys = []
+        if include_files:
+            # 1. Collect all currently assigned file_ids
+            assigned_file_ids = set()
+            for srec in self.db.segments.values():
+                for fid in srec.get("file_ids", []):
+                    assigned_file_ids.add(fid)
 
-        unassigned_files.sort(key=lambda x: x[0])
-        unassigned_keys = [x[0] for x in unassigned_files]
+            # 2. Collect candidate unassigned files
+            for fid, frec in self.db.files.items():
+                if fid not in assigned_file_ids:
+                    cap = frec.get("captured_at_utc", "")
+                    if cap:
+                        unassigned_files.append((str(cap)[:19], fid, frec))
+
+            unassigned_files.sort(key=lambda x: x[0])
+            unassigned_keys = [x[0] for x in unassigned_files]
 
         res = []
         for sid, srec in self.db.segments.items():
@@ -904,53 +911,54 @@ class AppCoordinator:
             end_ts = rng[1] if len(rng) > 1 else ""
             vid = srec.get("youtube_video_id")
             out_p = srec.get("output_path")
+            fids = srec.get("file_ids", [])
             excluded_ids = set(srec.get("excluded_file_ids", []))
 
-            # Constituent files details
+            # Constituent files details (only if requested)
             files = []
-            fids = srec.get("file_ids", [])
-            for fid in fids:
-                frec = self.db.files.get(fid)
-                if frec:
-                    files.append({
-                        "file_id": fid,
-                        "path": frec.get("path", ""),
-                        "name": frec.get("name") or os.path.basename(frec.get("path", "")),
-                        "type": frec.get("type", "image"),
-                        "duration_seconds": frec.get("duration_seconds", 3.0),
-                        "resolution": frec.get("resolution", ""),
-                        "size_bytes": frec.get("size_bytes", 0),
-                        "captured_at_utc": frec.get("captured_at_utc", ""),
-                        "is_excluded": (fid in excluded_ids),
-                    })
-
-            # Check for candidate files falling into this segment's [start_ts, end_ts]
             candidates = []
-            if start_ts and end_ts:
-                s_bound = str(start_ts)[:19]
-                e_bound = str(end_ts)[:19]
-                left = bisect.bisect_left(unassigned_keys, s_bound)
-                right = bisect.bisect_right(unassigned_keys, e_bound)
-                for _, fid, frec in unassigned_files[left:right]:
-                    candidates.append({
-                        "file_id": fid,
-                        "path": frec.get("path", ""),
-                        "name": frec.get("name") or os.path.basename(frec.get("path", "")),
-                        "type": frec.get("type", "image"),
-                        "duration_seconds": frec.get("duration_seconds", 3.0),
-                        "resolution": frec.get("resolution", ""),
-                        "size_bytes": frec.get("size_bytes", 0),
-                        "captured_at_utc": frec.get("captured_at_utc", ""),
-                    })
+            if include_files:
+                for fid in fids:
+                    frec = self.db.files.get(fid)
+                    if frec:
+                        files.append({
+                            "file_id": fid,
+                            "path": frec.get("path", ""),
+                            "name": frec.get("name") or os.path.basename(frec.get("path", "")),
+                            "type": frec.get("type", "image"),
+                            "duration_seconds": frec.get("duration_seconds", 3.0),
+                            "resolution": frec.get("resolution", ""),
+                            "size_bytes": frec.get("size_bytes", 0),
+                            "captured_at_utc": frec.get("captured_at_utc", ""),
+                            "is_excluded": (fid in excluded_ids),
+                        })
+
+                # Check for candidate files falling into this segment's [start_ts, end_ts]
+                if start_ts and end_ts:
+                    s_bound = str(start_ts)[:19]
+                    e_bound = str(end_ts)[:19]
+                    left = bisect.bisect_left(unassigned_keys, s_bound)
+                    right = bisect.bisect_right(unassigned_keys, e_bound)
+                    for _, fid, frec in unassigned_files[left:right]:
+                        candidates.append({
+                            "file_id": fid,
+                            "path": frec.get("path", ""),
+                            "name": frec.get("name") or os.path.basename(frec.get("path", "")),
+                            "type": frec.get("type", "image"),
+                            "duration_seconds": frec.get("duration_seconds", 3.0),
+                            "resolution": frec.get("resolution", ""),
+                            "size_bytes": frec.get("size_bytes", 0),
+                            "captured_at_utc": frec.get("captured_at_utc", ""),
+                        })
 
             local_path = self.find_local_segment_file(sid, title)
             has_local = bool(local_path and os.path.isfile(local_path))
             local_size = os.path.getsize(local_path) if has_local else 0
             local_size_formatted = f"{local_size / (1024 * 1024):.1f} MB" if has_local else None
 
-            active_dur = sum(f["duration_seconds"] for f in files if not f["is_excluded"])
+            active_dur = sum(f["duration_seconds"] for f in files if not f["is_excluded"]) if files else (dur or 0.0)
             cfg_dur = float(getattr(self.args, "segment_duration", 1200.0))
-            is_oversized = active_dur > cfg_dur
+            is_oversized = (dur or active_dur) > cfg_dur
 
             from . import web
             upload_state = web._server_state.get("upload", {})
@@ -990,6 +998,7 @@ class AppCoordinator:
                 "local_size_bytes": local_size,
                 "local_size_formatted": local_size_formatted,
                 "total_files": len(fids),
+                "file_count": len(fids),
                 "active_files_count": len([f for f in fids if f not in excluded_ids]),
                 "files": files,
                 "candidate_files": candidates,
@@ -1002,6 +1011,104 @@ class AppCoordinator:
         # Sort segments chronologically
         res.sort(key=lambda s: (s["start_ts"] or "", s["title"]))
         return res
+
+    def get_segment_files_data(self, segment_id: str) -> dict | None:
+        """Return detailed constituent files and candidate files for a single segment."""
+        if not self.db:
+            return None
+        srec = self.db.segments.get(segment_id)
+        if not srec:
+            for s, r in self.db.segments.items():
+                if s.startswith(segment_id) or (len(segment_id) >= 8 and s[:len(segment_id)].lower() == segment_id.lower()):
+                    srec = r
+                    segment_id = s
+                    break
+        if not srec:
+            return None
+
+        title = srec.get("title") or segment_id[:16]
+        fids = srec.get("file_ids", [])
+        excluded_ids = set(srec.get("excluded_file_ids", []))
+        media_dir = getattr(self.args, "input", None) or "."
+
+        files = []
+        items = []
+        for fid in fids:
+            frec = self.db.files.get(fid)
+            if not frec:
+                continue
+            rel_path = frec.get("path", "")
+            abs_path = os.path.abspath(os.path.join(media_dir, rel_path))
+            f_type = frec.get("type", "image")
+            dur = float(frec.get("duration_seconds") or (0.0 if f_type == "video" else 3.0))
+            sz = int(frec.get("size_bytes") or 0)
+            res_str = frec.get("resolution", "")
+            cap_utc = frec.get("captured_at_utc", "")
+            name = frec.get("name") or os.path.basename(rel_path)
+
+            file_entry = {
+                "id": fid,
+                "file_id": fid,
+                "path": rel_path,
+                "abs_path": abs_path,
+                "name": name,
+                "type": f_type,
+                "duration": dur,
+                "duration_seconds": dur,
+                "resolution": res_str,
+                "size": sz,
+                "size_bytes": sz,
+                "captured_at": cap_utc,
+                "captured_at_utc": cap_utc,
+                "is_excluded": (fid in excluded_ids),
+            }
+            files.append(file_entry)
+            items.append(file_entry)
+
+        # Candidates within [start_ts, end_ts]
+        candidates = []
+        rng = srec.get("range") or ["", ""]
+        start_ts = rng[0] if len(rng) > 0 else ""
+        end_ts = rng[1] if len(rng) > 1 else ""
+        if start_ts and end_ts:
+            s_bound = str(start_ts)[:19]
+            e_bound = str(end_ts)[:19]
+            assigned_file_ids = set()
+            for seg in self.db.segments.values():
+                for afid in seg.get("file_ids", []):
+                    assigned_file_ids.add(afid)
+
+            for fid, frec in self.db.files.items():
+                if fid in assigned_file_ids:
+                    continue
+                cap = str(frec.get("captured_at_utc", ""))[:19]
+                if s_bound <= cap <= e_bound:
+                    rel_p = frec.get("path", "")
+                    candidates.append({
+                        "file_id": fid,
+                        "path": rel_p,
+                        "name": frec.get("name") or os.path.basename(rel_p),
+                        "type": frec.get("type", "image"),
+                        "duration_seconds": float(frec.get("duration_seconds") or 3.0),
+                        "resolution": frec.get("resolution", ""),
+                        "size_bytes": int(frec.get("size_bytes") or 0),
+                        "captured_at_utc": frec.get("captured_at_utc", ""),
+                    })
+
+        active_dur = sum(f["duration_seconds"] for f in files if not f["is_excluded"])
+        return {
+            "ok": True,
+            "segment_id": segment_id,
+            "title": title,
+            "status": srec.get("status") or "pending",
+            "duration_seconds": float(srec.get("duration_seconds") or active_dur),
+            "youtube_video_id": srec.get("youtube_video_id"),
+            "items": items,
+            "files": files,
+            "candidate_files": candidates,
+            "active_files_count": len([f for f in files if not f["is_excluded"]]),
+            "total_files": len(files),
+        }
 
     def toggle_segment_file(self, segment_id: str, file_id: str, is_excluded: bool) -> tuple[bool, str]:
         """Toggle inclusion of a specific file in a segment."""

@@ -978,13 +978,14 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/segments":
+            include_files = query.get("include_files", ["0"])[0] in ("1", "true", "yes")
             coord = get_app_coordinator()
             if coord:
-                seg_view_data = coord.get_segments_view_data()
+                seg_view_data = coord.get_segments_view_data(include_files=include_files)
                 for s in seg_view_data:
                     s["id"] = s["segment_id"]
                     if "file_count" not in s:
-                        s["file_count"] = len(s.get("files", []))
+                        s["file_count"] = s.get("total_files", len(s.get("files", [])))
                 self._send_json(200, {"segments": seg_view_data})
                 return
 
@@ -993,8 +994,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
             segs = []
             for sid, srec in segments_dict.items():
                 fids = srec.get("file_ids", [])
+                excluded_ids = set(srec.get("excluded_file_ids", []))
                 file_items = []
-                if db and getattr(db, "files", None):
+                if include_files and db and getattr(db, "files", None):
                     for fid in fids:
                         f = db.files.get(fid)
                         if f:
@@ -1008,16 +1010,18 @@ class _RequestHandler(BaseHTTPRequestHandler):
                                 "duration_seconds": f.get("duration_seconds", 3.0),
                                 "resolution": f.get("resolution", ""),
                                 "size_bytes": f.get("size_bytes", 0),
-                                "is_excluded": False,
+                                "is_excluded": (fid in excluded_ids),
                             })
+                total_cnt = srec.get("file_count", len(fids))
                 segs.append({
                     "id": sid,
                     "segment_id": sid,
                     "title": srec.get("title") or sid[:16],
-                    "file_count": srec.get("file_count", len(fids)),
+                    "file_count": total_cnt,
+                    "total_files": total_cnt,
                     "files": file_items,
                     "candidate_files": [],
-                    "active_files_count": len(file_items),
+                    "active_files_count": len(fids) - len(excluded_ids),
                     "duration_seconds": float(srec.get("duration_seconds") or 0.0),
                     "status": srec.get("status") or "pending",
                     "range": srec.get("range") or [srec.get("start_ts", ""), srec.get("end_ts", "")],
@@ -1039,6 +1043,13 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": "缺少分片 ID"})
                 return
 
+            coord = get_app_coordinator()
+            if coord and hasattr(coord, "get_segment_files_data"):
+                details = coord.get_segment_files_data(seg_id)
+                if details:
+                    self._send_json(200, details)
+                    return
+
             segments_dict = _collect_segments()
             srec = segments_dict.get(seg_id)
             if not srec:
@@ -1054,8 +1065,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
             db = get_db()
             file_ids = srec.get("file_ids", [])
+            excluded_ids = set(srec.get("excluded_file_ids", []))
             media_dir = _server_state.get("media_dir") or "."
             items = []
+            files = []
             if db and getattr(db, "files", None):
                 for fid in file_ids:
                     f = db.files.get(fid)
@@ -1063,7 +1076,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                         continue
                     rel_path = f.get("path") or ""
                     abs_path = os.path.abspath(os.path.join(media_dir, rel_path))
-                    items.append({
+                    f_entry = {
                         "id": fid,
                         "file_id": fid,
                         "name": f.get("name") or os.path.basename(rel_path),
@@ -1071,10 +1084,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
                         "abs_path": abs_path,
                         "type": f.get("type", "image"),
                         "captured_at": f.get("captured_at_utc") or "",
+                        "captured_at_utc": f.get("captured_at_utc") or "",
                         "resolution": f.get("resolution") or "",
                         "duration": float(f.get("duration_seconds") or 0.0),
+                        "duration_seconds": float(f.get("duration_seconds") or 0.0),
                         "size": int(f.get("size_bytes") or 0),
-                    })
+                        "size_bytes": int(f.get("size_bytes") or 0),
+                        "is_excluded": (fid in excluded_ids),
+                    }
+                    items.append(f_entry)
+                    files.append(f_entry)
 
             self._send_json(200, {
                 "ok": True,
@@ -1084,6 +1103,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 "status": srec.get("status") or "sealed",
                 "youtube_video_id": srec.get("youtube_video_id"),
                 "items": items,
+                "files": files,
+                "candidate_files": [],
+                "active_files_count": len([f for f in files if not f["is_excluded"]]),
+                "total_files": len(files),
             })
             return
 

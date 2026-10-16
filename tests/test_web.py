@@ -1167,6 +1167,95 @@ def test_all_html_templates_js_syntax():
                 assert res.returncode == 0, f"JS Syntax error in {name} script {i}: {res.stderr.decode('utf-8')}"
 
 
+def test_web_segments_lazy_loading(tmp_path):
+    from tubetape.coordinator import AppCoordinator
+    from tubetape.db import Database
+
+    db_path = tmp_path / "tubetape.json"
+    db = Database(path=str(db_path))
+    db.upsert_file("f1", {
+        "path": "img1.png",
+        "file_type": "image",
+        "captured_at_utc": "2026-01-01 10:05:00",
+        "size": 500,
+        "segment_id": "seg_lazy",
+    })
+    db.upsert_file("f2", {
+        "path": "img2.png",
+        "file_type": "image",
+        "captured_at_utc": "2026-01-01 10:10:00",
+        "size": 500,
+        "segment_id": None,
+    })
+    db.upsert_segment("seg_lazy", {
+        "title": "Lazy Segment",
+        "file_ids": ["f1"],
+        "status": "planned",
+        "youtube_video_id": None,
+        "range": ["2026-01-01 10:00:00", "2026-01-01 11:00:00"],
+    })
+    db.save()
+
+    from tubetape import cli
+    test_args = cli.parse_args(["--input", str(tmp_path), "--db", str(db_path), "--no-upload", "--no-watch"])
+    coord = AppCoordinator(args=test_args, db=db)
+
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        web.set_app_coordinator(coord)
+        web.set_web_context(media_dir=str(tmp_path), db=db, db_path=str(db_path))
+
+        # 1. Summary mode: include_files=False returns empty files list
+        summary_data = coord.get_segments_view_data(include_files=False)
+        assert len(summary_data) == 1
+        assert summary_data[0]["files"] == []
+        assert summary_data[0]["candidate_files"] == []
+        assert summary_data[0]["total_files"] == 1
+        assert summary_data[0]["file_count"] == 1
+
+        # 2. Detailed mode: include_files=True returns populated files and candidates
+        full_data = coord.get_segments_view_data(include_files=True)
+        assert len(full_data[0]["files"]) == 1
+        assert len(full_data[0]["candidate_files"]) == 1
+        assert full_data[0]["files"][0]["file_id"] == "f1"
+        assert full_data[0]["candidate_files"][0]["file_id"] == "f2"
+
+        # 3. GET /api/segments (default should omit files for performance)
+        with urllib.request.urlopen(f"{base_url}/api/segments") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            seg = data["segments"][0]
+            assert seg["files"] == []
+            assert seg["total_files"] == 1
+
+        # 4. GET /api/segments?include_files=1 (explicitly requests files)
+        with urllib.request.urlopen(f"{base_url}/api/segments?include_files=1") as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            seg = data["segments"][0]
+            assert len(seg["files"]) == 1
+            assert len(seg["candidate_files"]) == 1
+
+        # 5. GET /api/segment/items?id=seg_lazy (on-demand loading)
+        with urllib.request.urlopen(f"{base_url}/api/segment/items?id=seg_lazy") as res:
+            assert res.status == 200
+            items_data = json.loads(res.read().decode("utf-8"))
+            assert items_data["ok"] is True
+            assert len(items_data["files"]) == 1
+            assert items_data["files"][0]["file_id"] == "f1"
+            assert len(items_data["candidate_files"]) == 1
+            assert items_data["candidate_files"][0]["file_id"] == "f2"
+
+    finally:
+        server.stop()
+
+
+
 
 
 
