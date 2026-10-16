@@ -1060,6 +1060,36 @@ def test_segment_delete_local_and_split_and_logs_pagination(tmp_path):
         server.stop()
 
 
+def test_all_html_templates_js_syntax():
+    import re
+    import shutil
+    import subprocess
+    from tubetape.web.dashboard import render_dashboard_html
+    from tubetape.web.view import render_view_html
+    from tubetape.web.segments import render_segments_html
+    from tubetape.web.logs import render_logs_html
+    from tubetape.web.settings import render_settings_html
+
+    pages = [
+        ("dashboard", render_dashboard_html()),
+        ("view", render_view_html()),
+        ("segments", render_segments_html()),
+        ("logs", render_logs_html()),
+        ("settings", render_settings_html()),
+    ]
+
+    has_node = shutil.which("node") is not None
+    for name, html in pages:
+        assert len(html) > 100
+        scripts = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
+        assert len(scripts) >= 1
+        if has_node:
+            for i, script_content in enumerate(scripts):
+                res = subprocess.run(["node", "-c", "-"], input=script_content.encode("utf-8"), capture_output=True)
+                assert res.returncode == 0, f"JS Syntax error in {name} script {i}: {res.stderr.decode('utf-8')}"
+
+
+
 
 
 

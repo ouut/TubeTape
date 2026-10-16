@@ -848,6 +848,30 @@ class AppCoordinator:
         if not self.db:
             return []
 
+        # If database has files but no segments planned yet, auto-plan them
+        if not self.db.segments and self.db.files:
+            try:
+                from . import web
+                collected = web._collect_segments()
+                for sid, srec in collected.items():
+                    if sid not in self.db.segments:
+                        self.db.upsert_segment(sid, {
+                            "title": srec.get("title") or sid[:16],
+                            "file_ids": srec.get("file_ids", []),
+                            "range": srec.get("range", ["", ""]),
+                            "duration_seconds": srec.get("duration_seconds", 0.0),
+                            "youtube_video_id": srec.get("youtube_video_id"),
+                            "status": srec.get("status", "pending"),
+                            "chapters": [],
+                            "last_rebuilt_at": None,
+                            "attempts": 0,
+                            "error": None,
+                        })
+                if collected:
+                    self.db.save()
+            except Exception as exc:
+                _logger.warning("could not auto-plan segments in get_segments_view_data: %s", exc)
+
         # 1. Collect all currently assigned file_ids
         assigned_file_ids = set()
         for srec in self.db.segments.values():

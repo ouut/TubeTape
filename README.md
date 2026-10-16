@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](pyproject.toml)
 [![Docker: chet2026/tubetape](https://img.shields.io/badge/Docker-chet2026%2Ftubetape-blue.svg)](https://hub.docker.com/r/chet2026/tubetape)
-[![Version: 1.8.0](https://img.shields.io/badge/Version-1.8.0-orange.svg)](pyproject.toml)
+[![Version: 1.8.1](https://img.shields.io/badge/Version-1.8.1-orange.svg)](pyproject.toml)
 
 ---
 

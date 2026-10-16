@@ -194,50 +194,57 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
     async function loadSegments() {
       try {
         const res = await fetch('/api/segments');
-        if (!res.ok) throw new Error('拉取失败');
+        if (!res.ok) throw new Error('拉取失败 (HTTP ' + res.status + ')');
         const d = await res.json();
         allSegments = d.segments || [];
-        document.getElementById('seg-summary-badge').textContent = `共 ${allSegments.length} 个分段`;
+        const badge = document.getElementById('seg-summary-badge');
+        if (badge) badge.textContent = `共 ${allSegments.length} 个分段`;
         renderSegmentsList();
       } catch (err) {
-        document.getElementById('segments-container').innerHTML = `
-          <div style="text-align: center; padding: 40px; color: #f87171;">
-            加载失败: ${err.message}
-          </div>
-        `;
+        console.error('loadSegments error:', err);
+        const c = document.getElementById('segments-container');
+        if (c && allSegments.length === 0) {
+          c.innerHTML = `
+            <div style="text-align: center; padding: 40px; color: #f87171;">
+              加载失败: ${err.message}<br/>
+              <button class="btn btn-sm" style="margin-top: 12px;" onclick="loadSegments()">重试</button>
+            </div>
+          `;
+        }
       }
     }
 
     function renderSegmentsList() {
-      const q = (document.getElementById('seg-search').value || '').trim().toLowerCase();
-      const filtered = allSegments.filter(s => {
-        if (!q) return true;
-        return (s.title && s.title.toLowerCase().includes(q)) ||
-               (s.status && s.status.toLowerCase().includes(q)) ||
-               (s.start_ts && s.start_ts.includes(q));
-      });
+      try {
+        const q = (document.getElementById('seg-search').value || '').trim().toLowerCase();
+        const filtered = allSegments.filter(s => {
+          if (!q) return true;
+          return (s.title && s.title.toLowerCase().includes(q)) ||
+                 (s.status && s.status.toLowerCase().includes(q)) ||
+                 (s.start_ts && String(s.start_ts).includes(q));
+        });
 
-      const c = document.getElementById('segments-container');
-      if (filtered.length === 0) {
-        c.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--text-muted);">未检索到匹配的分段</div>';
-        return;
-      }
-
-      c.innerHTML = filtered.map(seg => {
-        const isExp = expandedSegments.has(seg.segment_id);
-        const candidates = seg.candidate_files || [];
-        const files = seg.files || [];
-        const activeCount = seg.active_files_count ?? files.filter(f => !f.is_excluded).length;
-
-        // Local status badge
-        let localBadge = '';
-        if (seg.transcode_progress) {
-          localBadge = `<span class="badge badge-pending">⚡ 构建中 ${Math.round(seg.transcode_progress.percent)}%</span>`;
-        } else if (seg.has_local_file) {
-          localBadge = `<span class="badge badge-info">📁 本地已有 (${seg.local_size_formatted || '已生成'})</span>`;
-        } else {
-          localBadge = `<span class="badge" style="background: rgba(255,255,255,0.06); color: var(--text-muted);">⚪ 本地无文件</span>`;
+        const c = document.getElementById('segments-container');
+        if (filtered.length === 0) {
+          c.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--text-muted);">暂无分段或未检索到匹配的分段</div>';
+          return;
         }
+
+        c.innerHTML = filtered.map(seg => {
+          const isExp = expandedSegments.has(seg.segment_id);
+          const candidates = seg.candidate_files || [];
+          const files = seg.files || [];
+          const activeCount = seg.active_files_count ?? files.filter(f => !f.is_excluded).length;
+
+          // Local status badge
+          let localBadge = '';
+          if (seg.transcode_progress) {
+            localBadge = `<span class="badge badge-pending">⚡ 构建中 ${Math.round(seg.transcode_progress.percent || 0)}%</span>`;
+          } else if (seg.has_local_file) {
+            localBadge = `<span class="badge badge-info">📁 本地已有 (${seg.local_size_formatted || '已生成'})</span>`;
+          } else {
+            localBadge = `<span class="badge" style="background: rgba(255,255,255,0.06); color: var(--text-muted);">⚪ 本地无文件</span>`;
+          }
 
         // Cloud status badge
         let cloudBadge = '';
@@ -322,7 +329,7 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
                           <img class="file-thumb" src="/api/media/stream?id=${encodeURIComponent(cand.file_id)}">
                           <div>
                             <span style="font-weight: 600; color: #fff;">${cand.name}</span>
-                            <span style="color: var(--text-muted); margin-left: 8px;">${cand.captured_at_utc.slice(0, 19)}</span>
+                            <span style="color: var(--text-muted); margin-left: 8px;">${cand.captured_at_utc ? String(cand.captured_at_utc).slice(0, 19).replace('T', ' ') : '--'}</span>
                           </div>
                         </div>
                         <button class="btn btn-sm btn-emerald" onclick="includeCandidateFile('${seg.segment_id}', '${cand.file_id}')">➕ 纳入此分段</button>
@@ -362,9 +369,9 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
                           <div style="font-size: 0.72rem; color: var(--text-sub);">${f.path}</div>
                         </td>
                         <td>${f.type === 'video' ? '🎥 视频' : '📸 照片'}</td>
-                        <td>${f.captured_at_utc ? f.captured_at_utc.slice(0, 19).replace('T', ' ') : '--'}</td>
+                        <td>${f.captured_at_utc ? String(f.captured_at_utc).slice(0, 19).replace('T', ' ') : '--'}</td>
                         <td>${f.type === 'video' ? Math.round(f.duration_seconds || 0) + 's' : (f.resolution || '--')}</td>
-                        <td>${(f.size_bytes / (1024*1024)).toFixed(1)} MB</td>
+                        <td>${(((f.size_bytes || 0)) / (1024*1024)).toFixed(1)} MB</td>
                       </tr>
                     `).join('')}
                   </tbody>
@@ -374,6 +381,9 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
         `;
       }).join('');
+      } catch (err) {
+        console.error('renderSegmentsList error:', err);
+      }
     }
 
     function toggleExpand(segId) {
@@ -478,6 +488,8 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
       } catch (err) {
         showToast('❌ 请求失败: ' + err.message, true);
       }
+    }
+
     async function deleteLocalSegment(id) {
       if (!confirm(`确定要删除分段 [${id.slice(0, 12)}] 的本地视频文件吗？\n这会释放磁盘空间，原始照片文件与 YouTube 云端视频不受影响。`)) return;
       try {

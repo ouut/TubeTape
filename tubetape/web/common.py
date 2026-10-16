@@ -307,6 +307,7 @@ def render_navbar(active_page: str = "dashboard") -> str:
         active_cls = " active" if pid == active_page else ""
         links_html.append(f'<li class="nav-item{active_cls}"><a href="{url}">{title}</a></li>')
 
+    from .. import __version__
     links_str = "".join(links_html)
     tpl = """
   <nav class="navbar">
@@ -314,7 +315,7 @@ def render_navbar(active_page: str = "dashboard") -> str:
       <a href="/" class="nav-brand">
         <span class="nav-brand-logo">📼</span>
         <span>TubeTape</span>
-        <span class="nav-brand-tag">v1.6.2</span>
+        <span class="nav-brand-tag">v__VERSION__</span>
       </a>
       <ul class="nav-links">
         __NAV_LINKS__
@@ -412,4 +413,4 @@ def render_navbar(active_page: str = "dashboard") -> str:
     pollNavStatus();
   </script>
 """
-    return tpl.replace("__NAV_LINKS__", links_str)
+    return tpl.replace("__NAV_LINKS__", links_str).replace("__VERSION__", __version__)
