@@ -445,9 +445,9 @@ class TestKeepSegments:
         assert len(db.segments) == 1
         seg = list(db.segments.values())[0]
         assert seg["youtube_video_id"] is None
-        assert seg["status"] == "sealed"
-        assert seg["output_path"] is not None
-        assert os.path.isfile(seg["output_path"])
+        assert "output_path" not in seg or seg.get("output_path") is None
+        local_file = tmp_path / "uploaded_segments" / f"{seg['title']}.mp4"
+        assert local_file.is_file()
 
     def test_run_pipeline_upload_previously_sealed_no_upload_segments(self, tmp_path, monkeypatch):
         from unittest.mock import MagicMock

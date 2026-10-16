@@ -68,6 +68,16 @@ class TestRoundTrip:
         assert loaded.to_dict() == db.to_dict()
         assert loaded.files["abc"]["location"] == {"lat": 1.0, "lng": 2.0}
         assert loaded.get_segment("seg1")["youtube_video_id"] == "vid123"
+        assert "output_path" not in loaded.get_segment("seg1")
+
+    def test_output_path_stripped_for_portability(self, tmp_path):
+        path = tmp_path / "tubetape.json"
+        db = Database(path=str(path))
+        db.upsert_segment("seg1", {"title": "20240101", "output_path": "C:\\videos\\seg1.mp4"})
+        db.save()
+        assert "output_path" not in db.get_segment("seg1")
+        loaded = Database.load(str(path))
+        assert "output_path" not in loaded.get_segment("seg1")
 
     def test_load_missing_returns_empty(self, tmp_path):
         path = tmp_path / "none.json"

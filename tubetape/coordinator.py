@@ -16,7 +16,7 @@ from typing import Any
 from . import durations
 from .chapters import build_segment_description, chapters_text
 from .db import SEGMENT_STATUS_FAILED, SEGMENT_STATUS_SEALED, Database
-from .planner import ScannedFile, plan
+from .planner import ScannedFile, _make_segment, greedy_pack, plan
 from .rebuild import Rebuilder
 from .reconcile import fetch_remote_catalog, fetch_remote_index, reconcile_database
 from .scanner import FILE_TYPE_VIDEO, VIDEO_EXTENSIONS, scan
@@ -366,9 +366,6 @@ class AppCoordinator:
         if not self.db:
             return None
         srec = self.db.segments.get(segment_id, {})
-        if srec.get("output_path") and os.path.isfile(srec["output_path"]):
-            return srec["output_path"]
-
         t = title or srec.get("title")
         candidates = []
         if t:
@@ -376,9 +373,18 @@ class AppCoordinator:
             for ext in VIDEO_EXTENSIONS:
                 candidates.append(os.path.join(self.segments_dir, f"{t}{ext}"))
         candidates.append(os.path.join(self.segments_dir, f"{segment_id}.mp4"))
+        for ext in VIDEO_EXTENSIONS:
+            candidates.append(os.path.join(self.segments_dir, f"{segment_id}{ext}"))
+
+        # For historical databases that stored output_path, also check its basename in segments_dir
+        old_out = srec.get("output_path")
+        if old_out:
+            candidates.append(os.path.join(self.segments_dir, os.path.basename(old_out)))
+            if os.path.isfile(old_out) and os.path.getsize(old_out) > 0:
+                return old_out
 
         for c in candidates:
-            if os.path.isfile(c):
+            if os.path.isfile(c) and os.path.getsize(c) > 0:
                 return c
 
         # Search for sid[:16] prefix/suffix in uploaded_segments directory
@@ -387,9 +393,36 @@ class AppCoordinator:
             valid_exts = VIDEO_EXTENSIONS | {".mp4"}
             for entry in os.scandir(self.segments_dir):
                 if entry.is_file() and os.path.splitext(entry.name)[1].lower() in valid_exts and sid16 in entry.name:
-                    return entry.path
+                    if entry.stat().st_size > 0:
+                        return entry.path
 
         return None
+
+    def delete_local_segment_file(self, segment_id: str) -> tuple[bool, str]:
+        """Delete local segment video file from disk to free storage space."""
+        if not self.db:
+            return False, "数据库未初始化"
+        srec = self.db.segments.get(segment_id)
+        if not srec:
+            return False, f"未找到分段: {segment_id}"
+
+        title = srec.get("title") or segment_id[:16]
+        local_path = self.find_local_segment_file(segment_id, title)
+        if not local_path or not os.path.isfile(local_path):
+            return False, "本地未找到该分段的视频文件，无需删除"
+
+        try:
+            os.remove(local_path)
+            _logger.info("deleted local segment video file: %s", local_path)
+            # If not yet uploaded to YouTube, reset status back to pending
+            if not srec.get("youtube_video_id"):
+                srec["status"] = "pending"
+                self.db.upsert_segment(segment_id, srec)
+                self.db.save()
+            return True, f"已成功删除本地视频文件 ({os.path.basename(local_path)})"
+        except OSError as exc:
+            _logger.error("failed to delete local segment file %s: %s", local_path, exc)
+            return False, f"删除本地文件失败: {exc}"
 
     def ensure_uploader(self):
         """Lazy-initialize YouTube uploader if credentials are present."""
@@ -880,20 +913,60 @@ class AppCoordinator:
                             "captured_at_utc": frec.get("captured_at_utc", ""),
                         })
 
+            local_path = self.find_local_segment_file(sid, title)
+            has_local = bool(local_path and os.path.isfile(local_path))
+            local_size = os.path.getsize(local_path) if has_local else 0
+            local_size_formatted = f"{local_size / (1024 * 1024):.1f} MB" if has_local else None
+
+            active_dur = sum(f["duration_seconds"] for f in files if not f["is_excluded"])
+            cfg_dur = float(getattr(self.args, "segment_duration", 1200.0))
+            is_oversized = active_dur > cfg_dur
+
+            from . import web
+            upload_state = web._server_state.get("upload", {})
+            transcode_state = web._server_state.get("transcode", {})
+            upload_q = web.get_upload_queue()
+
+            upload_progress = None
+            if upload_state.get("segment_id") == sid:
+                upload_progress = {
+                    "percent": upload_state.get("percent", 0.0),
+                    "speed": upload_state.get("speed", ""),
+                    "uploaded_bytes": upload_state.get("uploaded_bytes", 0),
+                    "total_bytes": upload_state.get("total_bytes", 0),
+                }
+
+            transcode_progress = None
+            if transcode_state.get("segment_id") == sid:
+                transcode_progress = {
+                    "percent": transcode_state.get("percent", 0.0),
+                    "current_file": transcode_state.get("current_file", ""),
+                    "total_files": transcode_state.get("total_files", 0),
+                    "done_files": transcode_state.get("done_files", 0),
+                }
+
+            is_upload_queued = (sid in upload_q and sid != upload_state.get("segment_id"))
+
             res.append({
                 "segment_id": sid,
                 "title": title,
                 "status": status,
-                "duration_seconds": dur,
+                "duration_seconds": dur or active_dur,
                 "start_ts": start_ts,
                 "end_ts": end_ts,
                 "youtube_video_id": vid,
-                "output_path": out_p,
-                "has_local_file": bool(out_p and os.path.isfile(out_p)),
+                "local_path": local_path,
+                "has_local_file": has_local,
+                "local_size_bytes": local_size,
+                "local_size_formatted": local_size_formatted,
                 "total_files": len(fids),
                 "active_files_count": len([f for f in fids if f not in excluded_ids]),
                 "files": files,
                 "candidate_files": candidates,
+                "is_oversized": is_oversized,
+                "upload_progress": upload_progress,
+                "transcode_progress": transcode_progress,
+                "is_upload_queued": is_upload_queued,
             })
 
         # Sort segments chronologically
@@ -946,6 +1019,70 @@ class AppCoordinator:
             return True, f"已将文件纳入分段 {srec.get('title', segment_id[:12])}"
         return True, "文件已在分段中"
 
+    def split_segment(self, segment_id: str) -> tuple[bool, str, list[str]]:
+        """Split an oversized segment into 2 or more segments respecting segment_duration."""
+        if not self.db:
+            return False, "数据库未初始化", []
+        srec = self.db.segments.get(segment_id)
+        if not srec:
+            return False, f"未找到分段: {segment_id}", []
+
+        fids = srec.get("file_ids", [])
+        files = [
+            ScannedFile.from_record(fid, self.db.files[fid], self.args.input)
+            for fid in fids if fid in self.db.files
+        ]
+        if not files:
+            return False, "分段内无可用媒体文件", []
+
+        seg_dur = float(getattr(self.args, "segment_duration", 1200.0))
+        params = self.segment_params()
+        short_th = getattr(self.args, "short_video_threshold", 300.0)
+        ign_lp = getattr(self.args, "ignore_live_photos", True)
+        min_vd = getattr(self.args, "min_video_duration", 2.0)
+
+        groups = greedy_pack(
+            sorted(files, key=lambda f: f.captured_epoch or 0.0),
+            seg_dur,
+            short_video_threshold=short_th,
+            ignore_live_photos=ign_lp,
+            min_video_duration=min_vd,
+        )
+        if len(groups) <= 1:
+            return False, "该分段文件总时长未超过分段时长上限，无需拆分", [segment_id]
+
+        new_segment_ids = []
+        old_vid = srec.get("youtube_video_id")
+        old_prev = list(srec.get("previous_video_ids", []))
+        self.db.segments.pop(segment_id, None)
+
+        for i, group in enumerate(groups, start=1):
+            seg = _make_segment(group, params)
+            sid = seg.segment_id
+            new_segment_ids.append(sid)
+            vid = old_vid if (i == 1 and old_vid) else None
+            self.db.upsert_segment(
+                sid,
+                {
+                    "title": seg.title,
+                    "file_ids": seg.file_ids,
+                    "range": [seg.start_ts, seg.end_ts],
+                    "duration_seconds": seg.duration_seconds,
+                    "youtube_video_id": vid,
+                    "previous_video_ids": old_prev if i == 1 else [],
+                    "status": "pending" if not vid else SEGMENT_STATUS_SEALED,
+                    "chapters": [],
+                    "last_rebuilt_at": None,
+                    "attempts": 0,
+                    "error": None,
+                }
+            )
+
+        self.db.save()
+        msg = f"已将分段拆分为 {len(new_segment_ids)} 个符合时长限制的新分段"
+        _logger.info("split segment %s into %d segments: %s", segment_id, len(new_segment_ids), new_segment_ids)
+        return True, msg, new_segment_ids
+
     def force_replan(self) -> tuple[bool, str]:
         """Force re-planning all segments from scratch."""
         if not self.db:
@@ -961,6 +1098,7 @@ class AppCoordinator:
             try:
                 web.set_web_status("scanning", "正在强制重新规划分段...")
                 self.args.force_plan = True
+                self.args.flush = True
                 cli.run_pipeline(self.args, force_scan=False)
                 web.set_web_status("idle", "分段重新规划完成")
             except Exception as exc:

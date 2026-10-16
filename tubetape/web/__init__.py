@@ -712,6 +712,32 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(200 if ok else 400, {"ok": ok, "message": msg})
             return
 
+        if path == "/api/segment/delete_local":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            seg_id = query.get("id", [None])[0] or query.get("segment_id", [None])[0] or body_dict.get("id") or body_dict.get("segment_id")
+            if not seg_id:
+                self._send_json(400, {"ok": False, "error": "缺少参数: segment_id"})
+                return
+            ok, msg = coord.delete_local_segment_file(seg_id)
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg})
+            return
+
+        if path == "/api/segment/split":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            seg_id = query.get("id", [None])[0] or query.get("segment_id", [None])[0] or body_dict.get("id") or body_dict.get("segment_id")
+            if not seg_id:
+                self._send_json(400, {"ok": False, "error": "缺少参数: segment_id"})
+                return
+            ok, msg, new_ids = coord.split_segment(seg_id)
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg, "new_segment_ids": new_ids})
+            return
+
         self._send_error_json(404, f"未找到 POST 接口: {path}")
 
     def do_GET(self) -> None:

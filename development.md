@@ -165,11 +165,12 @@ except BaseException:
       "file_ids": ["<file_id_1>", "<file_id_2>"],
       "range": ["2024-05-01T12:00:00Z", "2024-05-01T12:20:00Z"],
       "duration_seconds": 1200.0,
-      "output_path": "/db/uploaded_segments/20240501-120000 - 20240501-122000 [a1b2c3d4e5f6].mp4",
+      "title": "20240501_120000[a1b2c3d4e5f6]",
       "youtube_video_id": "dQw4w9WgXcQ",
       "previous_video_ids": [],
       "status": "sealed",
       "chapters": [["0:00", "20240501-120000"], ["0:03", "20240501-120003"]],
+      "excluded_file_ids": [],
       "last_rebuilt_at": null,
       "attempts": 1,
       "error": null
@@ -177,6 +178,10 @@ except BaseException:
   }
 }
 ```
+
+> [!NOTE]
+> **关于 `output_path` 的跨机可移植性设计**：
+> 从 v1.8.0 起，数据库中彻底移除硬编码的绝对路径 `output_path`。换用不同主机或更换挂载目录后，系统通过 `find_local_segment_file(segment_id, title)` 结合当前的 `segments_dir` 动态定位 `.mp4` 文件，确保 `tubetape.json` 在 Windows / macOS / Linux 之间任意拷贝均可开箱即用。
 
 ---
 
@@ -398,20 +403,38 @@ while response is None:
 
 `web.py` 在独立守护线程中运行 `ThreadingHTTPServer`，提供完整的单页应用与流媒体支持。
 
-#### 1. 路由与 API 拓扑
-- `GET /`：全屏时间线画廊 HTML（分段优先导航，支持顶部下拉切分段、首尾平滑穿梭与真实绝对路径复制）。
-- `GET /log` 与 `GET /logs`：仪表盘与实时日志控制台 HTML。
+#### 1. 页面与路由架构 (Multi-Page Modular Architecture)
+- `GET /`：**系统仪表盘 (Dashboard)**：全景展现媒体统计（照片/视频/跳过数）、云端与本地分片指标、当前执行中任务、Google OAuth 一键授权以及【开始全量扫描】/【与 YouTube 同步】快捷操作。
+- `GET /view`：**全屏画廊 (View)**：纯净沉浸式时间线画廊，支持左右手势/按键切换分片，上下滑动选择分片内照片与视频，移除冗余控制条。
+- `GET /segments`：**分片管理中心 (Segments)**：
+  - 本地与云端状态解耦展示：本地状态（已有/大小/转码中/无文件）与云端状态（已上传/排队中/未上传）。
+  - 本地视频扫描复用：启动与规划后自动检测输出目录，存在有效视频时自动跳过转码，直接复用。
+  - 完整运维动作矩阵：`[🗑️ 删本地]`、`[🔨 构建/重构建]`、`[☁️ 立即上传]`、`[🗑️ 删云端]`、`[✂️ 超限拆分]`。
+  - 分片内文件勾选管理、未分配历史补录素材智能推荐与纳入、`[⚡ 强制重新规划分段]`。
+- `GET /logs`：**运行日志监控 (Logs)**：
+  - 高性能分页渲染机制（默认 100 行/页，支持 50/100/200/500/1000 行），彻底消除万行日志导致的浏览器重绘卡死。
+  - 首页/上一页/下一页/末页导航，支持【跟随最新】自动滚屏同步定位至尾页。
+  - 支持日志级别颜色过滤（ALL / INFO / WARN / ERROR / DEBUG）、实时搜索过滤与完整日志下载。
+- `GET /settings`：**配置管理中心 (Settings)**：全量参数详细说明与在线表单修改，启动参数覆盖合并，点击【应用配置并重启】平稳热重启流水线。
 - `GET /getbytime/{segment_id}/{minute}/{second}`：精确时间戳媒体直达查看器（展示匹配素材、宿主机真实物理路径、一键复制与流媒体播放；支持 `?raw=1` 重定向与 `?format=json` 元数据响应）。
-- `GET /api/segments`：获取所有规划分段的摘要列表（分段 ID、起止跨度、素材数、时长、状态、YouTube 视频 ID 与本地路径）。
-- `GET /api/segment/items?id=...`：获取指定分段内的所有媒体明细（含物理绝对路径 `abs_path`、相对路径、类型、拍摄时间、时长与分辨率）。
+
+#### 2. REST API 拓扑
 - `GET /api/status`：核心运行状态与当前任务 JSON。
 - `GET /api/dashboard`：包含扫描统计、分段列表、构建进度、本地保留视频统计及分段可用动作的综合大屏接口。
-- `GET /api/config`：获取当前运行配置及指纹参数清单。
-- `POST /api/config`：动态更新运行参数并保存至 `tubetape.json`。
-- `POST /api/scan/start`：异步触发全量扫描任务。
+- `GET /api/segments`：获取所有规划分段的摘要列表（本地文件存在与大小、云端视频ID、上传/转码实时进度）。
+- `GET /api/segment/items?id=...`：获取指定分段内的所有媒体明细（含物理绝对路径、类型、时长、分辨率及是否被排除）。
+- `POST /api/segment/delete_local`：删除本地 `.mp4` 文件以释放磁盘存储，未上传分片状态重置为待构建。
+- `POST /api/segment/split`：超限分片贪心装箱重新拆分为多个符合目标时长限制的子分片。
+- `POST /api/segment/toggle_file`：排除或重新纳入指定文件参与该分片的构建。
+- `POST /api/segment/include_file`：将补录的未分配候选文件纳入指定分片。
+- `POST /api/segments/replan`：清空分片结构并强制重新全量规划分片（所有规划分片立即持久化写入 `tubetape.json`）。
 - `POST /api/segment/rebuild`：异步触发指定分片重新构建。
 - `POST /api/segment/upload`：异步触发指定分片本地视频直传。
 - `POST /api/segment/delete_youtube`：调用 API 删除云端对应视频。
+- `GET /api/config`：获取当前运行配置及指纹参数清单。
+- `POST /api/config/apply`：动态保存配置并平稳热重启流水线。
+- `POST /api/scan/start`：异步触发全量扫描任务。
+- `POST /api/youtube/sync`：手动与 YouTube 远端频道对账同步。
 - `GET /api/media/summary`：时间线年月分布统计（支持侧边栏 Scrubber）。
 - `GET /api/media/items`：按时间线分页拉取媒体元数据。
 - `GET /api/media/view?id=...`：高清图片展示接口（支持 HEIC 转码缓存与路径穿越防护）。

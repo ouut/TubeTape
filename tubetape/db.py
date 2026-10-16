@@ -154,11 +154,21 @@ class Database:
         )
 
     def to_dict(self) -> dict:
+        # Strip deprecated output_path from all segments before serializing to disk
+        sanitized_segments = {}
+        for sid, srec in self.segments.items():
+            if isinstance(srec, dict) and "output_path" in srec:
+                srec_copy = dict(srec)
+                srec_copy.pop("output_path", None)
+                sanitized_segments[sid] = srec_copy
+            else:
+                sanitized_segments[sid] = srec
+
         d = {
             "version": self.version,
             "config": self.config,
             "files": self.files,
-            "segments": self.segments,
+            "segments": sanitized_segments,
         }
         if self.skipped_files:
             d["skipped_files"] = self.skipped_files
@@ -224,10 +234,12 @@ class Database:
         return self.segments.get(segment_id)
 
     def upsert_segment(self, segment_id: str, record: dict) -> None:
+        rec = dict(record)
+        rec.pop("output_path", None)
         _logger.debug(
             "upsert segment %s (status=%s, video=%s)",
             segment_id[:12],
-            record.get("status"),
-            record.get("youtube_video_id"),
+            rec.get("status"),
+            rec.get("youtube_video_id"),
         )
-        self.segments[segment_id] = record
+        self.segments[segment_id] = rec

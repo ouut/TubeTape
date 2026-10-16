@@ -86,6 +86,12 @@ _LOGS_HTML_TEMPLATE = """<!DOCTYPE html>
     .log-line.error { color: #f87171; font-weight: 600; }
     .log-line.debug { color: #6b7280; }
 
+    .btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
     .autoscroll-toggle {
       display: inline-flex;
       align-items: center;
@@ -112,13 +118,27 @@ _LOGS_HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <input type="text" id="log-search-input" class="log-search" placeholder="过滤关键字..." oninput="filterLogs()">
       </div>
-      <div style="display: flex; align-items: center; gap: 14px;">
+      <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+        <div style="display: flex; align-items: center; gap: 5px;">
+          <select id="page-size-select" onchange="changePageSize(this.value)" style="padding: 4px 8px; font-size: 0.8rem; background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: #fff; border-radius: 6px; cursor: pointer;">
+            <option value="50">50 行/页</option>
+            <option value="100" selected>100 行/页</option>
+            <option value="200">200 行/页</option>
+            <option value="500">500 行/页</option>
+            <option value="1000">1000 行/页</option>
+          </select>
+          <button class="btn btn-sm" id="btn-first" onclick="goToPage(1)" title="首页">⏮️</button>
+          <button class="btn btn-sm" id="btn-prev" onclick="goToPage(currentPage - 1)" title="上一页">◀</button>
+          <span id="page-info" style="font-size: 0.8rem; color: var(--text-muted); min-width: 110px; text-align: center;">1 / 1</span>
+          <button class="btn btn-sm" id="btn-next" onclick="goToPage(currentPage + 1)" title="下一页">▶</button>
+          <button class="btn btn-sm" id="btn-last" onclick="goToPage(totalPages)" title="末页">⏭️</button>
+        </div>
         <label class="autoscroll-toggle">
-          <input type="checkbox" id="auto-scroll" checked>
-          <span>自动滚屏</span>
+          <input type="checkbox" id="auto-scroll" checked onchange="toggleAutoScroll(this.checked)">
+          <span>跟随最新</span>
         </label>
-        <button class="btn btn-sm" onclick="clearLogs()">清空视图</button>
-        <a href="/api/logs?download=1" class="btn btn-sm btn-primary">⬇️ 下载完整日志</a>
+        <button class="btn btn-sm" onclick="clearLogs()">清空</button>
+        <a href="/api/logs?download=1" class="btn btn-sm btn-primary">⬇️ 下载日志</a>
       </div>
     </div>
 
@@ -130,6 +150,9 @@ _LOGS_HTML_TEMPLATE = """<!DOCTYPE html>
     let logLines = [];
     let currentLevel = 'ALL';
     let isPolling = false;
+    let pageSize = 100;
+    let currentPage = 1;
+    let totalPages = 1;
 
     async function pollLogs() {
       if (isPolling) return;
@@ -141,32 +164,64 @@ _LOGS_HTML_TEMPLATE = """<!DOCTYPE html>
         if (data.content && data.content.length > 0) {
           logOffset = data.offset;
           const newLines = data.content.split('\\n');
+          let added = false;
           for (const line of newLines) {
             if (line.trim().length > 0) {
               logLines.push(line);
+              added = true;
             }
           }
-          renderLogLines();
+          if (added) {
+            renderLogLines();
+          }
         }
       } catch (e) {} finally {
         isPolling = false;
       }
     }
 
+    function toggleAutoScroll(enabled) {
+      if (enabled) {
+        currentPage = totalPages;
+        renderLogLines();
+      }
+    }
+
+    function changePageSize(val) {
+      pageSize = parseInt(val, 10) || 100;
+      currentPage = 1;
+      renderLogLines();
+    }
+
+    function goToPage(page) {
+      const autoScrollCheckbox = document.getElementById('auto-scroll');
+      if (page < 1) page = 1;
+      if (page > totalPages) page = totalPages;
+      if (page !== totalPages && autoScrollCheckbox.checked) {
+        autoScrollCheckbox.checked = false;
+      }
+      currentPage = page;
+      renderLogLines();
+    }
+
     function setLogLevel(lvl, btn) {
       currentLevel = lvl;
       document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
       if (btn) btn.classList.add('active');
+      currentPage = 1;
       renderLogLines();
     }
 
     function filterLogs() {
+      currentPage = 1;
       renderLogLines();
     }
 
     function clearLogs() {
       logLines = [];
-      document.getElementById('log-box').innerHTML = '';
+      currentPage = 1;
+      totalPages = 1;
+      renderLogLines();
     }
 
     function renderLogLines() {
@@ -185,13 +240,46 @@ _LOGS_HTML_TEMPLATE = """<!DOCTYPE html>
         return true;
       });
 
-      box.innerHTML = filtered.map(line => {
+      const totalLines = filtered.length;
+      totalPages = Math.max(1, Math.ceil(totalLines / pageSize));
+
+      if (autoScroll) {
+        currentPage = totalPages;
+      } else {
+        if (currentPage > totalPages) currentPage = totalPages;
+        if (currentPage < 1) currentPage = 1;
+      }
+
+      const startIdx = totalLines === 0 ? 0 : (currentPage - 1) * pageSize;
+      const endIdx = Math.min(startIdx + pageSize, totalLines);
+      const pageLines = filtered.slice(startIdx, endIdx);
+
+      const pageInfo = document.getElementById('page-info');
+      if (pageInfo) {
+        pageInfo.textContent = `${currentPage} / ${totalPages} (${totalLines}条)`;
+      }
+      const btnFirst = document.getElementById('btn-first');
+      const btnPrev = document.getElementById('btn-prev');
+      const btnNext = document.getElementById('btn-next');
+      const btnLast = document.getElementById('btn-last');
+      if (btnFirst) btnFirst.disabled = (currentPage <= 1);
+      if (btnPrev) btnPrev.disabled = (currentPage <= 1);
+      if (btnNext) btnNext.disabled = (currentPage >= totalPages);
+      if (btnLast) btnLast.disabled = (currentPage >= totalPages);
+
+      if (pageLines.length === 0) {
+        box.innerHTML = '<div style="color: var(--text-muted); text-align: center; margin-top: 40px;">暂无匹配日志记录</div>';
+        return;
+      }
+
+      box.innerHTML = pageLines.map((line, idx) => {
         let cls = 'info';
         if (line.includes('ERROR') || line.includes('error')) cls = 'error';
         else if (line.includes('WARN') || line.includes('warn')) cls = 'warn';
         else if (line.includes('DEBUG') || line.includes('debug')) cls = 'debug';
         const escaped = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        return `<div class="log-line ${cls}">${escaped}</div>`;
+        const lineNum = startIdx + idx + 1;
+        return `<div class="log-line ${cls}"><span style="color:#4b5563; user-select:none; display:inline-block; width:45px; text-align:right; margin-right:12px;">${lineNum}</span>${escaped}</div>`;
       }).join('');
 
       if (autoScroll) {

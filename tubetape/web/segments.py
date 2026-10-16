@@ -229,33 +229,83 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
         const files = seg.files || [];
         const activeCount = seg.active_files_count ?? files.filter(f => !f.is_excluded).length;
 
-        let badgeHtml = '';
-        if (seg.youtube_video_id) {
-          badgeHtml = `<a href="https://youtu.be/${seg.youtube_video_id}" target="_blank" class="badge badge-sealed" style="text-decoration: none;">▶️ YouTube (${seg.youtube_video_id})</a>`;
-        } else if (seg.status === 'failed') {
-          badgeHtml = '<span class="badge badge-failed">构建失败</span>';
+        // Local status badge
+        let localBadge = '';
+        if (seg.transcode_progress) {
+          localBadge = `<span class="badge badge-pending">⚡ 构建中 ${Math.round(seg.transcode_progress.percent)}%</span>`;
         } else if (seg.has_local_file) {
-          badgeHtml = '<span class="badge badge-info">本地就绪 (待上传)</span>';
+          localBadge = `<span class="badge badge-info">📁 本地已有 (${seg.local_size_formatted || '已生成'})</span>`;
         } else {
-          badgeHtml = '<span class="badge badge-pending">待构建</span>';
+          localBadge = `<span class="badge" style="background: rgba(255,255,255,0.06); color: var(--text-muted);">⚪ 本地无文件</span>`;
         }
+
+        // Cloud status badge
+        let cloudBadge = '';
+        if (seg.upload_progress) {
+          cloudBadge = `<span class="badge badge-pending">🚀 上传中 ${Math.round(seg.upload_progress.percent)}% · ${seg.upload_progress.speed}</span>`;
+        } else if (seg.is_upload_queued) {
+          cloudBadge = `<span class="badge badge-info">🕒 排队上传中</span>`;
+        } else if (seg.youtube_video_id) {
+          cloudBadge = `<a href="https://youtu.be/${seg.youtube_video_id}" target="_blank" class="badge badge-sealed" style="text-decoration: none;">▶️ YouTube (${seg.youtube_video_id})</a>`;
+        } else {
+          cloudBadge = `<span class="badge" style="background: rgba(255,255,255,0.06); color: var(--text-muted);">⚪ 云端未上传</span>`;
+        }
+
+        const oversizedBadge = seg.is_oversized ? '<span class="badge badge-failed" title="当前有效文件总时长超过分段时长上限">⚠️ 时长超限</span>' : '';
 
         return `
           <div class="segment-card" id="card-${seg.segment_id}">
             <div class="segment-card-header" onclick="toggleExpand('${seg.segment_id}')">
-              <div>
+              <div style="flex: 1; min-width: 0;">
                 <div class="seg-title-row">
                   <span style="font-size: 1.1rem; color: #60a5fa;">${isExp ? '▼' : '▶'}</span>
                   <span class="seg-title">${seg.title}</span>
-                  ${badgeHtml}
+                  ${localBadge}
+                  ${cloudBadge}
+                  ${oversizedBadge}
                 </div>
                 <div class="seg-time-range" style="margin-top: 4px; margin-left: 26px;">
                   拍摄区间: ${seg.start_ts ? seg.start_ts.slice(0, 10) : '--'} ~ ${seg.end_ts ? seg.end_ts.slice(0, 10) : '--'} · 时长: ${Math.round(seg.duration_seconds || 0)}秒 · 有效文件: ${activeCount} / ${files.length}
                 </div>
+
+                ${seg.transcode_progress ? `
+                  <div style="margin: 8px 0 0 26px; font-size: 0.75rem; color: #93c5fd;" onclick="event.stopPropagation()">
+                    <div style="display:flex; justify-content:space-between; margin-bottom: 3px;">
+                      <span>⚡ 正在构建: ${seg.transcode_progress.current_file || ''}</span>
+                      <span>${seg.transcode_progress.done_files || 0} / ${seg.transcode_progress.total_files || 0} (${Math.round(seg.transcode_progress.percent)}%)</span>
+                    </div>
+                    <div style="height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
+                      <div style="height: 100%; width: ${seg.transcode_progress.percent}%; background: #3b82f6; transition: width 0.3s ease;"></div>
+                    </div>
+                  </div>
+                ` : ''}
+
+                ${seg.upload_progress ? `
+                  <div style="margin: 8px 0 0 26px; font-size: 0.75rem; color: #a7f3d0;" onclick="event.stopPropagation()">
+                    <div style="display:flex; justify-content:space-between; margin-bottom: 3px;">
+                      <span>🚀 正在上传至 YouTube · 速度: ${seg.upload_progress.speed || '计算中...'}</span>
+                      <span>${Math.round(seg.upload_progress.percent)}%</span>
+                    </div>
+                    <div style="height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
+                      <div style="height: 100%; width: ${seg.upload_progress.percent}%; background: #10b981; transition: width 0.3s ease;"></div>
+                    </div>
+                  </div>
+                ` : ''}
               </div>
+
               <div class="seg-actions" onclick="event.stopPropagation()">
-                <button class="btn btn-sm btn-emerald" onclick="rebuildSegment('${seg.segment_id}')">🔄 重新构建</button>
-                <button class="btn btn-sm btn-sync" onclick="queueUpload('${seg.segment_id}')">☁️ 上传</button>
+                ${seg.is_oversized ? `<button class="btn btn-sm btn-amber" onclick="splitSegment('${seg.segment_id}')">✂️ 超限拆分</button>` : ''}
+                ${seg.has_local_file ? `
+                  <button class="btn btn-sm btn-danger" onclick="deleteLocalSegment('${seg.segment_id}')" title="删除本地 .mp4 视频释放磁盘空间">🗑️ 删本地</button>
+                  <button class="btn btn-sm btn-emerald" onclick="rebuildSegment('${seg.segment_id}')">🔄 重新构建</button>
+                ` : `
+                  <button class="btn btn-sm btn-emerald" onclick="rebuildSegment('${seg.segment_id}')">🔨 构建视频</button>
+                `}
+                ${seg.youtube_video_id ? `
+                  <button class="btn btn-sm btn-danger" onclick="deleteYoutubeVideo('${seg.segment_id}')" title="从 YouTube 删除视频并解绑">🗑️ 删云端</button>
+                ` : (seg.has_local_file ? `
+                  <button class="btn btn-sm btn-sync" onclick="queueUpload('${seg.segment_id}')">☁️ 立即上传</button>
+                ` : '')}
               </div>
             </div>
 
@@ -428,9 +478,68 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
       } catch (err) {
         showToast('❌ 请求失败: ' + err.message, true);
       }
+    async function deleteLocalSegment(id) {
+      if (!confirm(`确定要删除分段 [${id.slice(0, 12)}] 的本地视频文件吗？\n这会释放磁盘空间，原始照片文件与 YouTube 云端视频不受影响。`)) return;
+      try {
+        const res = await fetch('/api/segment/delete_local', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ segment_id: id })
+        });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          showToast('✅ ' + (d.message || '本地视频已删除'));
+          loadSegments();
+        } else {
+          showToast('❌ 删除失败: ' + (d.error || '未知错误'), true);
+        }
+      } catch (err) {
+        showToast('❌ 请求失败: ' + err.message, true);
+      }
+    }
+
+    async function deleteYoutubeVideo(id) {
+      if (!confirm(`⚠️ 危险操作：确定要从 YouTube 上删除此分段对应的视频吗？\n删除后该视频在 YouTube 上将无法找回！`)) return;
+      try {
+        const res = await fetch('/api/segment/delete_youtube', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ segment_id: id })
+        });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          showToast('✅ ' + (d.message || '已从 YouTube 成功删除'));
+          loadSegments();
+        } else {
+          showToast('❌ 删除失败: ' + (d.error || '未知错误'), true);
+        }
+      } catch (err) {
+        showToast('❌ 请求失败: ' + err.message, true);
+      }
+    }
+
+    async function splitSegment(id) {
+      if (!confirm(`确定要将超长分段 [${id.slice(0, 12)}] 拆分为多个符合时长限制的新分段吗？`)) return;
+      try {
+        const res = await fetch('/api/segment/split', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ segment_id: id })
+        });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          showToast('✅ ' + (d.message || '分段拆分成功'));
+          loadSegments();
+        } else {
+          showToast('❌ 拆分失败: ' + (d.error || '未知错误'), true);
+        }
+      } catch (err) {
+        showToast('❌ 请求失败: ' + err.message, true);
+      }
     }
 
     loadSegments();
+    setInterval(loadSegments, 2500);
   </script>
 </body>
 </html>"""

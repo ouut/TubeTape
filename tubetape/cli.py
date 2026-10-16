@@ -568,13 +568,14 @@ def _run_pipeline_impl(
         f"({len(result.new_file_ids)} new, {len(result.deleted_file_ids)} deleted, "
         f"{len(result.skipped)} skipped)"
     )
-    existing_segs = {} if getattr(args, "force_plan", False) else db.segments
+    is_force_plan = getattr(args, "force_plan", False)
+    existing_segs = {} if is_force_plan else db.segments
     plan_result = plan(
         result.files,
         existing_segs,
         args.segment_duration,
         params=_segment_params(args),
-        flush=args.flush,
+        flush=args.flush or is_force_plan,
         short_video_threshold=getattr(args, "short_video_threshold", 300.0),
         ignore_live_photos=getattr(args, "ignore_live_photos", True),
         min_video_duration=getattr(args, "min_video_duration", 2.0),
@@ -635,10 +636,55 @@ def _run_pipeline_impl(
         db.remove_file(file_id)
         _log.debug("removed deleted file %s from index", file_id[:12])
 
-    # Immediately save the database after scanning and reconciliation so
-    # the index on disk is 100% up to date before long-running transcoding begins.
+    # Immediately save the database after scanning so index on disk is up to date
     db.save()
     _log.info("database saved after scan sync: %d file(s)", len(db.files))
+
+    # Immediately persist all planned segments into db.segments so they are visible on Web UI
+    segments_dir = getattr(args, "segments_dir", None) or os.path.join(os.path.dirname(args.db), "uploaded_segments")
+    os.makedirs(segments_dir, exist_ok=True)
+
+    if is_force_plan:
+        new_sids = {seg.segment_id for seg in plan_result.segments}
+        for sid in list(db.segments.keys()):
+            if sid not in new_sids:
+                db.segments.pop(sid, None)
+
+    for seg in plan_result.segments:
+        existing_srec = db.segments.get(seg.segment_id, {})
+        local_file = None
+        if coordinator:
+            local_file = coordinator.find_local_segment_file(seg.segment_id, seg.title)
+        if not local_file:
+            for cand in [os.path.join(segments_dir, f"{seg.title}.mp4"), os.path.join(segments_dir, f"{seg.segment_id}.mp4")]:
+                if os.path.isfile(cand) and os.path.getsize(cand) > 1024:
+                    local_file = cand
+                    break
+
+        has_local = bool(local_file and os.path.isfile(local_file))
+        existing_vid = existing_srec.get("youtube_video_id")
+        initial_status = existing_srec.get("status")
+        if not initial_status:
+            initial_status = SEGMENT_STATUS_SEALED if (existing_vid or has_local) else "pending"
+
+        db.upsert_segment(
+            seg.segment_id,
+            {
+                "title": seg.title,
+                "file_ids": list(seg.file_ids),
+                "range": [seg.start_ts, seg.end_ts],
+                "duration_seconds": seg.duration_seconds,
+                "youtube_video_id": existing_vid,
+                "previous_video_ids": list(existing_srec.get("previous_video_ids", [])),
+                "status": initial_status,
+                "chapters": list(existing_srec.get("chapters", [])),
+                "last_rebuilt_at": existing_srec.get("last_rebuilt_at"),
+                "attempts": existing_srec.get("attempts", 0),
+                "error": existing_srec.get("error"),
+            }
+        )
+    db.save()
+    _log.info("database saved after plan sync: %d segment(s)", len(db.segments))
 
     # Real run: transcode each new/rebuild segment, then upload.
 
@@ -755,15 +801,22 @@ def _run_pipeline_impl(
 
             # Check if segment was already transcoded locally and sealed in db
             srec = db.segments.get(segment.segment_id)
-            local_out = srec.get("output_path") if srec else None
-            has_existing_file = (local_out and os.path.isfile(local_out)) or os.path.isfile(out_path)
+            local_out = None
+            if coordinator:
+                local_out = coordinator.find_local_segment_file(segment.segment_id, segment.title)
+            if not local_out:
+                for cand in [out_path, os.path.join(segments_dir, f"{segment.title}.mp4"), os.path.join(segments_dir, f"{segment.segment_id}.mp4")]:
+                    if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                        local_out = cand
+                        break
+            has_existing_file = bool(local_out and os.path.isfile(local_out))
             if (
                 srec
                 and not segment.is_rebuild
                 and has_existing_file
                 and not srec.get("youtube_video_id")
             ):
-                target_out = local_out if (local_out and os.path.isfile(local_out)) else out_path
+                target_out = local_out
                 if upload_worker:
                     reporter.status(f"segment {segment.title} already transcoded locally ({target_out}); queuing for upload")
                     _log.info("segment %s already transcoded locally; queuing for upload", segment.segment_id)
@@ -775,8 +828,6 @@ def _run_pipeline_impl(
                             s["youtube_video_id"] = vid
                             s["status"] = SEGMENT_STATUS_SEALED
                             s["error"] = None
-                            if getattr(args, "keep_segments", 0) <= 0:
-                                s["output_path"] = None
                             db.upsert_segment(sid, s)
                             db.save()
                             rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))
@@ -802,6 +853,15 @@ def _run_pipeline_impl(
                             on_error=cb_err,
                         )
                     )
+                    continue
+                else:
+                    reporter.status(f"segment {segment.title} already transcoded locally ({target_out})")
+                    _log.info("segment %s already transcoded locally", segment.segment_id)
+                    srec["status"] = SEGMENT_STATUS_SEALED
+                    srec["error"] = None
+                    db.upsert_segment(segment.segment_id, srec)
+                    db.save()
+                    web.finish_web_segment(segment.segment_id, youtube_video_id=None)
                     continue
 
             _log.info(
@@ -882,7 +942,6 @@ def _run_pipeline_impl(
                     else:
                         _, chapters = transcode_fn(segment_files)
                         video_id = None
-                        saved_out_path = out_path if getattr(args, "keep_segments", 0) > 0 and os.path.exists(out_path) else None
                         db.upsert_segment(
                             segment.segment_id,
                             {
@@ -890,7 +949,6 @@ def _run_pipeline_impl(
                                 "file_ids": segment.file_ids,
                                 "range": [segment.start_ts, segment.end_ts],
                                 "duration_seconds": segment.duration_seconds,
-                                "output_path": saved_out_path,
                                 "youtube_video_id": None,
                                 "previous_video_ids": [],
                                 "status": SEGMENT_STATUS_SEALED,
@@ -911,7 +969,6 @@ def _run_pipeline_impl(
                     if upload_worker:
                         reporter.status(f"transcoded {segment.title}; queuing for background upload ...")
                         _log.info("transcoded %s; queuing for background upload", segment.segment_id)
-                        saved_out_path = out_path
                         srec = db.segments.get(segment.segment_id, {})
                         db.upsert_segment(
                             segment.segment_id,
@@ -920,7 +977,6 @@ def _run_pipeline_impl(
                                 "file_ids": segment.file_ids,
                                 "range": [segment.start_ts, segment.end_ts],
                                 "duration_seconds": segment.duration_seconds,
-                                "output_path": saved_out_path,
                                 "youtube_video_id": None,
                                 "previous_video_ids": srec.get("previous_video_ids", []),
                                 "status": SEGMENT_STATUS_SEALED,
@@ -939,8 +995,6 @@ def _run_pipeline_impl(
                                 s["youtube_video_id"] = vid
                                 s["status"] = SEGMENT_STATUS_SEALED
                                 s["error"] = None
-                                if getattr(args, "keep_segments", 0) <= 0:
-                                    s["output_path"] = None
                                 db.upsert_segment(sid, s)
                                 db.save()
                                 rotate_uploaded_segments(segments_dir, getattr(args, "keep_segments", 0))

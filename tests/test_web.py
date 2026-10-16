@@ -970,6 +970,97 @@ def test_web_segment_toggle_and_include(tmp_path):
         server.stop()
 
 
+def test_segment_delete_local_and_split_and_logs_pagination(tmp_path):
+    from tubetape.coordinator import AppCoordinator
+    from tubetape.db import Database
+    from tubetape import cli
+
+    db_path = tmp_path / "db.json"
+    seg_dir = tmp_path / "uploaded_segments"
+    seg_dir.mkdir(exist_ok=True)
+
+    db = Database(path=str(db_path))
+    db.upsert_file("f_a", {
+        "path": "img_a.png", "name": "img_a.png", "type": "video",
+        "duration_seconds": 15.0, "captured_at_utc": "2024-01-01T10:00:00Z"
+    })
+    db.upsert_file("f_b", {
+        "path": "img_b.png", "name": "img_b.png", "type": "video",
+        "duration_seconds": 15.0, "captured_at_utc": "2024-01-01T10:10:00Z"
+    })
+    db.upsert_segment("seg_oversized", {
+        "title": "20240101_100000[seg_oversized]",
+        "file_ids": ["f_a", "f_b"],
+        "range": ["2024-01-01T10:00:00Z", "2024-01-01T10:10:00Z"],
+        "duration_seconds": 30.0,
+        "youtube_video_id": None,
+        "status": "pending",
+    })
+    db.save()
+
+    # Create dummy local segment file
+    seg_file = seg_dir / "20240101_100000[seg_oversized].mp4"
+    seg_file.write_bytes(b"test_local_mp4_bytes")
+
+    test_args = cli.parse_args([
+        "--input", str(tmp_path),
+        "--db", str(db_path),
+        "--segments-dir", str(seg_dir),
+        "--segment-duration", "20s",
+        "--no-upload",
+        "--no-watch",
+    ])
+    coord = AppCoordinator(args=test_args, db=db)
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+    web.set_app_coordinator(coord)
+    web.set_web_context(media_dir=str(tmp_path), db=db, db_path=str(db_path))
+
+    try:
+        # 1. Verify logs page has pagination elements
+        with urllib.request.urlopen(f"{base_url}/logs") as res:
+            assert res.status == 200
+            html = res.read().decode("utf-8")
+            assert "page-size-select" in html
+            assert "btn-first" in html
+            assert "btn-next" in html
+            assert "跟随最新" in html
+
+        # 2. Test POST /api/segment/delete_local
+        assert seg_file.is_file()
+        req_del = urllib.request.Request(
+            f"{base_url}/api/segment/delete_local?id=seg_oversized",
+            data=b"",
+            method="POST",
+        )
+        with urllib.request.urlopen(req_del) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert not seg_file.is_file()
+
+        # 3. Test POST /api/segment/split
+        req_split = urllib.request.Request(
+            f"{base_url}/api/segment/split?id=seg_oversized",
+            data=b"",
+            method="POST",
+        )
+        with urllib.request.urlopen(req_split) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert len(data["new_segment_ids"]) == 2
+            assert "seg_oversized" not in db.segments
+            for nid in data["new_segment_ids"]:
+                assert nid in db.segments
+    finally:
+        server.stop()
+
+
+
 
 
 
