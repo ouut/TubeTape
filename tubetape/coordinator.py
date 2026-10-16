@@ -107,16 +107,21 @@ class AppCoordinator:
             return {}
 
         saved = self.db.config
+        explicit = getattr(self.args, "_explicit_cli_args", set())
         if saved:
-            explicit = getattr(self.args, "_explicit_cli_args", set())
             filtered_saved = {k: v for k, v in saved.items() if k not in explicit}
             self._apply_dict_to_args(filtered_saved)
             _logger.info("loaded dynamic config overrides from database %s", self.db.path)
-            return saved
-        return {}
+        # Always persist current effective configuration to tubetape.json (except in dry-run mode)
+        if not getattr(self.args, "dry_run", False):
+            self.save_config()
+        return self.db.config
 
     def save_config(self) -> None:
         """Persist current configuration to tubetape.json database."""
+        if getattr(self.args, "dry_run", False):
+            return
+
         if self.db is None and self._db_path:
             try:
                 self.db = Database.load(self._db_path)
@@ -130,6 +135,10 @@ class AppCoordinator:
         try:
             cfg = self.get_config()["config"]
             cfg["force_scan"] = False  # never persist force_scan across restarts
+            cfg["force_plan"] = False  # never persist force_plan across restarts
+            # Do not persist CLI one-time --no-upload flag to database
+            if "no_upload" in getattr(self.args, "_explicit_cli_args", set()):
+                cfg["no_upload"] = False
             self.db.config = cfg
             self.db.save()
             # Clean up legacy config.json if present
@@ -155,37 +164,45 @@ class AppCoordinator:
         )
         return {
             "config": {
-                "segment_duration": float(getattr(a, "segment_duration", 1200.0)),
+                "input": str(getattr(a, "input", ".")),
                 "segments_dir": str(getattr(a, "segments_dir", None) or self.segments_dir),
+                "db": str(getattr(a, "db", "tubetape.json")),
+                "log_file": str(getattr(a, "log_file", None) or (getattr(a, "db", "tubetape.json") + ".log")),
                 "web_port": int(getattr(a, "web_port", 8080)),
                 "keep_segments": int(getattr(a, "keep_segments", 0)),
                 "no_upload": bool(getattr(a, "no_upload", False)),
                 "force_scan": bool(getattr(a, "force_scan", False)),
-                "image_duration": float(getattr(a, "image_duration", 3.0)),
+                "force_plan": bool(getattr(a, "force_plan", False)),
+                "segment_duration": float(getattr(a, "segment_duration", 1200.0)),
+                "encoder": str(getattr(a, "encoder", "auto")),
                 "crf": int(getattr(a, "crf", 18)),
                 "max_resolution": max_res_str,
                 "canvas_mode": str(getattr(a, "canvas_mode", "max")),
                 "fps": int(getattr(a, "fps", 30)),
                 "x264_preset": str(getattr(a, "x264_preset", "fast")),
+                "image_duration": float(getattr(a, "image_duration", 3.0)),
                 "ken_burns": bool(getattr(a, "ken_burns", False)),
-                "privacy": str(getattr(a, "privacy", "private")),
-                "playlist": str(getattr(a, "playlist", "") or ""),
+                "short_video_threshold": float(getattr(a, "short_video_threshold", 300.0)),
+                "min_video_duration": float(getattr(a, "min_video_duration", 2.0)),
+                "ignore_live_photos": bool(getattr(a, "ignore_live_photos", True)),
                 "only_camera_photos": bool(getattr(a, "only_camera_photos", False)),
                 "only_phone_videos": bool(getattr(a, "only_phone_videos", False)),
+                "timezone": str(getattr(a, "timezone", "Asia/Shanghai")),
+                "privacy": str(getattr(a, "privacy", "private")),
+                "playlist": str(getattr(a, "playlist", "") or ""),
+                "watch": bool(getattr(a, "watch", True)),
                 "quiet_period": float(getattr(a, "quiet_period", 600.0)),
                 "poll_interval": float(getattr(a, "poll_interval", 30.0)),
                 "mtime_interval": float(getattr(a, "mtime_interval", 600.0)),
                 "quota_backoff": float(getattr(a, "quota_backoff", 3600.0)),
-                "short_video_threshold": float(getattr(a, "short_video_threshold", 300.0)),
-                "ignore_live_photos": bool(getattr(a, "ignore_live_photos", True)),
-                "min_video_duration": float(getattr(a, "min_video_duration", 2.0)),
-                "encoder": str(getattr(a, "encoder", "auto")),
             },
             "fingerprint_params": list(FINGERPRINT_PARAMS),
         }
 
     def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
         """Validate, apply, and persist configuration updates, then restart pipeline."""
+        if isinstance(updates, dict) and "updates" in updates and isinstance(updates["updates"], dict):
+            updates = updates["updates"]
         self._apply_dict_to_args(updates)
         self.save_config()
 
@@ -308,6 +325,23 @@ class AppCoordinator:
                 a.ignore_live_photos = bool(v)
             elif k == "encoder":
                 a.encoder = str(v).strip().lower()
+            elif k == "watch":
+                a.watch = bool(v)
+            elif k == "force_plan":
+                a.force_plan = bool(v)
+            elif k == "input":
+                if v and str(v).strip():
+                    a.input = os.path.abspath(str(v).strip())
+            elif k == "db":
+                if v and str(v).strip():
+                    a.db = os.path.abspath(str(v).strip())
+                    self._db_path = a.db
+            elif k == "log_file":
+                if v and str(v).strip():
+                    a.log_file = os.path.abspath(str(v).strip())
+            elif k == "timezone":
+                if v:
+                    a.timezone = durations.parse_timezone(str(v).strip())
 
     def is_task_running(self) -> bool:
         return self.current_task is not None
@@ -423,7 +457,10 @@ class AppCoordinator:
 
                 # Collect files
                 files = []
+                excluded_ids = set(srec.get("excluded_file_ids", []))
                 for fid in srec.get("file_ids", []):
+                    if fid in excluded_ids:
+                        continue
                     frec = self.db.files.get(fid)
                     if frec:
                         files.append(ScannedFile.from_record(fid, frec, self.args.input))
@@ -704,4 +741,236 @@ class AppCoordinator:
         finally:
             self.current_task = None
             self.task_lock.release()
+
+    def get_media_stats(self) -> dict:
+        """Compute summary statistics across all scanned media files and database."""
+        if not self.db:
+            return {
+                "total_files": 0,
+                "total_size_bytes": 0,
+                "total_size_formatted": "0 B",
+                "photos_count": 0,
+                "videos_count": 0,
+                "skipped_count": 0,
+                "earliest_date": None,
+                "latest_date": None,
+                "date_span": "暂无数据",
+                "total_segments": 0,
+                "uploaded_segments": 0,
+            }
+
+        files = self.db.files
+        total_files = len(files)
+        total_size = 0
+        photos_count = 0
+        videos_count = 0
+        dates: list[str] = []
+
+        for frec in files.values():
+            sz = frec.get("size_bytes", 0) or 0
+            total_size += sz
+            ftype = frec.get("type", "")
+            if ftype == FILE_TYPE_VIDEO:
+                videos_count += 1
+            else:
+                photos_count += 1
+            cap = frec.get("captured_at_utc")
+            if cap:
+                dates.append(str(cap)[:10])
+
+        dates.sort()
+        earliest = dates[0] if dates else None
+        latest = dates[-1] if dates else None
+        date_span = f"{earliest} ~ {latest}" if (earliest and latest) else "暂无数据"
+
+        if total_size >= 1024 * 1024 * 1024:
+            sz_str = f"{total_size / (1024 * 1024 * 1024):.2f} GB"
+        elif total_size >= 1024 * 1024:
+            sz_str = f"{total_size / (1024 * 1024):.1f} MB"
+        elif total_size >= 1024:
+            sz_str = f"{total_size / 1024:.0f} KB"
+        else:
+            sz_str = f"{total_size} B"
+
+        skipped_count = len(getattr(self.db, "skipped_files", {}))
+        total_segments = len(self.db.segments)
+        uploaded_segments = sum(1 for s in self.db.segments.values() if s.get("youtube_video_id"))
+
+        return {
+            "total_files": total_files,
+            "total_size_bytes": total_size,
+            "total_size_formatted": sz_str,
+            "photos_count": photos_count,
+            "videos_count": videos_count,
+            "skipped_count": skipped_count,
+            "earliest_date": earliest,
+            "latest_date": latest,
+            "date_span": date_span,
+            "total_segments": total_segments,
+            "uploaded_segments": uploaded_segments,
+        }
+
+    def get_segments_view_data(self) -> list[dict]:
+        """Return rich segments list for Segments management page."""
+        if not self.db:
+            return []
+
+        # 1. Collect all currently assigned file_ids
+        assigned_file_ids = set()
+        for srec in self.db.segments.values():
+            for fid in srec.get("file_ids", []):
+                assigned_file_ids.add(fid)
+
+        # 2. Collect candidate unassigned files
+        unassigned_files = []
+        for fid, frec in self.db.files.items():
+            if fid not in assigned_file_ids:
+                cap = frec.get("captured_at_utc", "")
+                if cap:
+                    unassigned_files.append((str(cap), fid, frec))
+
+        unassigned_files.sort(key=lambda x: x[0])
+
+        res = []
+        for sid, srec in self.db.segments.items():
+            title = srec.get("title") or sid[:16]
+            status = srec.get("status", "pending")
+            dur = srec.get("duration_seconds", 0.0)
+            rng = srec.get("range") or ["", ""]
+            start_ts = rng[0] if len(rng) > 0 else ""
+            end_ts = rng[1] if len(rng) > 1 else ""
+            vid = srec.get("youtube_video_id")
+            out_p = srec.get("output_path")
+            excluded_ids = set(srec.get("excluded_file_ids", []))
+
+            # Constituent files details
+            files = []
+            fids = srec.get("file_ids", [])
+            for fid in fids:
+                frec = self.db.files.get(fid)
+                if frec:
+                    files.append({
+                        "file_id": fid,
+                        "path": frec.get("path", ""),
+                        "name": frec.get("name") or os.path.basename(frec.get("path", "")),
+                        "type": frec.get("type", "image"),
+                        "duration_seconds": frec.get("duration_seconds", 3.0),
+                        "resolution": frec.get("resolution", ""),
+                        "size_bytes": frec.get("size_bytes", 0),
+                        "captured_at_utc": frec.get("captured_at_utc", ""),
+                        "is_excluded": (fid in excluded_ids),
+                    })
+
+            # Check for candidate files falling into this segment's [start_ts, end_ts]
+            candidates = []
+            if start_ts and end_ts:
+                s_bound = str(start_ts)[:19]
+                e_bound = str(end_ts)[:19]
+                for cap, fid, frec in unassigned_files:
+                    c_ts = cap[:19]
+                    if s_bound <= c_ts <= e_bound:
+                        candidates.append({
+                            "file_id": fid,
+                            "path": frec.get("path", ""),
+                            "name": frec.get("name") or os.path.basename(frec.get("path", "")),
+                            "type": frec.get("type", "image"),
+                            "duration_seconds": frec.get("duration_seconds", 3.0),
+                            "resolution": frec.get("resolution", ""),
+                            "size_bytes": frec.get("size_bytes", 0),
+                            "captured_at_utc": frec.get("captured_at_utc", ""),
+                        })
+
+            res.append({
+                "segment_id": sid,
+                "title": title,
+                "status": status,
+                "duration_seconds": dur,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "youtube_video_id": vid,
+                "output_path": out_p,
+                "has_local_file": bool(out_p and os.path.isfile(out_p)),
+                "total_files": len(fids),
+                "active_files_count": len([f for f in fids if f not in excluded_ids]),
+                "files": files,
+                "candidate_files": candidates,
+            })
+
+        # Sort segments chronologically
+        res.sort(key=lambda s: (s["start_ts"] or "", s["title"]))
+        return res
+
+    def toggle_segment_file(self, segment_id: str, file_id: str, is_excluded: bool) -> tuple[bool, str]:
+        """Toggle inclusion of a specific file in a segment."""
+        if not self.db:
+            return False, "数据库未初始化"
+        srec = self.db.segments.get(segment_id)
+        if not srec:
+            return False, f"未找到分段: {segment_id}"
+
+        excluded = list(srec.get("excluded_file_ids", []))
+        if is_excluded:
+            if file_id not in excluded:
+                excluded.append(file_id)
+        else:
+            if file_id in excluded:
+                excluded.remove(file_id)
+
+        srec["excluded_file_ids"] = excluded
+        # If output was already transcoded, mark as pending rebuild
+        if srec.get("output_path") and not srec.get("youtube_video_id"):
+            srec["status"] = "pending"
+        self.db.upsert_segment(segment_id, srec)
+        self.db.save()
+        return True, "文件构建状态已更新"
+
+    def include_candidate_file(self, segment_id: str, file_id: str) -> tuple[bool, str]:
+        """Include a candidate unassigned file into an existing segment."""
+        if not self.db:
+            return False, "数据库未初始化"
+        srec = self.db.segments.get(segment_id)
+        if not srec:
+            return False, f"未找到分段: {segment_id}"
+
+        fids = list(srec.get("file_ids", []))
+        if file_id not in fids:
+            fids.append(file_id)
+            srec["file_ids"] = fids
+            excluded = list(srec.get("excluded_file_ids", []))
+            if file_id in excluded:
+                excluded.remove(file_id)
+                srec["excluded_file_ids"] = excluded
+            srec["status"] = "pending"
+            self.db.upsert_segment(segment_id, srec)
+            self.db.save()
+            return True, f"已将文件纳入分段 {srec.get('title', segment_id[:12])}"
+        return True, "文件已在分段中"
+
+    def force_replan(self) -> tuple[bool, str]:
+        """Force re-planning all segments from scratch."""
+        if not self.db:
+            return False, "数据库未初始化"
+        if not self.task_lock.acquire(blocking=False):
+            return False, f"已有任务正在运行中 ({self.current_task})"
+
+        self.current_task = "强制重新规划分片"
+
+        def _worker():
+            from . import cli, web
+
+            try:
+                web.set_web_status("scanning", "正在强制重新规划分段...")
+                self.args.force_plan = True
+                cli.run_pipeline(self.args, force_scan=False)
+                web.set_web_status("idle", "分段重新规划完成")
+            except Exception as exc:
+                _logger.error("force_replan failed: %s", exc, exc_info=True)
+                web.set_web_status("error", f"重新规划出错: {exc}")
+            finally:
+                self.current_task = None
+                self.task_lock.release()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True, "强制重新规划任务已启动"
+
 

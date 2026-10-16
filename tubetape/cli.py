@@ -266,6 +266,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="transcode videos locally without uploading to YouTube (default: False)",
     )
+    parser.add_argument(
+        "--force-plan",
+        action="store_true",
+        default=False,
+        help="force re-computing all segments from scratch on startup (default: False)",
+    )
     return parser
 
 
@@ -391,19 +397,36 @@ def _file_persister(db: Database):
     return persist
 
 
+def _get_matched_coordinator(args: argparse.Namespace):
+    from . import web
+
+    coordinator = getattr(args, "_coordinator", None)
+    if coordinator is not None:
+        return coordinator
+    web_coord = web.get_app_coordinator()
+    if (
+        web_coord
+        and getattr(web_coord, "_db_path", None)
+        and os.path.abspath(web_coord._db_path) == os.path.abspath(args.db)
+    ):
+        return web_coord
+    return None
+
+
 def run_pipeline(
     args: argparse.Namespace,
     reporter: Reporter | None = None,
     force_scan: bool = False,
 ) -> int:
     reporter = reporter or Reporter()
-    from . import web
 
-    coordinator = getattr(args, "_coordinator", None) or web.get_app_coordinator()
-    if coordinator and coordinator.db is not None:
+    coordinator = _get_matched_coordinator(args)
+    if coordinator and coordinator.db is not None and os.path.abspath(coordinator.db.path) == os.path.abspath(args.db):
         db = coordinator.db
     else:
         db = Database.load(args.db)
+        if coordinator:
+            coordinator.db = db
 
     try:
         return _run_pipeline_impl(args, reporter, force_scan, db)
@@ -455,7 +478,7 @@ def _run_pipeline_impl(
 
     # If this is a real run (not dry-run and not no-upload), ensure YouTube uploader credentials
     # early so any OAuth authorization prompts or web waits happen up-front.
-    coordinator = getattr(args, "_coordinator", None) or web.get_app_coordinator()
+    coordinator = _get_matched_coordinator(args)
     uploader = None
     if coordinator and coordinator.uploader is not None:
         uploader = coordinator.uploader
@@ -545,9 +568,10 @@ def _run_pipeline_impl(
         f"({len(result.new_file_ids)} new, {len(result.deleted_file_ids)} deleted, "
         f"{len(result.skipped)} skipped)"
     )
+    existing_segs = {} if getattr(args, "force_plan", False) else db.segments
     plan_result = plan(
         result.files,
-        db.segments,
+        existing_segs,
         args.segment_duration,
         params=_segment_params(args),
         flush=args.flush,
@@ -683,7 +707,12 @@ def _run_pipeline_impl(
     total_segments = len(segments_to_process)
     try:
         for index, segment in enumerate(segments_to_process, start=1):
-            segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id]
+            srec = db.segments.get(segment.segment_id)
+            excluded_ids = set(srec.get("excluded_file_ids", [])) if srec else set()
+            segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id and fid not in excluded_ids]
+            if not segment_files:
+                _log.info("segment %s has no active files (all excluded); skipping", segment.segment_id)
+                continue
             is_single_vid = len(segment_files) == 1 and segment_files[0].type == FILE_TYPE_VIDEO
             if is_single_vid:
                 ext = os.path.splitext(segment_files[0].abs_path)[1].lower() or ".mp4"

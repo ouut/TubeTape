@@ -851,6 +851,126 @@ def test_web_api_sync_youtube(tmp_path):
         server.stop()
 
 
+def test_web_multi_page_routes(tmp_path):
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        pages = [
+            ("/", "控制台"),
+            ("/view", "视界画廊"),
+            ("/segments", "分片管理"),
+            ("/logs", "运行日志"),
+            ("/settings", "系统配置"),
+        ]
+        for route, expected_text in pages:
+            with urllib.request.urlopen(f"{base_url}{route}") as res:
+                assert res.status == 200
+                html = res.read().decode("utf-8")
+                assert expected_text in html
+                assert "TubeTape" in html
+        # Common navbar links on standard pages
+        for route in ["/", "/segments", "/logs", "/settings"]:
+            with urllib.request.urlopen(f"{base_url}{route}") as res:
+                html = res.read().decode("utf-8")
+                assert 'href="/view"' in html
+                assert 'href="/segments"' in html
+                assert 'href="/logs"' in html
+                assert 'href="/settings"' in html
+    finally:
+        server.stop()
+
+
+def test_web_segment_toggle_and_include(tmp_path):
+    from unittest.mock import MagicMock
+    from tubetape.coordinator import AppCoordinator
+    from tubetape.db import Database
+
+    db_path = tmp_path / "tubetape.json"
+    db = Database(path=str(db_path))
+    db.upsert_file("f1", {
+        "path": "img1.png",
+        "file_type": "image",
+        "captured_at_utc": "2026-01-01 10:05:00",
+        "size": 500,
+        "segment_id": "seg_test",
+    })
+    db.upsert_file("f2", {
+        "path": "img2.png",
+        "file_type": "image",
+        "captured_at_utc": "2026-01-01 10:10:00",
+        "size": 500,
+        "segment_id": None,
+    })
+    db.upsert_segment("seg_test", {
+        "title": "Test Segment",
+        "file_ids": ["f1"],
+        "status": "planned",
+        "youtube_video_id": None,
+        "range": ["2026-01-01 10:00:00", "2026-01-01 11:00:00"],
+    })
+    db.save()
+
+    from tubetape import cli
+    test_args = cli.parse_args(["--input", str(tmp_path), "--db", str(db_path), "--no-upload", "--no-watch"])
+    coord = AppCoordinator(args=test_args, db=db)
+    coord.restart_pipeline = MagicMock(return_value=(True, "ok"))
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        web.set_app_coordinator(coord)
+        web.set_web_context(media_dir=str(tmp_path), db=db, db_path=str(db_path))
+
+        view_data = coord.get_segments_view_data()
+        assert len(view_data) == 1
+        assert view_data[0]["segment_id"] == "seg_test"
+        assert len(view_data[0]["candidate_files"]) == 1
+        assert view_data[0]["candidate_files"][0]["file_id"] == "f2"
+
+        # Toggle f1 excluded
+        req_data = json.dumps({"segment_id": "seg_test", "file_id": "f1", "excluded": True}).encode("utf-8")
+        req = urllib.request.Request(f"{base_url}/api/segment/toggle_file", data=req_data, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert "f1" in db.segments["seg_test"]["excluded_file_ids"]
+
+        # Include candidate f2
+        req_data = json.dumps({"segment_id": "seg_test", "file_id": "f2"}).encode("utf-8")
+        req = urllib.request.Request(f"{base_url}/api/segment/include_file", data=req_data, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert "f2" in db.segments["seg_test"]["file_ids"]
+
+        # Check config API and config apply
+        with urllib.request.urlopen(f"{base_url}/api/config") as res:
+            assert res.status == 200
+            cfg_data = json.loads(res.read().decode("utf-8"))
+            assert "config" in cfg_data
+
+        apply_data = json.dumps({"updates": {"crf": 22}}).encode("utf-8")
+        req = urllib.request.Request(f"{base_url}/api/config/apply", data=apply_data, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            applied = json.loads(res.read().decode("utf-8"))
+            assert applied["ok"] is True
+            assert coord.args.crf == 22
+            assert db.config.get("crf") == 22
+    finally:
+        server.stop()
+
+
+
 
 
 
