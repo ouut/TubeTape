@@ -686,37 +686,68 @@ def _run_pipeline_impl(
     db.save()
     _log.info("database saved after plan sync: %d segment(s)", len(db.segments))
 
-    # Real run: transcode each new/rebuild segment, then upload.
+    # Real run: transcode each new/rebuild/pending segment, then upload.
 
-    # Identify any sealed segments in the database that have not yet been uploaded
-    # to YouTube (e.g. transcoded previously under --no-upload, or pending retry).
-    # If upload is enabled (uploader is present), queue them for uploading!
-    segments_to_process = list(plan_result.segments)
-    if uploader is not None:
-        unuploaded_segs = []
-        for sid, srec in db.segments.items():
-            if srec.get("status") == SEGMENT_STATUS_SEALED and not srec.get("youtube_video_id"):
-                file_ids = srec.get("file_ids", [])
-                rng = srec.get("range") or ["", ""]
-                unuploaded_segs.append(
-                    Segment(
-                        file_ids=file_ids,
-                        start_ts=rng[0] if len(rng) > 0 else "",
-                        end_ts=rng[1] if len(rng) > 1 else "",
-                        duration_seconds=float(srec.get("duration_seconds", 0.0)),
-                        segment_id=sid,
-                        title=srec.get("title") or sid[:16],
-                    )
-                )
-        if unuploaded_segs:
-            unuploaded_segs.sort(key=lambda s: (s.start_ts, s.title))
-            _log.info(
-                "found %d previously sealed segment(s) not yet uploaded to YouTube; queuing for upload",
-                len(unuploaded_segs),
+    # Identify any pending, unsealed, or unuploaded segments in the database
+    # (e.g. planned previously, pending retry, or transcoded under --no-upload).
+    planned_sids = {seg.segment_id for seg in plan_result.segments}
+    db_unprocessed_segs = []
+    is_no_upload = getattr(args, "no_upload", False) or (uploader is None)
+
+    for sid, srec in db.segments.items():
+        if sid in planned_sids:
+            continue
+        # If already uploaded to YouTube, skip
+        if srec.get("youtube_video_id"):
+            continue
+        # If --no-upload and already sealed locally, check if local file exists
+        if is_no_upload and srec.get("status") == SEGMENT_STATUS_SEALED:
+            local_f = None
+            if coordinator:
+                local_f = coordinator.find_local_segment_file(sid, srec.get("title", ""))
+            if not local_f:
+                for cand in [os.path.join(segments_dir, f"{srec.get('title', '')}.mp4"), os.path.join(segments_dir, f"{sid}.mp4")]:
+                    if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                        local_f = cand
+                        break
+            if local_f and os.path.isfile(local_f):
+                continue
+
+        file_ids = srec.get("file_ids", [])
+        rng = srec.get("range") or ["", ""]
+        db_unprocessed_segs.append(
+            Segment(
+                file_ids=file_ids,
+                start_ts=rng[0] if len(rng) > 0 else "",
+                end_ts=rng[1] if len(rng) > 1 else "",
+                duration_seconds=float(srec.get("duration_seconds", 0.0)),
+                segment_id=sid,
+                title=srec.get("title") or sid[:16],
             )
-            reporter.status(f"found {len(unuploaded_segs)} unuploaded segment(s) in database; queuing for upload")
-            segments_to_process = unuploaded_segs + segments_to_process
-            web.set_web_planned_segments(segments_to_process)
+        )
+
+    if db_unprocessed_segs:
+        db_unprocessed_segs.sort(key=lambda s: (s.start_ts or "", s.title))
+        pending_cnt = sum(1 for s in db_unprocessed_segs if db.segments.get(s.segment_id, {}).get("status") != SEGMENT_STATUS_SEALED)
+        sealed_cnt = len(db_unprocessed_segs) - pending_cnt
+        if pending_cnt > 0:
+            _log.info("found %d pending segment(s) in database; queuing for transcode", pending_cnt)
+            reporter.status(f"found {pending_cnt} pending segment(s) in database; queuing for transcode")
+        if sealed_cnt > 0:
+            _log.info("found %d sealed unuploaded segment(s) in database; queuing for upload", sealed_cnt)
+            reporter.status(f"found {sealed_cnt} unuploaded segment(s) in database; queuing for upload")
+
+    all_to_process = list(plan_result.segments) + db_unprocessed_segs
+    # Deduplicate preserving order
+    seen_sids = set()
+    segments_to_process = []
+    for s in all_to_process:
+        if s.segment_id not in seen_sids:
+            seen_sids.add(s.segment_id)
+            segments_to_process.append(s)
+
+    segments_to_process.sort(key=lambda s: (s.start_ts or "", s.title))
+    web.set_web_planned_segments(segments_to_process)
 
     # Reconcile against YouTube so a lost local database does not re-upload
     # everything: only list when there is actually something to upload.
@@ -755,7 +786,16 @@ def _run_pipeline_impl(
         for index, segment in enumerate(segments_to_process, start=1):
             srec = db.segments.get(segment.segment_id)
             excluded_ids = set(srec.get("excluded_file_ids", [])) if srec else set()
-            segment_files = [files_by_id[fid] for fid in segment.file_ids if fid in files_by_id and fid not in excluded_ids]
+            segment_files = []
+            for fid in segment.file_ids:
+                if fid in excluded_ids:
+                    continue
+                f_item = files_by_id.get(fid)
+                if not f_item and fid in db.files:
+                    f_item = ScannedFile.from_record(fid, db.files[fid], args.input)
+                    files_by_id[fid] = f_item
+                if f_item:
+                    segment_files.append(f_item)
             if not segment_files:
                 _log.info("segment %s has no active files (all excluded); skipping", segment.segment_id)
                 continue

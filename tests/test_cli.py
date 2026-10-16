@@ -690,7 +690,69 @@ class TestKeepSegments:
         assert len(loaded_db.files) == 1
         assert "img1.png" in [rec["path"] for rec in loaded_db.files.values()]
 
+    def test_run_pipeline_processes_pending_database_segments(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+        from conftest import make_png
+        from tubetape import cli
+        from tubetape.db import Database, SEGMENT_STATUS_SEALED
+
+        make_png(tmp_path / "img1.png", size=(10, 10))
+        db_path = tmp_path / "tubetape.json"
+        segments_dir = tmp_path / "segs"
+        segments_dir.mkdir()
+
+        # Pre-seed DB with a segment in 'pending' status (e.g. from web UI planning)
+        db = Database(path=str(db_path))
+        from tubetape.scanner import ScannedFile
+        sf = ScannedFile(
+            file_id="fid_12345",
+            rel_path="img1.png",
+            abs_path=str(tmp_path / "img1.png"),
+            name="img1.png",
+            type="image",
+            size_bytes=100,
+            duration_seconds=3.0,
+            captured_at_utc="2026-01-01 10:00:00",
+            captured_epoch=1767261600.0,
+            missing_meta=False,
+        )
+        fid = sf.file_id
+        db.upsert_file(fid, sf.to_record())
+        db.upsert_segment("seg_pending", {
+            "title": "Pending Segment",
+            "file_ids": [fid],
+            "status": "pending",
+            "youtube_video_id": None,
+            "range": ["2026-01-01 10:00:00", "2026-01-01 10:00:00"],
+            "duration_seconds": 3.0,
+        })
+        db.save()
+
+        transcoded_segments = []
+
+        def fake_transcode(files, out_path, config, progress=None):
+            transcoded_segments.append(out_path)
+            with open(out_path, "wb") as f:
+                f.write(b"fake-mp4")
+            return out_path, [["0:00", "Start"]]
+
+        monkeypatch.setattr(cli, "transcode_segment", fake_transcode)
+
+        rc = cli.main([
+            "--no-upload",
+            "--no-watch",
+            "--input", str(tmp_path),
+            "--db", str(db_path),
+            "--segments-dir", str(segments_dir),
+            "--segment-duration", "20s",
+        ])
+        assert rc == 0
+        assert len(transcoded_segments) == 1
+        db_after = Database.load(str(db_path))
+        assert db_after.segments["seg_pending"]["status"] == SEGMENT_STATUS_SEALED
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
 
