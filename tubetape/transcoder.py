@@ -618,6 +618,13 @@ def transcode_segment(
 
         _logger.info("rendering photo album with concat demuxer: %d photo(s) -> %s", len(files), out_path)
         try:
+            from . import web
+            if web.is_transcode_paused():
+                _logger.info("transcode is paused; waiting before photo album rendering...")
+                web.wait_if_transcode_paused()
+        except Exception:
+            pass
+        try:
             run_ffmpeg(
                 cmd,
                 total_duration=total_dur,
@@ -638,6 +645,14 @@ def transcode_segment(
 
     clips: list[str] = []
     for index, item in enumerate(files):
+        try:
+            from . import web
+            if web.is_transcode_paused():
+                _logger.info("transcode is paused; waiting before clip %d/%d (%s)...", index + 1, len(files), item.name)
+                web.wait_if_transcode_paused()
+        except Exception:
+            pass
+
         clip_name = f"clip_{index:04d}_{item.file_id[:12]}.mp4"
         clip_path = os.path.join(staging_dir, clip_name)
         tmp_clip_path = os.path.join(staging_dir, f"clip_{index:04d}_{item.file_id[:12]}.tmp.mp4")

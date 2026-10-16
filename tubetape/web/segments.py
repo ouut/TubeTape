@@ -257,7 +257,10 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
           // Local status badge
           let localBadge = '';
           if (seg.transcode_progress) {
-            localBadge = `<span class="badge badge-pending">⚡ 构建中 ${Math.round(seg.transcode_progress.percent || 0)}%</span>`;
+            const isPaused = !!seg.transcode_progress.is_paused;
+            localBadge = isPaused
+              ? `<span class="badge" style="background: rgba(245,158,11,0.15); color: #fbbf24;">⏸️ 构建已暂停 (${Math.round(seg.transcode_progress.percent || 0)}%)</span>`
+              : `<span class="badge badge-pending">⚡ 构建中 ${Math.round(seg.transcode_progress.percent || 0)}%</span>`;
           } else if (seg.has_local_file) {
             localBadge = `<span class="badge badge-info">📁 本地已有 (${seg.local_size_formatted || '已生成'})</span>`;
           } else {
@@ -267,7 +270,10 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
         // Cloud status badge
         let cloudBadge = '';
         if (seg.upload_progress) {
-          cloudBadge = `<span class="badge badge-pending">🚀 上传中 ${Math.round(seg.upload_progress.percent)}% · ${seg.upload_progress.speed}</span>`;
+          const isPaused = !!seg.upload_progress.is_paused;
+          cloudBadge = isPaused
+            ? `<span class="badge" style="background: rgba(245,158,11,0.15); color: #fbbf24;">⏸️ 上传已暂停 (${Math.round(seg.upload_progress.percent)}%)</span>`
+            : `<span class="badge badge-pending">🚀 上传中 ${Math.round(seg.upload_progress.percent)}% · ${seg.upload_progress.speed}</span>`;
         } else if (seg.is_upload_queued) {
           cloudBadge = `<span class="badge badge-info">🕒 排队上传中</span>`;
         } else if (seg.youtube_video_id) {
@@ -295,24 +301,34 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
 
                 ${seg.transcode_progress ? `
                   <div style="margin: 8px 0 0 26px; font-size: 0.75rem; color: #93c5fd;" onclick="event.stopPropagation()">
-                    <div style="display:flex; justify-content:space-between; margin-bottom: 3px;">
-                      <span>⚡ 正在构建: ${seg.transcode_progress.current_file || ''}</span>
-                      <span>${seg.transcode_progress.done_files || 0} / ${seg.transcode_progress.total_files || 0} (${Math.round(seg.transcode_progress.percent)}%)</span>
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 3px;">
+                      <span>${seg.transcode_progress.is_paused ? '⏸️ 构建已暂停: ' : '⚡ 正在构建: '}${seg.transcode_progress.current_file || ''}</span>
+                      <div style="display:flex; align-items:center; gap: 8px;">
+                        <span>${seg.transcode_progress.done_files || 0} / ${seg.transcode_progress.total_files || 0} (${Math.round(seg.transcode_progress.percent)}%)</span>
+                        <button class="btn btn-sm ${seg.transcode_progress.is_paused ? 'btn-emerald' : 'btn-amber'}" style="padding: 1px 6px; font-size: 0.7rem;" onclick="toggleTranscodePause(${!seg.transcode_progress.is_paused})">
+                          ${seg.transcode_progress.is_paused ? '▶️ 继续' : '⏸️ 暂停'}
+                        </button>
+                      </div>
                     </div>
                     <div style="height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
-                      <div style="height: 100%; width: ${seg.transcode_progress.percent}%; background: #3b82f6; transition: width 0.3s ease;"></div>
+                      <div style="height: 100%; width: ${seg.transcode_progress.percent}%; ${seg.transcode_progress.is_paused ? 'background: #94a3b8;' : 'background: #3b82f6;'} transition: width 0.3s ease;"></div>
                     </div>
                   </div>
                 ` : ''}
 
                 ${seg.upload_progress ? `
                   <div style="margin: 8px 0 0 26px; font-size: 0.75rem; color: #a7f3d0;" onclick="event.stopPropagation()">
-                    <div style="display:flex; justify-content:space-between; margin-bottom: 3px;">
-                      <span>🚀 正在上传至 YouTube · 速度: ${seg.upload_progress.speed || '计算中...'}</span>
-                      <span>${Math.round(seg.upload_progress.percent)}%</span>
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 3px;">
+                      <span>${seg.upload_progress.is_paused ? '⏸️ 上传已暂停 · ' : '🚀 正在上传至 YouTube · 速度: '}${seg.upload_progress.is_paused ? '' : (seg.upload_progress.speed || '计算中...')}</span>
+                      <div style="display:flex; align-items:center; gap: 8px;">
+                        <span>${Math.round(seg.upload_progress.percent)}%</span>
+                        <button class="btn btn-sm ${seg.upload_progress.is_paused ? 'btn-emerald' : 'btn-amber'}" style="padding: 1px 6px; font-size: 0.7rem;" onclick="toggleUploadPause(${!seg.upload_progress.is_paused})">
+                          ${seg.upload_progress.is_paused ? '▶️ 继续' : '⏸️ 暂停'}
+                        </button>
+                      </div>
                     </div>
                     <div style="height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
-                      <div style="height: 100%; width: ${seg.upload_progress.percent}%; background: #10b981; transition: width 0.3s ease;"></div>
+                      <div style="height: 100%; width: ${seg.upload_progress.percent}%; ${seg.upload_progress.is_paused ? 'background: #94a3b8;' : 'background: #10b981;'} transition: width 0.3s ease;"></div>
                     </div>
                   </div>
                 ` : ''}
@@ -619,6 +635,30 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
         }
       } catch (err) {
         showToast('❌ 请求失败: ' + err.message, true);
+      }
+    }
+
+    async function toggleTranscodePause(pause) {
+      try {
+        const url = pause ? '/api/transcode/pause' : '/api/transcode/resume';
+        const res = await fetch(url, { method: 'POST' });
+        const d = await res.json();
+        showToast(d.message || (pause ? '已暂停转码' : '已恢复转码'));
+        loadSegments();
+      } catch (err) {
+        showToast('❌ 操作失败: ' + err.message, true);
+      }
+    }
+
+    async function toggleUploadPause(pause) {
+      try {
+        const url = pause ? '/api/upload/pause' : '/api/upload/resume';
+        const res = await fetch(url, { method: 'POST' });
+        const d = await res.json();
+        showToast(d.message || (pause ? '已暂停上传' : '已恢复上传'));
+        loadSegments();
+      } catch (err) {
+        showToast('❌ 操作失败: ' + err.message, true);
       }
     }
 

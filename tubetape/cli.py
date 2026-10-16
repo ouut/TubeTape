@@ -784,6 +784,13 @@ def _run_pipeline_impl(
     total_segments = len(segments_to_process)
     try:
         for index, segment in enumerate(segments_to_process, start=1):
+            try:
+                from . import web
+                if web.is_transcode_paused():
+                    _log.info("transcode is paused; waiting before segment %s...", segment.title)
+                    web.wait_if_transcode_paused()
+            except Exception:
+                pass
             srec = db.segments.get(segment.segment_id)
             excluded_ids = set(srec.get("excluded_file_ids", [])) if srec else set()
             segment_files = []

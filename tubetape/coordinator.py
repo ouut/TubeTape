@@ -347,6 +347,26 @@ class AppCoordinator:
     def is_task_running(self) -> bool:
         return self.current_task is not None
 
+    def pause_transcode(self) -> tuple[bool, str]:
+        from . import web
+        web.pause_transcode()
+        return True, "已暂停转码"
+
+    def resume_transcode(self) -> tuple[bool, str]:
+        from . import web
+        web.resume_transcode()
+        return True, "已恢复转码"
+
+    def pause_upload(self) -> tuple[bool, str]:
+        from . import web
+        web.pause_upload()
+        return True, "已暂停上传"
+
+    def resume_upload(self) -> tuple[bool, str]:
+        from . import web
+        web.resume_upload()
+        return True, "已恢复上传"
+
     def segment_params(self) -> tuple:
         a = self.args
         return (
@@ -972,6 +992,7 @@ class AppCoordinator:
                     "speed": upload_state.get("speed", ""),
                     "uploaded_bytes": upload_state.get("uploaded_bytes", 0),
                     "total_bytes": upload_state.get("total_bytes", 0),
+                    "is_paused": bool(upload_state.get("is_paused", False)),
                 }
 
             transcode_progress = None
@@ -981,6 +1002,7 @@ class AppCoordinator:
                     "current_file": transcode_state.get("current_file", ""),
                     "total_files": transcode_state.get("total_files", 0),
                     "done_files": transcode_state.get("done_files", 0),
+                    "is_paused": bool(transcode_state.get("is_paused", False)),
                 }
 
             is_upload_queued = (sid in upload_q and sid != upload_state.get("segment_id"))

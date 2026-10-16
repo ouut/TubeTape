@@ -132,6 +132,14 @@ class Uploader:
             last_log = time.monotonic()
             while response is None:
                 try:
+                    from . import web
+                    if web.is_upload_paused():
+                        _logger.info("upload is paused; waiting for resume...")
+                        web.wait_if_upload_paused()
+                except Exception:
+                    pass
+
+                try:
                     status, response = request.next_chunk()
                     if status:
                         prog_val = status.progress()
@@ -292,6 +300,13 @@ class UploadWorker:
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
+            try:
+                from . import web
+                if web.is_upload_paused():
+                    web.wait_if_upload_paused(timeout=1.0)
+                    continue
+            except Exception:
+                pass
             try:
                 task = self._queue.get(timeout=0.5)
             except queue.Empty:

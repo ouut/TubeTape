@@ -340,50 +340,96 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         const tc = document.getElementById('task-content');
         const tb = document.getElementById('task-badge');
 
-        if (d.transcode && d.transcode.segment_id) {
-          const t = d.transcode;
-          const pct = t.total > 0 ? Math.round((t.done / t.total) * 100) : 0;
-          tb.textContent = `转码中: ${pct}%`;
-          tc.innerHTML = `
-            <div class="task-indicator">
-              <div class="task-spinner" style="border-top-color: var(--amber);"></div>
-              <div style="flex: 1;">
-                <div class="task-desc">正在转码: ${t.title || t.segment_id}</div>
-                <div class="task-meta">切片进度: ${t.done} / ${t.total} (${pct}%) · ${t.current_file || ''}</div>
-                <div class="prog-track" style="margin-top: 8px;">
-                  <div class="prog-bar" style="width: ${pct}%; background: linear-gradient(90deg, #f59e0b, #fbbf24);"></div>
-                </div>
-              </div>
-            </div>
-          `;
-        } else if (d.upload && d.upload.segment_id) {
-          const u = d.upload;
-          const pct = Math.round(u.percent || 0);
-          tb.textContent = `上传中: ${pct}%`;
-          tc.innerHTML = `
-            <div class="task-indicator">
-              <div class="task-spinner" style="border-top-color: var(--purple);"></div>
-              <div style="flex: 1;">
-                <div class="task-desc">正在上传: ${u.title || u.segment_id}</div>
-                <div class="task-meta">上传进度: ${pct}% · 速度: ${u.speed || '计算中...'}</div>
-                <div class="prog-track" style="margin-top: 8px;">
-                  <div class="prog-bar purple" style="width: ${pct}%;"></div>
-                </div>
-              </div>
-            </div>
-          `;
-        } else if (d.scanner && d.scanner.is_scanning) {
+        const taskCards = [];
+        const badges = [];
+
+        if (d.scanner && d.scanner.is_scanning) {
           const sc = d.scanner;
-          tb.textContent = '扫描中';
-          tc.innerHTML = `
-            <div class="task-indicator">
+          badges.push('扫描中');
+          taskCards.push(`
+            <div class="task-indicator" style="margin-bottom: 12px;">
               <div class="task-spinner"></div>
               <div style="flex: 1;">
                 <div class="task-desc">正在扫描媒体文件</div>
                 <div class="task-meta">已扫描 ${sc.count} 个文件 · ${sc.current || ''}</div>
               </div>
             </div>
-          `;
+          `);
+        }
+
+        if (d.transcode && d.transcode.segment_id) {
+          const t = d.transcode;
+          const isPaused = !!t.is_paused;
+          const pct = t.total > 0 ? Math.round((t.done / t.total) * 100) : 0;
+          badges.push(isPaused ? '转码已暂停' : `转码中: ${pct}%`);
+          const spinner = isPaused
+            ? '<span style="font-size: 1.3rem; margin-right: 4px;">⏸️</span>'
+            : '<div class="task-spinner" style="border-top-color: var(--amber);"></div>';
+          const btn = isPaused
+            ? `<button class="btn btn-sm btn-emerald" onclick="toggleTranscodePause(false)">▶️ 继续转码</button>`
+            : `<button class="btn btn-sm btn-amber" onclick="toggleTranscodePause(true)">⏸️ 暂停转码</button>`;
+          const barStyle = isPaused ? 'background: #94a3b8;' : 'background: linear-gradient(90deg, #f59e0b, #fbbf24);';
+
+          taskCards.push(`
+            <div class="task-indicator" style="margin-bottom: 12px; align-items: flex-start;">
+              ${spinner}
+              <div style="flex: 1; min-width: 0;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                  <div class="task-desc" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${t.title || t.segment_id}">
+                    ${isPaused ? '⏸️ 转码已暂停' : '⚡ 正在转码'}: ${t.title || t.segment_id}
+                  </div>
+                  <div style="margin-left: 10px; flex-shrink: 0;">
+                    ${btn}
+                  </div>
+                </div>
+                <div class="task-meta">切片进度: ${t.done} / ${t.total} (${pct}%) · ${t.current_file || ''}</div>
+                <div class="prog-track" style="margin-top: 8px;">
+                  <div class="prog-bar" style="width: ${pct}%; ${barStyle}"></div>
+                </div>
+              </div>
+            </div>
+          `);
+        }
+
+        if (d.upload && d.upload.segment_id) {
+          const u = d.upload;
+          const isPaused = !!u.is_paused;
+          const pct = Math.round(u.percent || 0);
+          badges.push(isPaused ? '上传已暂停' : `上传中: ${pct}%`);
+          const spinner = isPaused
+            ? '<span style="font-size: 1.3rem; margin-right: 4px;">⏸️</span>'
+            : '<div class="task-spinner" style="border-top-color: var(--purple);"></div>';
+          const btn = isPaused
+            ? `<button class="btn btn-sm btn-emerald" onclick="toggleUploadPause(false)">▶️ 继续上传</button>`
+            : `<button class="btn btn-sm btn-amber" onclick="toggleUploadPause(true)">⏸️ 暂停上传</button>`;
+          const speedText = isPaused ? '已暂停' : (u.speed || '计算中...');
+          const barClass = isPaused ? '' : 'purple';
+          const barStyle = isPaused ? 'background: #94a3b8;' : '';
+
+          taskCards.push(`
+            <div class="task-indicator" style="margin-bottom: 12px; align-items: flex-start;">
+              ${spinner}
+              <div style="flex: 1; min-width: 0;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                  <div class="task-desc" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${u.title || u.segment_id}">
+                    ${isPaused ? '⏸️ 上传已暂停' : '🚀 正在上传'}: ${u.title || u.segment_id}
+                  </div>
+                  <div style="margin-left: 10px; flex-shrink: 0;">
+                    ${btn}
+                  </div>
+                </div>
+                <div class="task-meta">上传进度: ${pct}% · 速度: ${speedText}</div>
+                <div class="prog-track" style="margin-top: 8px;">
+                  <div class="prog-bar ${barClass}" style="width: ${pct}%; ${barStyle}"></div>
+                </div>
+              </div>
+            </div>
+          `);
+        }
+
+        if (taskCards.length > 0) {
+          tb.textContent = badges.join(' · ');
+          tc.innerHTML = taskCards.join('');
         } else {
           tb.textContent = '空闲';
           tc.innerHTML = `
@@ -441,6 +487,30 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         }
       } catch (err) {
         showToast('❌ 请求失败: ' + err.message, true);
+      }
+    }
+
+    async function toggleTranscodePause(pause) {
+      try {
+        const url = pause ? '/api/transcode/pause' : '/api/transcode/resume';
+        const res = await fetch(url, { method: 'POST' });
+        const d = await res.json();
+        showToast(d.message || (pause ? '已暂停转码' : '已恢复转码'));
+        pollDashboard();
+      } catch (err) {
+        showToast('❌ 操作失败: ' + err.message, true);
+      }
+    }
+
+    async function toggleUploadPause(pause) {
+      try {
+        const url = pause ? '/api/upload/pause' : '/api/upload/resume';
+        const res = await fetch(url, { method: 'POST' });
+        const d = await res.json();
+        showToast(d.message || (pause ? '已暂停上传' : '已恢复上传'));
+        pollDashboard();
+      } catch (err) {
+        showToast('❌ 操作失败: ' + err.message, true);
       }
     }
 

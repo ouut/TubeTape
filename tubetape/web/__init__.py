@@ -67,6 +67,7 @@ _server_state = {
         "file_progress": None,
         "fps": None,
         "speed": None,
+        "is_paused": False,
     },
     "upload": {
         "segment_id": None,
@@ -75,12 +76,55 @@ _server_state = {
         "uploaded_bytes": 0,
         "total_bytes": 0,
         "speed": None,
+        "is_paused": False,
     },
     "upload_queue": [],
     "_file_cache": None,
     "_file_cache_db_len": 0,
     "_date_groups_cache": None,
 }
+
+_transcode_pause_event = threading.Event()
+_transcode_pause_event.set()  # set means actively running
+
+_upload_pause_event = threading.Event()
+_upload_pause_event.set()  # set means actively running
+
+
+def is_transcode_paused() -> bool:
+    return not _transcode_pause_event.is_set()
+
+
+def pause_transcode() -> None:
+    _transcode_pause_event.clear()
+    _server_state["transcode"]["is_paused"] = True
+
+
+def resume_transcode() -> None:
+    _transcode_pause_event.set()
+    _server_state["transcode"]["is_paused"] = False
+
+
+def wait_if_transcode_paused(timeout: float | None = None) -> bool:
+    return _transcode_pause_event.wait(timeout=timeout)
+
+
+def is_upload_paused() -> bool:
+    return not _upload_pause_event.is_set()
+
+
+def pause_upload() -> None:
+    _upload_pause_event.clear()
+    _server_state["upload"]["is_paused"] = True
+
+
+def resume_upload() -> None:
+    _upload_pause_event.set()
+    _server_state["upload"]["is_paused"] = False
+
+
+def wait_if_upload_paused(timeout: float | None = None) -> bool:
+    return _upload_pause_event.wait(timeout=timeout)
 
 
 def set_app_coordinator(coordinator) -> None:
@@ -169,6 +213,7 @@ def update_web_transcode(
         "file_progress": file_progress,
         "fps": fps,
         "speed": speed,
+        "is_paused": is_transcode_paused(),
     }
 
 
@@ -184,6 +229,7 @@ def finish_web_segment(segment_id: str, youtube_video_id: str | None = None) -> 
             "file_progress": None,
             "fps": None,
             "speed": None,
+            "is_paused": is_transcode_paused(),
         }
     if _server_state["upload"].get("segment_id") == segment_id:
         clear_web_upload()
@@ -207,6 +253,7 @@ def update_web_upload(
         "uploaded_bytes": int(uploaded_bytes),
         "total_bytes": int(total_bytes),
         "speed": speed,
+        "is_paused": is_upload_paused(),
     }
 
 
@@ -218,6 +265,7 @@ def clear_web_upload() -> None:
         "uploaded_bytes": 0,
         "total_bytes": 0,
         "speed": None,
+        "is_paused": is_upload_paused(),
     }
 
 
@@ -638,6 +686,26 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 return
             ok, msg, stats = coord.sync_youtube()
             self._send_json(200 if ok else 400, {"ok": ok, "message": msg, "stats": stats})
+            return
+
+        if path == "/api/transcode/pause":
+            pause_transcode()
+            self._send_json(200, {"ok": True, "message": "已暂停转码", "is_paused": True})
+            return
+
+        if path == "/api/transcode/resume":
+            resume_transcode()
+            self._send_json(200, {"ok": True, "message": "已恢复转码", "is_paused": False})
+            return
+
+        if path == "/api/upload/pause":
+            pause_upload()
+            self._send_json(200, {"ok": True, "message": "已暂停上传", "is_paused": True})
+            return
+
+        if path == "/api/upload/resume":
+            resume_upload()
+            self._send_json(200, {"ok": True, "message": "已恢复上传", "is_paused": False})
             return
 
         if path == "/api/segment/rebuild":

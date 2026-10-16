@@ -1255,6 +1255,105 @@ def test_web_segments_lazy_loading(tmp_path):
         server.stop()
 
 
+def test_web_pause_resume_endpoints(tmp_path):
+    server = web.WebServer(host="127.0.0.1", port=0)
+    server.start()
+    time.sleep(0.1)
+
+    port = server._server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        # Reset pause state before starting
+        web.resume_transcode()
+        web.resume_upload()
+        assert not web.is_transcode_paused()
+        assert not web.is_upload_paused()
+
+        # 1. Pause transcode
+        req = urllib.request.Request(f"{base_url}/api/transcode/pause", data=b"{}", method="POST")
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert data["is_paused"] is True
+            assert web.is_transcode_paused() is True
+
+        # Check dashboard endpoint reflects pause
+        with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
+            st = json.loads(res.read().decode("utf-8"))
+            assert st["transcode"]["is_paused"] is True
+
+        # 2. Resume transcode
+        req = urllib.request.Request(f"{base_url}/api/transcode/resume", data=b"{}", method="POST")
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert data["is_paused"] is False
+            assert web.is_transcode_paused() is False
+
+        with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
+            st = json.loads(res.read().decode("utf-8"))
+            assert st["transcode"]["is_paused"] is False
+
+        # 3. Pause upload
+        req = urllib.request.Request(f"{base_url}/api/upload/pause", data=b"{}", method="POST")
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert data["is_paused"] is True
+            assert web.is_upload_paused() is True
+
+        # Check dashboard endpoint reflects pause
+        with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
+            st = json.loads(res.read().decode("utf-8"))
+            assert st["upload"]["is_paused"] is True
+
+        # 4. Resume upload
+        req = urllib.request.Request(f"{base_url}/api/upload/resume", data=b"{}", method="POST")
+        with urllib.request.urlopen(req) as res:
+            assert res.status == 200
+            data = json.loads(res.read().decode("utf-8"))
+            assert data["ok"] is True
+            assert data["is_paused"] is False
+            assert web.is_upload_paused() is False
+
+        with urllib.request.urlopen(f"{base_url}/api/dashboard") as res:
+            st = json.loads(res.read().decode("utf-8"))
+            assert st["upload"]["is_paused"] is False
+
+        # 5. Coordinator delegation checks
+        from types import SimpleNamespace
+        from tubetape.coordinator import AppCoordinator
+        from tubetape.db import Database
+
+        db = Database(path=str(tmp_path / "test.json"))
+        args = SimpleNamespace(
+            input=str(tmp_path),
+            db=str(tmp_path / "test.json"),
+            segments_dir=str(tmp_path / "segments"),
+            segment_duration=1200,
+        )
+        coord = AppCoordinator(args, db=db)
+
+        coord.pause_transcode()
+        assert web.is_transcode_paused() is True
+        coord.resume_transcode()
+        assert web.is_transcode_paused() is False
+
+        coord.pause_upload()
+        assert web.is_upload_paused() is True
+        coord.resume_upload()
+        assert web.is_upload_paused() is False
+
+    finally:
+        web.resume_transcode()
+        web.resume_upload()
+        server.stop()
+
+
 
 
 
