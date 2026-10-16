@@ -1114,9 +1114,15 @@ class _RequestHandler(BaseHTTPRequestHandler):
             elif ext == ".webp": mime = "image/webp"
             elif ext in (".mp4", ".m4v"): mime = "video/mp4"
             elif ext in (".mov", ".qt"): mime = "video/quicktime"
+            elif ext == ".3gp": mime = "video/3gpp"
+            elif ext == ".webm": mime = "video/webm"
+            elif ext == ".mkv": mime = "video/x-matroska"
+            elif ext == ".avi": mime = "video/x-msvideo"
+            elif ext in (".mts", ".m2ts"): mime = "video/mp2t"
 
+            video_exts = (".mp4", ".m4v", ".mov", ".qt", ".3gp", ".webm", ".mkv", ".avi", ".mts", ".m2ts")
             range_header = self.headers.get("Range")
-            if range_header and ext in (".mp4", ".m4v", ".mov", ".qt"):
+            if range_header and ext in video_exts:
                 try:
                     file_size = os.path.getsize(full_p)
                     match = re.match(r"bytes=(\d+)-(\d*)", range_header)
@@ -1153,8 +1159,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
                                 self.wfile.write(chunk)
                                 remaining -= len(chunk)
                         return
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    return
+                except OSError as e:
+                    if getattr(e, "winerror", None) in (10053, 10054) or getattr(e, "errno", None) in (32, 104):
+                        return
+                    _logger.debug("stream range error: %s", e)
+                    return
                 except Exception as e:
-                    _logger.warning("stream range error: %s", e)
+                    _logger.debug("stream range error: %s", e)
+                    return
 
             try:
                 size = os.path.getsize(full_p)
@@ -1167,8 +1181,14 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 with open(full_p, "rb") as f:
                     while chunk := f.read(65536):
                         self.wfile.write(chunk)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                return
+            except OSError as e:
+                if getattr(e, "winerror", None) in (10053, 10054) or getattr(e, "errno", None) in (32, 104):
+                    return
+                _logger.debug("stream file %s error: %s", full_p, e)
             except Exception as e:
-                _logger.warning("stream file %s error: %s", full_p, e)
+                _logger.debug("stream file %s error: %s", full_p, e)
             return
 
         # 6. Legacy getbytime API (preserved for backward compatibility)

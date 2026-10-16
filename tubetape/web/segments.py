@@ -326,7 +326,10 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
                     ${candidates.map(cand => `
                       <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(0,0,0,0.25); padding: 6px 12px; border-radius: 6px; font-size: 0.8rem;">
                         <div style="display: flex; align-items: center; gap: 10px;">
-                          <img class="file-thumb" src="/api/media/stream?id=${encodeURIComponent(cand.file_id)}">
+                          ${cand.type === 'video'
+                            ? '<div class="file-thumb" style="display:flex;align-items:center;justify-content:center;background:#1e293b;border-radius:4px;font-size:1.1rem;cursor:default;" title="视频文件">🎥</div>'
+                            : `<img class="file-thumb" src="/api/media/view?id=${encodeURIComponent(cand.file_id)}" loading="lazy">`
+                          }
                           <div>
                             <span style="font-weight: 600; color: #fff;">${cand.name}</span>
                             <span style="color: var(--text-muted); margin-left: 8px;">${cand.captured_at_utc ? String(cand.captured_at_utc).slice(0, 19).replace('T', ' ') : '--'}</span>
@@ -362,7 +365,10 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
                           </label>
                         </td>
                         <td>
-                          <img class="file-thumb" src="/api/media/stream?id=${encodeURIComponent(f.file_id)}">
+                          ${f.type === 'video'
+                            ? '<div class="file-thumb" style="display:flex;align-items:center;justify-content:center;background:#1e293b;border-radius:4px;font-size:1.1rem;cursor:default;" title="视频文件">🎥</div>'
+                            : `<img class="file-thumb" src="/api/media/view?id=${encodeURIComponent(f.file_id)}" loading="lazy">`
+                          }
                         </td>
                         <td>
                           <div style="font-weight: 500;">${f.name}</div>
