@@ -198,20 +198,6 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
               </div>
             </div>
           </div>
-
-          <!-- Quick Actions -->
-          <div style="margin-top: 18px; border-top: 1px solid rgba(255, 255, 255, 0.05); padding-top: 14px;">
-            <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 8px; font-weight: 600;">快捷操作:</div>
-            <div class="quick-actions">
-              <button class="btn btn-emerald" onclick="triggerFullScan()">🔄 全量文件扫描</button>
-              <button class="btn btn-sync" onclick="triggerSyncYoutube()">☁️ 与 YouTube 同步</button>
-              <button class="btn" onclick="triggerCleanOrphans()" style="border-color: rgba(244, 63, 94, 0.4); color: #fda4af;">🗑️ 清理云端孤儿视频</button>
-              <a href="/segments" class="btn">🎞️ 管理分片与排除</a>
-              <a href="/view" class="btn btn-primary">🖼️ 打开沉浸画廊</a>
-              <a href="/settings" class="btn">⚙️ 调整配置参数</a>
-              <a href="/logs" class="btn">📜 查看详细日志</a>
-            </div>
-          </div>
         </div>
 
         <!-- Upload Queue Card -->
@@ -453,19 +439,27 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         const qc = document.getElementById('upload-queue-container');
         const qBadge = document.getElementById('queue-count-badge');
         const q = d.upload_queue || [];
+        const segMap = new Map((d.segments || []).map(s => [s.segment_id, s]));
         qBadge.textContent = `${q.length} 个排队中`;
         if (q.length === 0) {
           qc.innerHTML = '<div style="color: var(--text-muted); font-size: 0.85rem; text-align: center; padding: 20px 0;">暂无排队中的待上传分片</div>';
         } else {
-          qc.innerHTML = q.map(item => `
+          qc.innerHTML = q.map(item => {
+            const sid = (typeof item === 'object' && item !== null) ? (item.segment_id || '') : String(item);
+            const seg = segMap.get(sid) || {};
+            const title = (typeof item === 'object' && item && item.title) ? item.title : (seg.title || (sid.length > 16 ? sid.slice(0, 16) : sid) || '分片');
+            const durSec = (typeof item === 'object' && item && item.duration_seconds) ? item.duration_seconds : (seg.duration_seconds || 0);
+            const dur = durSec > 0 ? `${Math.round(durSec)}秒` : '';
+            return `
             <div class="queue-item">
               <div>
-                <span style="font-weight: 600; color: #fff;">${item.title || item.segment_id}</span>
-                <span style="font-size: 0.75rem; color: var(--text-muted); margin-left: 8px;">${Math.round(item.duration_seconds || 0)}秒</span>
+                <span style="font-weight: 600; color: #fff;">${title}</span>
+                ${dur ? `<span style="font-size: 0.75rem; color: var(--text-muted); margin-left: 8px;">${dur}</span>` : ''}
               </div>
               <span class="badge badge-pending">排队中</span>
             </div>
-          `).join('');
+          `;
+          }).join('');
         }
       } catch (e) {}
     }

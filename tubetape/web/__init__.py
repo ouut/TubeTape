@@ -205,11 +205,23 @@ def update_web_transcode(
     speed: str | None = None,
     encoder: str | None = None,
 ) -> None:
+    if total > 0:
+        base_done = max(0, done - 1) if (file_progress is not None and done > 0) else done
+        cur_file_pct = (file_progress / 100.0) if file_progress is not None else 0.0
+        pct = min(99.9, max(0.0, ((base_done + cur_file_pct) / total) * 100.0))
+        if done >= total and file_progress is None:
+            pct = 100.0
+    else:
+        pct = 0.0
+
     _server_state["transcode"] = {
         "segment_id": segment_id,
         "title": title or segment_id[:16],
         "done": done,
+        "done_files": done,
         "total": total,
+        "total_files": total,
+        "percent": round(pct, 1),
         "current_file": current_file,
         "resumed": resumed,
         "file_progress": file_progress,
@@ -226,7 +238,10 @@ def finish_web_segment(segment_id: str, youtube_video_id: str | None = None) -> 
             "segment_id": None,
             "title": None,
             "done": 0,
+            "done_files": 0,
             "total": 0,
+            "total_files": 0,
+            "percent": 0.0,
             "current_file": None,
             "resumed": False,
             "file_progress": None,
@@ -993,7 +1008,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 "scanner": _server_state["scanner"],
                 "transcode": _server_state["transcode"],
                 "upload": _server_state["upload"],
-                "upload_queue": _server_state["upload_queue"],
+                "upload_queue": _server_state.get("upload_queue", []),
                 "media_dir": _server_state["media_dir"] or (coord.args.input if coord else None),
                 "segments_dir": _server_state.get("segments_dir") or (coord.segments_dir if coord else None),
                 "db_path": _server_state["db_path"] or (coord.db.path if coord and coord.db else None),

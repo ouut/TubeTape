@@ -176,6 +176,7 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
       <div style="display: flex; gap: 10px;">
         <input type="text" id="seg-search" class="search-input" placeholder="搜索分片名称或状态..." oninput="filterSegments()">
+        <button class="btn" onclick="triggerCleanOrphans()" style="border-color: rgba(244, 63, 94, 0.4); color: #fda4af;">🗑️ 清理云端孤儿视频</button>
         <button class="btn btn-amber" onclick="triggerForceReplan()">🔄 强制重新规划分段</button>
       </div>
     </div>
@@ -258,9 +259,12 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
           let localBadge = '';
           if (seg.transcode_progress) {
             const isPaused = !!seg.transcode_progress.is_paused;
+            const doneCnt = seg.transcode_progress.done_files ?? seg.transcode_progress.done ?? 0;
+            const totCnt = seg.transcode_progress.total_files ?? seg.transcode_progress.total ?? 0;
+            const pct = Math.round(seg.transcode_progress.percent ?? (totCnt > 0 ? (doneCnt / totCnt) * 100 : 0));
             localBadge = isPaused
-              ? `<span class="badge" style="background: rgba(245,158,11,0.15); color: #fbbf24;">⏸️ 构建已暂停 (${Math.round(seg.transcode_progress.percent || 0)}%)</span>`
-              : `<span class="badge badge-pending">⚡ 构建中 ${Math.round(seg.transcode_progress.percent || 0)}%</span>`;
+              ? `<span class="badge" style="background: rgba(245,158,11,0.15); color: #fbbf24;">⏸️ 构建已暂停 (${pct}%)</span>`
+              : `<span class="badge badge-pending">⚡ 构建中 ${pct}%</span>`;
           } else if (seg.has_local_file) {
             localBadge = `<span class="badge badge-info">📁 本地已有 (${seg.local_size_formatted || '已生成'})</span>`;
           } else {
@@ -299,22 +303,30 @@ _SEGMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
                   拍摄区间: ${seg.start_ts ? seg.start_ts.slice(0, 10) : '--'} ~ ${seg.end_ts ? seg.end_ts.slice(0, 10) : '--'} · 时长: ${Math.round(seg.duration_seconds || 0)}秒 · 有效文件: ${activeCount} / ${totalCount}
                 </div>
 
-                ${seg.transcode_progress ? `
+                ${seg.transcode_progress ? (() => {
+                  const tp = seg.transcode_progress;
+                  const isPaused = !!tp.is_paused;
+                  const doneCnt = tp.done_files ?? tp.done ?? 0;
+                  const totCnt = tp.total_files ?? tp.total ?? 0;
+                  const pct = Math.round(tp.percent ?? (totCnt > 0 ? (doneCnt / totCnt) * 100 : 0));
+                  const spdInfo = tp.speed && tp.speed !== 'N/A' ? ` · 速度: ${tp.speed}` : '';
+                  const fpsInfo = tp.fps ? ` · ${tp.fps.toFixed(1)} fps` : '';
+                  return `
                   <div style="margin: 8px 0 0 26px; font-size: 0.75rem; color: #93c5fd;" onclick="event.stopPropagation()">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 3px;">
-                      <span>${seg.transcode_progress.is_paused ? '⏸️ 构建已暂停: ' : '⚡ 正在构建: '}${seg.transcode_progress.current_file || ''}${seg.transcode_progress.encoder ? ` (${seg.transcode_progress.encoder})` : ''}</span>
+                      <span>${isPaused ? '⏸️ 构建已暂停: ' : '⚡ 正在构建: '}${tp.current_file || ''}${tp.encoder ? ` (${tp.encoder})` : ''}${spdInfo}${fpsInfo}</span>
                       <div style="display:flex; align-items:center; gap: 8px;">
-                        <span>${seg.transcode_progress.done_files || 0} / ${seg.transcode_progress.total_files || 0} (${Math.round(seg.transcode_progress.percent)}%)</span>
-                        <button class="btn btn-sm ${seg.transcode_progress.is_paused ? 'btn-emerald' : 'btn-amber'}" style="padding: 1px 6px; font-size: 0.7rem;" onclick="toggleTranscodePause(${!seg.transcode_progress.is_paused})">
-                          ${seg.transcode_progress.is_paused ? '▶️ 继续' : '⏸️ 暂停'}
+                        <span>${doneCnt} / ${totCnt} (${pct}%)</span>
+                        <button class="btn btn-sm ${isPaused ? 'btn-emerald' : 'btn-amber'}" style="padding: 1px 6px; font-size: 0.7rem;" onclick="toggleTranscodePause(${!isPaused})">
+                          ${isPaused ? '▶️ 继续' : '⏸️ 暂停'}
                         </button>
                       </div>
                     </div>
                     <div style="height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
-                      <div style="height: 100%; width: ${seg.transcode_progress.percent}%; ${seg.transcode_progress.is_paused ? 'background: #94a3b8;' : 'background: #3b82f6;'} transition: width 0.3s ease;"></div>
+                      <div style="height: 100%; width: ${pct}%; ${isPaused ? 'background: #94a3b8;' : 'background: #3b82f6;'} transition: width 0.3s ease;"></div>
                     </div>
                   </div>
-                ` : ''}
+                `})() : ''}
 
                 ${seg.upload_progress ? `
                   <div style="margin: 8px 0 0 26px; font-size: 0.75rem; color: #a7f3d0;" onclick="event.stopPropagation()">

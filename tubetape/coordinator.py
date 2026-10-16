@@ -1210,11 +1210,19 @@ class AppCoordinator:
 
             transcode_progress = None
             if transcode_state.get("segment_id") == sid:
+                tot = transcode_state.get("total_files") or transcode_state.get("total") or 0
+                dn = transcode_state.get("done_files") or transcode_state.get("done") or 0
+                pct = transcode_state.get("percent")
+                if pct is None:
+                    pct = round((dn / tot) * 100.0, 1) if tot > 0 else 0.0
                 transcode_progress = {
-                    "percent": transcode_state.get("percent", 0.0),
+                    "percent": pct,
                     "current_file": transcode_state.get("current_file", ""),
-                    "total_files": transcode_state.get("total_files", 0),
-                    "done_files": transcode_state.get("done_files", 0),
+                    "total_files": tot,
+                    "done_files": dn,
+                    "file_progress": transcode_state.get("file_progress"),
+                    "fps": transcode_state.get("fps"),
+                    "speed": transcode_state.get("speed"),
                     "encoder": transcode_state.get("encoder"),
                     "is_paused": bool(transcode_state.get("is_paused", False)),
                 }
