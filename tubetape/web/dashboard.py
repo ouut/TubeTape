@@ -205,6 +205,7 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="quick-actions">
               <button class="btn btn-emerald" onclick="triggerFullScan()">🔄 全量文件扫描</button>
               <button class="btn btn-sync" onclick="triggerSyncYoutube()">☁️ 与 YouTube 同步</button>
+              <button class="btn" onclick="triggerCleanOrphans()" style="border-color: rgba(244, 63, 94, 0.4); color: #fda4af;">🗑️ 清理云端孤儿视频</button>
               <a href="/segments" class="btn">🎞️ 管理分片与排除</a>
               <a href="/view" class="btn btn-primary">🖼️ 打开沉浸画廊</a>
               <a href="/settings" class="btn">⚙️ 调整配置参数</a>

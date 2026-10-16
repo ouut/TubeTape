@@ -841,6 +841,57 @@ class TestKeepSegments:
         with _ffmpeg_proc_lock:
             assert dummy_proc not in _active_ffmpeg_procs
 
+    def test_clean_orphaned_youtube_videos(self, tmp_path, monkeypatch):
+        from tubetape import cli
+        from tubetape.coordinator import AppCoordinator
+        from tubetape.db import Database
+        from tubetape.reconcile import RemoteIndex
+
+        db_path = tmp_path / "tubetape.json"
+        db = Database(path=str(db_path))
+        # Valid segment in DB
+        db.upsert_segment("seg_valid_11111111", {
+            "title": "Valid Seg",
+            "youtube_video_id": "vid_valid_1",
+            "status": "sealed",
+            "file_ids": [],
+            "range": ["", ""],
+            "duration_seconds": 10.0,
+        })
+        db.save()
+
+        args = cli.parse_args([
+            "--input", str(tmp_path),
+            "--db", str(db_path),
+        ])
+
+        deleted_videos = []
+
+        class FakeUploader:
+            service = object()
+
+            def delete_video(self, video_id):
+                deleted_videos.append(video_id)
+
+        uploader = FakeUploader()
+        coord = AppCoordinator(args, db=db, uploader=uploader)
+
+        # Remote has 1 valid video and 2 orphaned videos
+        remote_data = {
+            "seg_valid_11111111": "vid_valid_1",
+            "seg_orphan_22222222": "vid_orphan_2",
+            "seg_orphan_33333333": "vid_orphan_3",
+        }
+        monkeypatch.setattr(
+            "tubetape.coordinator.fetch_remote_catalog",
+            lambda svc: (remote_data, {"vid_valid_1", "vid_orphan_2", "vid_orphan_3"}, True),
+        )
+
+        ok, msg, deleted = coord.clean_orphaned_youtube_videos()
+        assert ok is True
+        assert len(deleted) == 2
+        assert deleted_videos == ["vid_orphan_2", "vid_orphan_3"]
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

@@ -925,6 +925,94 @@ class AppCoordinator:
             self.current_task = None
             self.task_lock.release()
 
+    def clean_orphaned_youtube_videos(self) -> tuple[bool, str, list[dict]]:
+        """Identify and delete videos from YouTube that belong to obsolete/orphaned segments.
+
+        Returns (success, message, deleted_list).
+        """
+        if not self.db:
+            return False, "数据库未初始化", []
+        uploader = self.ensure_uploader()
+        if not uploader:
+            return False, "无法获取 YouTube 凭据，请先在控制台完成授权", []
+
+        if not self.task_lock.acquire(blocking=False):
+            return False, f"已有任务正在运行中 ({self.current_task})", []
+
+        self.current_task = "清理云端孤儿视频"
+        try:
+            from . import web
+
+            web.set_web_status("syncing", "正在扫描 YouTube 孤儿视频...")
+            remote_index, remote_video_ids, success = fetch_remote_catalog(uploader.service)
+            if not success and not remote_index:
+                web.set_web_status("error", "无法连接 YouTube 获取视频列表")
+                return False, "无法从 YouTube 获取视频列表，请检查网络或授权", []
+
+            # 1. Valid segment IDs and prefixes
+            valid_sids = set(self.db.segments.keys())
+            valid_sids16 = {sid[:16] for sid in valid_sids if len(sid) >= 16}
+
+            planned = web._server_state.get("planned_segments", [])
+            for seg in planned:
+                psid = getattr(seg, "segment_id", None) or (seg.get("segment_id") if isinstance(seg, dict) else "")
+                if psid:
+                    valid_sids.add(psid)
+                    if len(psid) >= 16:
+                        valid_sids16.add(psid[:16])
+
+            # 2. Currently active valid YouTube video IDs
+            active_vids = {s.get("youtube_video_id") for s in self.db.segments.values() if s.get("youtube_video_id")}
+
+            # 3. Detect orphaned videos
+            orphans: list[dict] = []
+            for sid_or_prefix, vid in remote_index.items():
+                if vid in active_vids:
+                    continue
+                if sid_or_prefix not in valid_sids and sid_or_prefix not in valid_sids16:
+                    orphans.append({"video_id": vid, "segment_id": sid_or_prefix})
+
+            # Deduplicate by video_id
+            seen_vids = set()
+            unique_orphans = []
+            for o in orphans:
+                if o["video_id"] not in seen_vids:
+                    seen_vids.add(o["video_id"])
+                    unique_orphans.append(o)
+
+            if not unique_orphans:
+                msg = "未检测到任何云端孤儿视频，YouTube 视频与当前规划分片完全一致"
+                _logger.info(msg)
+                web.set_web_status("idle", msg)
+                return True, msg, []
+
+            _logger.info("found %d orphaned videos on YouTube: %s", len(unique_orphans), unique_orphans)
+            deleted = []
+            for item in unique_orphans:
+                vid = item["video_id"]
+                try:
+                    _logger.info("deleting orphaned YouTube video %s (associated segment %s)", vid, item["segment_id"])
+                    uploader.delete_video(vid)
+                    deleted.append(item)
+                except Exception as exc:
+                    _logger.warning("failed to delete orphaned video %s: %s", vid, exc)
+
+            msg = f"已成功删除 {len(deleted)}/{len(unique_orphans)} 个云端孤儿视频"
+            _logger.info(msg)
+            web.set_web_status("idle", msg)
+            return True, msg, deleted
+        except Exception as exc:
+            _logger.error("cleaning orphaned YouTube videos failed: %s", exc, exc_info=True)
+            try:
+                from . import web
+                web.set_web_status("error", f"清理孤儿视频失败: {exc}")
+            except Exception:
+                pass
+            return False, f"清理孤儿视频失败: {exc}", []
+        finally:
+            self.current_task = None
+            self.task_lock.release()
+
     def get_media_stats(self) -> dict:
         """Compute summary statistics across all scanned media files and database."""
         if not self.db:

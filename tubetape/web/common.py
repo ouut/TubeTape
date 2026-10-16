@@ -386,6 +386,25 @@ def render_navbar(active_page: str = "dashboard") -> str:
       }
     }
 
+    async function triggerCleanOrphans() {
+      if (!confirm('确定要扫描并删除 YouTube 上属于旧规划/已失效的孤儿视频吗？此操作不可逆。')) return;
+      showToast('⏳ 正在扫描并清理云端孤儿视频...');
+      try {
+        const res = await fetch('/api/clean_orphans', { method: 'POST' });
+        const d = await res.json();
+        if (res.ok && d.ok) {
+          showToast('✅ ' + (d.message || '孤儿视频清理完成'));
+          if (typeof pollDashboard === 'function') pollDashboard();
+          if (typeof loadSegments === 'function') loadSegments();
+          if (typeof loadSummaryStats === 'function') loadSummaryStats();
+        } else {
+          showToast('❌ 清理失败: ' + (d.error || d.message || '未知错误'), true);
+        }
+      } catch (err) {
+        showToast('❌ 请求失败: ' + err.message, true);
+      }
+    }
+
     async function pollNavStatus() {
       try {
         const res = await fetch('/api/status');

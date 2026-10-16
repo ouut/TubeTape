@@ -692,6 +692,15 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(200 if ok else 400, {"ok": ok, "message": msg, "stats": stats})
             return
 
+        if path == "/api/clean_orphans":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            ok, msg, deleted = coord.clean_orphaned_youtube_videos()
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg, "deleted": deleted})
+            return
+
         if path == "/api/transcode/pause":
             pause_transcode()
             self._send_json(200, {"ok": True, "message": "已暂停转码", "is_paused": True})
@@ -899,6 +908,15 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 return
             ok, msg, stats = coord.sync_youtube()
             self._send_json(200 if ok else 400, {"ok": ok, "message": msg, "stats": stats})
+            return
+
+        if path == "/api/clean_orphans":
+            coord = get_app_coordinator()
+            if not coord:
+                self._send_json(400, {"ok": False, "error": "后台协调器未初始化"})
+                return
+            ok, msg, deleted = coord.clean_orphaned_youtube_videos()
+            self._send_json(200 if ok else 400, {"ok": ok, "message": msg, "deleted": deleted})
             return
 
         if path == "/api/status":

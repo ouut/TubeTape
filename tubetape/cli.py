@@ -272,6 +272,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="force re-computing all segments from scratch on startup (default: False)",
     )
+    parser.add_argument(
+        "--clean-orphans",
+        action="store_true",
+        default=False,
+        help="scan YouTube channel for orphaned videos from obsolete plans and delete them",
+    )
     return parser
 
 
@@ -1392,6 +1398,18 @@ def main(argv: list[str] | None = None) -> int:
     coordinator = AppCoordinator(args)
     setattr(args, "_coordinator", coordinator)
     coordinator.load_saved_config()
+
+    if getattr(args, "clean_orphans", False):
+        uploader = _build_uploader(args, coordinator.db)
+        if not uploader:
+            print("Error: cannot authenticate with YouTube to clean orphans", file=sys.stderr)
+            return _EXIT_ERROR
+        coordinator.uploader = uploader
+        ok, msg, deleted = coordinator.clean_orphaned_youtube_videos()
+        print(msg)
+        for item in deleted:
+            print(f"  Deleted: {item['video_id']} (segment: {item['segment_id']})")
+        return _EXIT_OK if ok else _EXIT_ERROR
 
     if getattr(args, "web_port", 0) > 0 and not args.dry_run:
         from .web import WebServer, set_app_coordinator, set_web_context
