@@ -36,12 +36,8 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      # 照片/视频目录：只读挂载进容器 /data，请将冒号前的路径修改为你的宿主机实际路径
+      # 方式一（推荐）：照片目录只读挂载到 /data，数据库/日志/凭据/本地分片挂载到 /db
       - /home/cc/projects/u:/data:ro
-      # 数据库 + 哈希缓存 + 日志 + 凭据(client_secret.json/token.json) + uploaded_segments 本地视频
       - ./:/db
-    command:
-      - --input
-      - /data
-      - --db
-      - /db/tubetape.json
+      # 方式二（单目录极简）：只挂载 /data（读写），数据库/日志/凭据/本地分片自动保存在 /data 下
+      # - /home/cc/projects/u:/data
