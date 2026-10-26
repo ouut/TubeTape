@@ -161,8 +161,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--flush",
-        action="store_true",
-        help="force-seal and upload the pending queue immediately",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="force-seal and upload the pending queue immediately (default: True; use --no-flush to disable)",
     )
     parser.add_argument(
         "--watch",

@@ -364,6 +364,16 @@ _SETTINGS_HTML_TEMPLATE = """<!DOCTYPE html>
             <span class="toggle-slider"></span>
           </label>
         </div>
+        <div class="toggle-row">
+          <div>
+            <div style="font-weight: 600; font-size: 0.85rem; color: #fff;">强制封板模式 (flush)</div>
+            <div style="font-size: 0.75rem; color: var(--text-muted);">立即封板当前所有已规划的分段并触发上传，不等待时间跨度聚拢</div>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="cfg-flush">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
       </div>
     </div>
 
@@ -422,6 +432,7 @@ _SETTINGS_HTML_TEMPLATE = """<!DOCTYPE html>
         setVal('cfg-quota_backoff', formatDuration(currentConfig.quota_backoff));
         setBool('cfg-no_upload', currentConfig.no_upload ?? false);
         setBool('cfg-watch', currentConfig.watch ?? true);
+        setBool('cfg-flush', currentConfig.flush ?? true);
 
         showToast('已加载最新配置');
       } catch (err) {
@@ -480,7 +491,8 @@ _SETTINGS_HTML_TEMPLATE = """<!DOCTYPE html>
         mtime_interval: document.getElementById('cfg-mtime_interval').value.trim(),
         quota_backoff: document.getElementById('cfg-quota_backoff').value.trim(),
         no_upload: document.getElementById('cfg-no_upload').checked,
-        watch: document.getElementById('cfg-watch').checked
+        watch: document.getElementById('cfg-watch').checked,
+        flush: document.getElementById('cfg-flush').checked
       };
 
       try {

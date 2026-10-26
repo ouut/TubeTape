@@ -366,10 +366,11 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
             data = json.loads(res.read().decode("utf-8"))
             assert "config" in data
             assert data["config"]["crf"] == 18
+            assert data["config"]["flush"] is True
             assert "segment_duration" in data["fingerprint_params"]
 
         # 2. POST /api/config
-        update_data = json.dumps({"crf": 22, "keep_segments": 5, "no_upload": True}).encode("utf-8")
+        update_data = json.dumps({"crf": 22, "keep_segments": 5, "no_upload": True, "flush": False}).encode("utf-8")
         req = urllib.request.Request(
             f"{base_url}/api/config",
             data=update_data,
@@ -383,16 +384,19 @@ def test_web_server_config_and_coordinator_actions(tmp_path):
             assert data["config"]["crf"] == 22
             assert data["config"]["keep_segments"] == 5
             assert data["config"]["no_upload"] is True
+            assert data["config"]["flush"] is False
 
         assert coord.args.crf == 22
         assert coord.args.keep_segments == 5
         assert coord.args.no_upload is True
+        assert coord.args.flush is False
         # Verify saved to tubetape.json database directly
         from tubetape.db import Database
         saved_db = Database.load(str(db_path))
         assert saved_db.config["crf"] == 22
         assert saved_db.config["keep_segments"] == 5
         assert saved_db.config["no_upload"] is True
+        assert saved_db.config["flush"] is False
         assert not (tmp_path / "config.json").exists()
 
         # 3. POST /api/config with invalid value fails

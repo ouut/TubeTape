@@ -27,7 +27,7 @@ class TestDefaults:
         assert args.x264_preset == "fast"
         assert args.ken_burns is False
         assert args.privacy == "private"
-        assert args.flush is False
+        assert args.flush is True
         assert args.watch is True
         assert args.dry_run is False
         assert args.mtime_interval == 600.0
@@ -157,6 +157,7 @@ class TestRunPipeline:
             [
                 "--dry-run",
                 "--no-watch",
+                "--no-flush",
                 "--input", str(tmp_path),
                 "--db", str(tmp_path / "db.json"),
                 "--segment-duration", "20s",

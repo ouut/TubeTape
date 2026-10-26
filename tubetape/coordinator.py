@@ -248,6 +248,7 @@ class AppCoordinator:
                 "web_port": int(getattr(a, "web_port", 8080)),
                 "keep_segments": int(getattr(a, "keep_segments", 0)),
                 "no_upload": bool(getattr(a, "no_upload", False)),
+                "flush": bool(getattr(a, "flush", True)),
                 "force_scan": bool(getattr(a, "force_scan", False)),
                 "force_plan": bool(getattr(a, "force_plan", False)),
                 "segment_duration": float(getattr(a, "segment_duration", 1200.0)),
@@ -395,6 +396,8 @@ class AppCoordinator:
                 a.keep_segments = val
             elif k == "no_upload":
                 a.no_upload = bool(v)
+            elif k == "flush":
+                a.flush = bool(v)
             elif k == "force_scan":
                 a.force_scan = bool(v)
             elif k == "no_scan":
